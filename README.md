@@ -58,8 +58,8 @@ A full prompt-writing studio inside a single ComfyUI node — AI-powered editing
 **Manual:**
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/pixelpainter/Comfyui_Enhanced_Prompt_Editor
-pip install -r Comfyui_Enhanced_Prompt_Editor/requirements.txt
+git clone https://github.com/pixelpainter/comfyui-AI-prompt-editor
+pip install -r comfyui-AI-prompt-editor/requirements.txt
 ```
 Restart ComfyUI.
 
