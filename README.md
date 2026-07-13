@@ -1,8 +1,11 @@
-# Enhanced Prompt Editor (EPE)
+comfyui-AI-prompt-editor
+# Enhanced Prompt Editor
+(This node requires that Ollama is installed on your OS)
 
 A full prompt-writing studio inside a single ComfyUI node — AI-powered editing, style targeting, prompt browsing, and wireless prompt injection, all driven by your local Ollama models.
 
-![Enhanced Prompt Editor](docs/screenshot-main.png)
+<img width="923" height="686" alt="EPE_Node" src="https://github.com/user-attachments/assets/489ebbed-2ed2-41ed-af03-fe1652a87f0f" />
+
 
 ## Features
 
@@ -25,9 +28,11 @@ A full prompt-writing studio inside a single ComfyUI node — AI-powered editing
 - **Extract from Image** — pulls the embedded prompt/workflow from PNG metadata
 
 **Style tuning**
-- 8 style targets (Midjourney, DALL·E, Imagen, Meta, Photorealistic, Cinematic, Anime, Concept Art) that reshape the AI's aesthetic vocabulary — not just an appended suffix
-- **Override toggle** — off: the style only fills gaps your prompt leaves open; on: the style replaces your prompt's look while subjects, poses, and scene stay
-- 6 sliders (Creativity, Length/Density, Focus, Variability, Boldness, Subject grip) that keep working on top of any style
+- 8 style targets (Midjourney, DALL·E, Imagen, Meta, Photorealistic, Cinematic, Anime, Concept Art) that reshape the AI's aesthetic vocabulary, not just an appended suffix
+- **Override toggle** 
+- off: the style only fills gaps your prompt leaves open;
+- on: the style replaces your prompt's look while subjects, poses, and scene stay
+- 6 sliders (Creativity, Length/Density, Focus, Variability, Boldness, Subject grip) that keep working **-on top of any style-**
 
 **Library**
 - Browse prompts from **Civitai**, **Genur.art**, and **Sea.art** with image/video previews, infinite scroll, and one-click Use / Enhance / Variations
@@ -40,8 +45,8 @@ A full prompt-writing studio inside a single ComfyUI node — AI-powered editing
 ## Requirements
 
 - **ComfyUI** (recent build)
-- **[Ollama](https://ollama.com)** installed and running — this powers all AI features
-  - Text features: any capable instruct model (e.g. `ministral`, `nemotron`, gpt-oss)
+- **[Ollama](https://ollama.com/download)** installed and running on your Operating System — **this powers all AI features**
+  - Text features: any capable instruct model (e.g. `ministral`, `nemotron`, `gpt-oss`)
   - Image/Video to Prompt: a **vision** model (e.g. `qwen3.5`, `Gemma4`, `qwen3.6`)
   - Model quality matters: larger models follow the style system noticeably better
 - Python package `av` (installed automatically via `requirements.txt`) for video frame extraction
