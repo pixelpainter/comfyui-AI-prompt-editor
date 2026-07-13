@@ -24,7 +24,7 @@ A full prompt-writing studio inside a single ComfyUI node — AI-powered editing
 
 **From media**
 - **Image to Prompt** — caption any image into a usable prompt (vision model required)
-- **Video to Prompt** — samples frames from a clip and writes a video-model prompt
+- **Video to Prompt** — samples frames from a clip and writes an image prompt
 - **Extract from Image** — pulls the embedded prompt/workflow from PNG metadata
 
 **Style tuning**
