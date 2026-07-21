@@ -34,7 +34,7 @@ EPE replaces the humble prompt textbox with a complete writing environment. Writ
 
 **Instruct edit** — Type a natural-language change and the LLM applies it with coherent ripple effects: changing gender also updates pronouns, clothing, and hair; changing season updates lighting, sky, and environment. Streams live into the editor with apply/undo.
 
-**From media** — **Image to Prompt** captions any image into a usable prompt (vision model required). **Video to Prompt** samples frames from a clip and writes an image prompt. **Extract from Image** pulls the embedded prompt/workflow from PNG metadata.
+**From media** — **Image to Prompt** captions any image into a usable prompt (vision model required). **Video to Prompt** samples frames from a clip and writes an image prompt. **Extract from Image** pulls an embedded prompt (from embedded workflow) from PNG metadata.
 
 **Style tuning** — 8 style targets and 6 sliders that reshape the AI's aesthetic vocabulary, not just an appended suffix.
 
@@ -78,6 +78,21 @@ Restart ComfyUI after installation.
 
 > Model quality matters: larger models follow the style system noticeably better.
 
+### Setting up Ollama
+
+1. **Install Ollama** — download the installer for Windows or macOS from [ollama.com/download](https://ollama.com/download) and run it. On Linux: `curl -fsSL https://ollama.com/install.sh | sh`. Once installed, Ollama runs quietly in the background.
+2. **Download a model** — open a terminal (Command Prompt / PowerShell on Windows) and pull a model:
+
+```bash
+# a text model for Enhance, Variations, Instruct edit, Synonyms…
+ollama pull ministral
+
+# a vision model for Image to Prompt / Video to Prompt
+ollama pull qwen3-vl
+```
+
+3. **Verify** — `ollama list` shows your installed models. That's it: EPE finds them automatically in **⚙ AI Setup**.
+
 ## Quick start
 
 1. Add the node: double-click the canvas → search **Enhanced Prompt Editor**
@@ -114,6 +129,38 @@ Select target nodes once — every queue injects the current prompt into all of 
 <img src="assets/wireless.gif" alt="Wireless targets: prompt injected into CLIP Text Encode at queue time" width="840">
 </div>
 
+### Adding a target
+
+Click **+ Add target** and a picker opens listing every text widget in your graph — subgraphs included, searchable by node name, widget, or ID. Pick your CLIP Text Encode and its chip joins the bar; the number on the chip is the node's ID, and widgets that are already targets are marked so you can't double-add them.
+
+<div align="center">
+<img src="assets/targetpicker.gif" alt="Adding a wireless target: the picker lists every text widget in the graph" width="840">
+</div>
+
+## Library
+
+Search **Civitai**, **Genur.art**, and **Sea.art** without leaving the node — image *and* video results, with infinite scroll. Open any result to see its full prompt on a detail card: **Use** sends it to the main editor, **Enhance** / **Variations** transform it on the spot, and **Save as New** / **Snippets** file it into your collections. The media itself is workable too — **Image to Prompt** (or **Video to Prompt** on video results) writes a fresh prompt from the image using your vision model.
+
+<div align="center">
+<img src="assets/library.gif" alt="Library: search, open the detail card, Use the prompt, and run Image to Prompt" width="840">
+</div>
+
+### Workflows
+
+Results whose images carry an embedded ComfyUI graph appear in the **Workflows** tab — one click on **⬇ Load Workflow** opens the full node graph on your canvas, ready to queue.
+
+<div align="center">
+<img src="assets/workflows.gif" alt="Workflows: search and load a full ComfyUI graph from the library" width="640">
+</div>
+
+### Favorites & Snippets
+
+Two personal collections: **Favorites** store whole prompts (save from the File ▾ menu or any detail card); **Snippets** are reusable fragments — click one and it drops straight into your prompt.
+
+<div align="center">
+<img src="assets/favsnips.gif" alt="Favorites store whole prompts; snippets drop fragments into the editor" width="840">
+</div>
+
 ## Notes
 
 - Everything runs locally — no cloud APIs, no keys
@@ -125,7 +172,7 @@ Select target nodes once — every queue injects the current prompt into all of 
 
 Bugs and feature requests → [open an issue](https://github.com/pixelpainter/comfyui-AI-prompt-editor/issues).
 
-If EPE has earned a place in your workflow, a star helps others find it — and there's always [coffee](https://buymeacoffee.com/pixelpainter). ☕
+⭐ If EPE has earned a place in your workflow, a star helps others find it — and I always love a good cup of [coffee](https://buymeacoffee.com/pixelpainter). ☕
 
 ## License
 
