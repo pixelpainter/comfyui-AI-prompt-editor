@@ -147,7 +147,7 @@ Search **Civitai**, **Genur.art**, and **Sea.art** without leaving the node — 
 
 ### Workflows
 
-Results whose images carry an embedded ComfyUI graph appear in the **Workflows** tab — one click on **⬇ Load Workflow** opens the full node graph on your canvas, ready to queue.
+The **Workflows** tab searches Civitai's workflow listings and Sea.art's ComfyUI templates directly — one click on **⬇ Load Workflow** opens the full node graph in a new canvas tab, ready to queue. Image results can carry workflows too: when a Civitai or Genur.art image has one embedded in its PNG metadata, the **⚡ Workflow** button lights up to load it.
 
 <div align="center">
 <img src="assets/workflows.gif" alt="Workflows: search and load a full ComfyUI graph from the library" width="640">
