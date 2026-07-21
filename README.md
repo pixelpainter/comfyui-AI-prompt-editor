@@ -16,8 +16,6 @@ No cloud APIs. No keys. Nothing leaves your machine.
 
 </div>
 
-> ⭐ **Find EPE useful?** A star helps other ComfyUI users discover it — and if it saves you real time, you can [buy me a coffee](https://buymeacoffee.com/pixelpainter). ☕
-
 ---
 
 ## What it does
@@ -36,7 +34,7 @@ EPE replaces the humble prompt textbox with a complete writing environment. Writ
 
 **Instruct edit** — Type a natural-language change and the LLM applies it with coherent ripple effects: changing gender also updates pronouns, clothing, and hair; changing season updates lighting, sky, and environment. Streams live into the editor with apply/undo.
 
-**From media** — **Image to Prompt** captions any image into a usable prompt (vision model required). **Video to Prompt** samples frames from a clip and writes an image prompt. **Extract from Image** pulls an embedded prompt (from embedded workflow) from PNG metadata.
+**From media** — **Image to Prompt** captions any image into a usable prompt (vision model required). **Video to Prompt** samples frames from a clip and writes an image prompt. **Extract from Image** pulls the embedded prompt/workflow from PNG metadata.
 
 **Style tuning** — 8 style targets and 6 sliders that reshape the AI's aesthetic vocabulary, not just an appended suffix.
 
@@ -123,13 +121,11 @@ Select target nodes once — every queue injects the current prompt into all of 
 - Server routes only accept Ollama addresses on localhost/private networks, refuse fetching internal URLs, and cap upload sizes
 - In-app help: click **? Help** in the node's title bar
 
-## Support the project
+## Support
 
-If EPE has earned a place in your workflow:
+Bugs and feature requests → [open an issue](https://github.com/pixelpainter/comfyui-AI-prompt-editor/issues).
 
-- ⭐ **[Star the repo](https://github.com/pixelpainter/comfyui-AI-prompt-editor)** — it's the best way to help others find it
-- ☕ **[Buy me a coffee](https://buymeacoffee.com/pixelpainter)** — fuels late-night feature development
-- 🐛 [Open an issue](https://github.com/pixelpainter/comfyui-AI-prompt-editor/issues) for bugs and feature requests
+If EPE has earned a place in your workflow, a star helps others find it — and there's always [coffee](https://buymeacoffee.com/pixelpainter). ☕
 
 ## License
 
