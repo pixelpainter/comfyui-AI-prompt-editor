@@ -897,7 +897,10 @@ async def epe_prompts_extract_workflow(request):
             fetch_url = image_url
             source = "genur"
 
-        headers = {"User-Agent": "Mozilla/5.0", "Accept": "image/*,*/*", "Range": "bytes=0-131071"}
+        # 1 MB range: PNG text chunks live before the image data, but large
+        # (subgraph-heavy) workflows can exceed 128 KB — a truncated chunk
+        # would silently parse as "no workflow".
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "image/*,*/*", "Range": "bytes=0-1048575"}
         img_bytes = None
         for _attempt in range(2):
             try:
@@ -918,14 +921,34 @@ async def epe_prompts_extract_workflow(request):
         if not img_bytes:
             return web.json_response({"error": "Image fetch failed"}, status=502)
 
-        workflow, _ = _parse_png_workflow(img_bytes)
+        workflow, prompt_str = _parse_png_workflow(img_bytes)
+        workflow_format = "graph" if workflow is not None else None
+
+        # Fallback: images saved via ComfyUI's "Save (API format)" carry only a
+        # 'prompt' chunk holding the API-format graph. Modern ComfyUI frontends
+        # can load that directly, so surface it when no 'workflow' chunk exists.
+        if workflow is None and prompt_str:
+            try:
+                api_wf = json.loads(prompt_str)
+                if isinstance(api_wf, dict) and any(
+                    isinstance(v, dict) and "class_type" in v for v in api_wf.values()
+                ):
+                    workflow = api_wf
+                    workflow_format = "api"
+            except Exception:
+                pass
+
         has_workflow = workflow is not None
 
-        logger.info(f"epe_prompts_extract_workflow {source} has_workflow={has_workflow} url={fetch_url[-60:]}")
+        logger.info(
+            f"epe_prompts_extract_workflow {source} has_workflow={has_workflow} "
+            f"format={workflow_format} url={fetch_url[-60:]}"
+        )
         return web.json_response({
-            "hasWorkflow": has_workflow,
-            "workflow":    workflow,
-            "source":      source,
+            "hasWorkflow":    has_workflow,
+            "workflow":       workflow,
+            "workflowFormat": workflow_format,
+            "source":         source,
         })
 
     except Exception as e:

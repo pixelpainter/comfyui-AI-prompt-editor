@@ -645,7 +645,19 @@ function _epeShowTargetPicker(currentBindKey, onSelect) {
 
 // ── Workflow template opener ──────────────────────────────────────────────────
 
-async function _epeOpenTemplate(templateJSON) {
+async function _epeOpenTemplate(templateJSON, format = "graph") {
+  // API-format graphs (from a PNG's 'prompt' chunk) load via loadApiJson.
+  if (format === "api") {
+    if (typeof app.loadApiJson !== "function") {
+      throw new Error("This ComfyUI version cannot load API-format workflows");
+    }
+    try {
+      await app.extensionManager.commands.execute('Comfy.NewBlankWorkflow');
+      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+    } catch(e) { /* fall through — load into the current tab instead */ }
+    await app.loadApiJson(templateJSON, "workflow.json");
+    return;
+  }
   try {
     // Step 1: create exactly one new blank tab via ComfyUI's own command.
     await app.extensionManager.commands.execute('Comfy.NewBlankWorkflow');
@@ -6100,7 +6112,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               return;
             }
             rpGetWfBtn.textContent = "Loading\u2026";
-            await _epeOpenTemplate(data.workflow);
+            await _epeOpenTemplate(data.workflow, data.workflowFormat || "graph");
             rpGetWfBtn.textContent = "\u21af Workflow";
             _setGetWfBtn(false, null);
           } catch(e) {
