@@ -9,7 +9,7 @@
 [![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-%E2%98%95-ffdd00?labelColor=1c2431)](https://buymeacoffee.com/pixelpainter)
 
 **A full prompt-writing studio inside a single ComfyUI node** — AI-powered editing, style targeting,
-prompt browsing, and wireless prompt injection, all driven by your local [Ollama](https://ollama.com) models.
+prompt browsing, and wireless prompt injection, all driven by your local [Ollama](https://ollama.com) models.<br>
 No cloud APIs. No keys. Nothing leaves your machine.
 
 <img src="EPE_Node.png" alt="Enhanced Prompt Editor node" width="850">
