@@ -105,6 +105,14 @@ ollama pull qwen3-vl
 <img src="assets/enhance.gif" alt="Enhance: a rough idea becomes a diffusion-ready prompt" width="840">
 </div>
 
+## Example workflows
+
+A ready-to-run example lives in [`example_workflows/`](example_workflows). Once EPE is installed it also appears in ComfyUI's **Workflow → Browse Templates** menu.
+
+- **[Krea 2 Turbo — Text to Image (with EPE)](example_workflows/Krea2-Turbo_Text-to-Image_EPE.json)** — EPE writes the prompt and injects it into the CLIP Text Encode node wirelessly, driving a Krea-2 Turbo text-to-image graph.
+
+To load it, drag the `.json` onto your canvas, or use **Workflow → Open**.
+
 ## Instruct edit
 
 Describe the change; the model rewrites the prompt coherently — one instruction can ripple through lighting, shadows, and atmosphere while everything else stays put.
