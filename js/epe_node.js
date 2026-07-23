@@ -1459,30 +1459,32 @@ Output ONLY the inverted prompt paragraph. No preamble, no explanation, no <thin
   },
 
   // Check if Ollama is reachable
-  async checkConnection(url) {
+  // Backend check: probes Ollama server-side (no browser CORS) and
+  // auto-starts a local Ollama if it isn't running yet.
+  async _backendCheck(url) {
     try {
-      const resp = await fetch(url || this.getSettings().url, { 
-        method: "GET",
-        signal: AbortSignal.timeout(3000)
+      const resp = await fetch("/epe/ollama/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ollamaUrl: url || this.getSettings().url }),
+        signal: AbortSignal.timeout(20000)
       });
-      return resp.ok;
+      if (!resp.ok) return null;
+      return await resp.json();
     } catch (e) {
-      return false;
+      return null;
     }
   },
 
-  // Fetch available models
+  async checkConnection(url) {
+    const c = await this._backendCheck(url);
+    return !!(c && c.running);
+  },
+
+  // Fetch available models (server-side via the backend — CORS-free)
   async fetchModels(url) {
-    try {
-      const resp = await fetch((url || this.getSettings().url) + "/api/tags", {
-        signal: AbortSignal.timeout(5000)
-      });
-      if (!resp.ok) return [];
-      const data = await resp.json();
-      return (data.models || []).map(m => m.name || m.model).filter(Boolean);
-    } catch (e) {
-      return [];
-    }
+    const c = await this._backendCheck(url);
+    return (c && c.installedModels) || [];
   },
 
   // Generate text (non-streaming for simplicity)
@@ -1517,7 +1519,9 @@ Output ONLY the inverted prompt paragraph. No preamble, no explanation, no <thin
 
   async _generateOnce(systemPrompt, userPrompt, opts = {}) {
     const settings = this.getSettings();
-    const url = settings.url + "/api/generate";
+    // Route through the ComfyUI backend so the browser never talks to Ollama
+    // directly (avoids CORS when ComfyUI is opened from a non-localhost URL).
+    const url = "/epe/ollama/generate";
     const model = opts.model || settings.model;
     if (!model) throw new Error("No model selected");
     
@@ -1535,6 +1539,7 @@ Output ONLY the inverted prompt paragraph. No preamble, no explanation, no <thin
     
     try {
       const body = {
+          ollamaUrl: settings.url,
           model: model,
           system: systemPrompt,
           prompt: userPrompt,
@@ -1642,10 +1647,11 @@ Output ONLY the inverted prompt paragraph. No preamble, no explanation, no <thin
     try {
       const settings = this.getSettings();
       if (!settings.model) return;
-      await fetch(settings.url + "/api/generate", {
+      await fetch("/epe/ollama/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          ollamaUrl: settings.url,
           model: settings.model,
           keep_alive: 0
         }),
@@ -4133,7 +4139,18 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const populateModels = async (url) => {
             statusDot.style.background = "#ca0";
             testBtn.textContent = "...";
-            const connected = await _epeOllama.checkConnection(url);
+            // Ask the backend to ensure Ollama is up first — it will auto-start
+            // a local Ollama if it isn't running. Returns { running, autoStart }.
+            let ensured = null;
+            try {
+              const r = await fetch("/epe/ollama/check", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ ollamaUrl: url }),
+              });
+              if (r.ok) ensured = await r.json();
+            } catch (e) {}
+            const connected = (ensured && ensured.running) || await _epeOllama.checkConnection(url);
             if (connected) {
               statusDot.style.background = "#4c4";
               testBtn.textContent = "Test";
@@ -4179,7 +4196,18 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               modelSelect.innerHTML = "";
               const failOpt = document.createElement("option");
               failOpt.value = "";
-              failOpt.textContent = "— Connection failed —";
+              // Auto-start couldn't help — tell the user exactly why.
+              const reason = ensured && ensured.autoStart;
+              if (reason === "not_on_path") {
+                failOpt.textContent = "— Ollama not found on PATH —";
+                modelSelect.title = "Ollama isn't on this machine's PATH. Install it, or start it manually with: ollama serve";
+              } else if (reason === "remote") {
+                failOpt.textContent = "— Can't reach Ollama at that URL —";
+                modelSelect.title = "Couldn't reach Ollama at that address. Make sure it's running on that machine and reachable from here.";
+              } else {
+                failOpt.textContent = "— Ollama not running (run: ollama serve) —";
+                modelSelect.title = "Ollama isn't running. Start it with: ollama serve  —  or on Linux, run: sudo systemctl enable --now ollama  to start it at boot.";
+              }
               modelSelect.appendChild(failOpt);
             }
           };

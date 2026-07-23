@@ -13,6 +13,8 @@ import asyncio
 import datetime
 import zipfile
 import io
+import shutil
+import subprocess
 import aiohttp
 import socket
 import ipaddress
@@ -1982,11 +1984,69 @@ def _build_image_system_prompt(style: str = None, length_slider=None, focus_slid
 
 
 
+def _epe_url_is_loopback(url: str) -> bool:
+    """True only if the URL host is localhost / a loopback IP — i.e. Ollama
+    would be on THIS machine, so it is safe for us to try to start it."""
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or "").strip()
+        if host in ("localhost",):
+            return True
+        return ipaddress.ip_address(host).is_loopback
+    except Exception:
+        return False
+
+
+def _epe_try_start_ollama(ollama_url: str):
+    """Attempt to start a local Ollama server. Returns a reason string:
+    'spawned' on success launching the process, or a failure reason that the
+    frontend turns into a targeted message. Never starts a remote Ollama."""
+    if not _epe_url_is_loopback(ollama_url):
+        return "remote"                 # not our machine — can't start it
+    exe = shutil.which("ollama")
+    if not exe:
+        return "not_on_path"            # binary not found for this process
+    try:
+        kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        if os.name == "nt":
+            # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP so it outlives us
+            kwargs["creationflags"] = 0x00000008 | 0x00000200
+        else:
+            kwargs["start_new_session"] = True   # detach from ComfyUI on POSIX
+        subprocess.Popen([exe, "serve"], **kwargs)
+        return "spawned"
+    except Exception as e:
+        logger.warning(f"EPE: could not launch 'ollama serve': {e}")
+        return "spawn_failed"
+
+
+async def _epe_probe_ollama(ollama_url: str):
+    """Return (running: bool, installedModels: [str]). Generous timeout so a
+    cold start / model-loading server isn't misread as 'not running'."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{ollama_url}/api/tags",
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    models = [m.get("name") or m.get("model", "")
+                              for m in data.get("models", [])]
+                    return True, [n for n in models if n]
+    except Exception:
+        pass
+    return False, []
+
+
 @routes.post("/epe/ollama/check")
 async def epe_ollama_check(request):
     """
-    Check if Ollama is running and which known models are installed.
-    Returns: { running, ollamaUrl, installedModels: [str], knownModels: [...] }
+    Check if Ollama is running and which known models are installed. If it is
+    not reachable and it lives on this machine, try to start it automatically
+    (spawn `ollama serve`) and wait for it to come up.
+    Returns: { running, ollamaUrl, installedModels, knownModels, autoStart }
+      autoStart: null | 'spawned' | 'not_on_path' | 'remote' | 'spawn_failed'
     """
     try:
         body = await request.json()
@@ -1995,34 +2055,75 @@ async def epe_ollama_check(request):
         if _u_err:
             return web.json_response({"error": _u_err}, status=400)
 
-        installed = []
-        running = False
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{ollama_url}/api/tags",
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as resp:
-                    if resp.status == 200:
-                        running = True
-                        data = await resp.json()
-                        installed = [
-                            m.get("name") or m.get("model", "")
-                            for m in data.get("models", [])
-                        ]
-                        installed = [n for n in installed if n]
-        except Exception:
-            pass
+        running, installed = await _epe_probe_ollama(ollama_url)
 
+        auto_start = None
+        if not running:
+            auto_start = _epe_try_start_ollama(ollama_url)
+            if auto_start == "spawned":
+                # poll until the freshly-started server answers (up to ~12s)
+                for _ in range(24):
+                    await asyncio.sleep(0.5)
+                    running, installed = await _epe_probe_ollama(ollama_url)
+                    if running:
+                        break
+
+        logger.info(f"EPE: ollama check running={running} autoStart={auto_start} "
+                    f"models={len(installed)}")
         return web.json_response({
             "running":         running,
             "ollamaUrl":       ollama_url,
             "installedModels": installed,
             "knownModels":     _OLLAMA_KNOWN_MODELS,
+            "autoStart":       auto_start,
         })
 
     except Exception as e:
         logger.error(f"Error in epe_ollama_check: {e}", exc_info=True)
+        return web.json_response({"error": str(e)}, status=500)
+
+
+@routes.post("/epe/ollama/generate")
+async def epe_ollama_generate_proxy(request):
+    """
+    Server-side proxy for Ollama's /api/generate (text features). Browsers can
+    only call Ollama directly from localhost origins — any other origin gets a
+    CORS 403. Backend-to-Ollama requests carry no Origin, so routing through
+    here works regardless of how ComfyUI is accessed, with no OLLAMA_ORIGINS.
+    Body: the normal Ollama generate payload plus "ollamaUrl".
+    Streams Ollama's NDJSON response back unchanged.
+    """
+    try:
+        body = await request.json()
+        ollama_url = (body.pop("ollamaUrl", "") or "http://localhost:11434").rstrip("/")
+        _u_err = _epe_check_ollama_url(ollama_url)
+        if _u_err:
+            return web.json_response({"error": _u_err}, status=400)
+
+        timeout = aiohttp.ClientTimeout(total=600, sock_read=300)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(f"{ollama_url}/api/generate", json=body) as upstream:
+                if upstream.status != 200:
+                    text = await upstream.text()
+                    return web.Response(status=upstream.status, text=text)
+                resp = web.StreamResponse()
+                resp.headers["Content-Type"] = upstream.headers.get(
+                    "Content-Type", "application/x-ndjson")
+                await resp.prepare(request)
+                try:
+                    async for chunk in upstream.content.iter_any():
+                        await resp.write(chunk)
+                    await resp.write_eof()
+                except (ConnectionResetError, ConnectionError, asyncio.CancelledError):
+                    # Browser aborted (user cancel) — stop pulling from Ollama.
+                    pass
+                return resp
+
+    except aiohttp.ClientConnectorError:
+        return web.json_response(
+            {"error": "Could not reach Ollama — is it running?"}, status=502)
+    except Exception as e:
+        logger.error(f"Error in epe_ollama_generate proxy: {e}", exc_info=True)
         return web.json_response({"error": str(e)}, status=500)
 
 

@@ -174,6 +174,14 @@ Bugs and feature requests → [open an issue](https://github.com/pixelpainter/co
 
 ⭐ If EPE has earned a place in your workflow, a star helps others find it — and I always love a good cup of [coffee](https://buymeacoffee.com/pixelpainter). ☕
 
+## Changelog
+
+### 1.0.14
+- Fixed Ollama initialization on Linux — the node now starts Ollama automatically if it isn't running. Auto-start only works if Ollama is on your PATH.
+- Clearer message and a longer connection timeout when Ollama can't be reached.
+- Ollama requests now route through the ComfyUI backend — fixes empty model lists and failed generation when ComfyUI is opened from another machine (browser CORS). No OLLAMA_ORIGINS needed.
+- Workflow extraction now also detects API-format graphs embedded in image metadata.
+
 ## License
 
 GPL-3.0 © pixelpainter — see [LICENSE](LICENSE).

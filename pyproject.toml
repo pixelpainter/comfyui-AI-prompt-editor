@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-ai-prompt-editor"
 description = "A full prompt-writing studio inside a single ComfyUI node — AI-powered editing, style targeting, prompt browsing, and wireless prompt injection, all driven by your local Ollama models."
-version = "1.0.13"
+version = "1.0.14"
 license = { file = "LICENSE" }
 dependencies = ["av>=10.0.0"]
 requires-python = ">=3.9"
