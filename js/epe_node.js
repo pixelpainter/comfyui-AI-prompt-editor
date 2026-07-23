@@ -4751,6 +4751,15 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             // map current slider values to Ollama options
             // (temperature, top_p, top_k, num_predict, min_p, seed, presence_penalty).
             const sliderOpts = _composeOllamaOpts();
+            // Variations emits THREE ~180-word paragraphs — roughly 3x the output of
+            // a single prompt. The Length slider's num_predict cap (200-800) starves
+            // that budget, so the model stops partway through and the 3rd variation
+            // comes back unfinished (or only 2 parse out). Give this mode a floor
+            // sized for all three paragraphs; the slider still sets each one's length
+            // via the system prompt's word target.
+            if (mode === "variations") {
+              sliderOpts.num_predict = Math.max(sliderOpts.num_predict || 0, 2048);
+            }
             let tokenCount = 0;
             const raw = await _epeOllama.generate(systemPrompt, promptText, {
               signal: _aiAbort.signal,
