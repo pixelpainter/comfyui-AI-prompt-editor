@@ -13,7 +13,7 @@ Requirements:
 
 import logging
 
-EPE_VERSION = "1.0.14"
+EPE_VERSION = "1.0.15"
 
 logger = logging.getLogger("EPE")
 

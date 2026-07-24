@@ -6089,17 +6089,29 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             civList.appendChild(civStatus);
             civList.appendChild(civSentinel);
             civStatus.style.display = "none";
-            const q = civSearchInput.value.trim();
-            if (q) { _civState.query = q; requestAnimationFrame(() => _civLoadMore()); }
+            // Empty query is valid now (browse the featured feed), so always load.
+            _civState.query = civSearchInput.value.trim();
+            requestAnimationFrame(() => _civLoadMore());
+          } else if (_rpActive === "genur") {
+            _genurState.page = 1;
+            _genurState.loading = false; _genurState.exhausted = false; _genurState.results = [];
+            while (genurList.lastChild) genurList.removeChild(genurList.lastChild);
+            genurList.appendChild(genurStatus);
+            genurList.appendChild(genurSentinel);
+            genurStatus.style.display = "none";
+            // Empty query is valid (browse feed), so always load.
+            _genurState.query = genurSearchInput.value.trim();
+            requestAnimationFrame(() => _genurLoadMore());
           } else if (_rpActive === "seaart") {
-            _seaartState.query = ""; _seaartState.page = 1;
+            _seaartState.page = 1;
             _seaartState.loading = false; _seaartState.exhausted = false; _seaartState.results = [];
             while (seaartList.lastChild) seaartList.removeChild(seaartList.lastChild);
             seaartList.appendChild(seaartStatus);
             seaartList.appendChild(seaartSentinel);
             seaartStatus.style.display = "none";
-            const q = seaartSearchInput.value.trim();
-            if (q) { _seaartState.query = q; requestAnimationFrame(() => _seaartLoadMore()); }
+            // Empty query is valid (browse the selected category), so always load.
+            _seaartState.query = seaartSearchInput.value.trim();
+            requestAnimationFrame(() => _seaartLoadMore());
           }
         };
 
@@ -6196,8 +6208,9 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         const _civState = {
           query:    "",
           sort:     "Most Reactions",  // "Most Reactions" | "Newest"
-          period:   "",               // "" | "Week" | "Month" | "6Month" | "Year"
+          period:   "Week",           // "" | "Week" | "Month" | "6Month" | "Year"
           baseModel:"",               // "" = any, or "Flux.1 D", "SD 1.5", "SDXL 1.0" etc
+          baseModels: [],             // selected base models to filter by ([] = all)
           page:     1,
           loading:  false,
           exhausted:false,
@@ -6224,7 +6237,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         civCalloutIcon.textContent = "\uD83D\uDD0D";
         civCalloutIcon.style.cssText = "font-size:10px;flex-shrink:0;";
         const civCalloutText = document.createElement("span");
-        civCalloutText.textContent = "Search Civitai for images \u2014 browse image prompts to use as inspiration";
+        civCalloutText.textContent = "Browse featured Civitai images, or type to search \u2014 use any prompt as inspiration";
         civCalloutText.style.cssText = "font-size:9px;color:rgba(100,160,255,0.7);line-height:1.4;";
         civCallout.appendChild(civCalloutIcon);
         civCallout.appendChild(civCalloutText);
@@ -6235,8 +6248,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         civSearchRow.style.cssText = "display:flex;gap:4px;";
         const civSearchInput = document.createElement("input");
         civSearchInput.type = "text";
-        civSearchInput.placeholder = "fantasy portrait\u2026";
-        civSearchInput.value = "fantasy portrait";
+        civSearchInput.placeholder = "Search, or leave empty to browse featured\u2026";
+        civSearchInput.value = "";
         civSearchInput.style.cssText =
           "flex:1;background:#0b0f15;border:1px solid #1c2431;border-radius:3px;" +
           "color:#c2cddb;font-size:10px;padding:3px 7px;outline:none;font-family:inherit;";
@@ -6292,14 +6305,92 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         });
 
         const civPeriodRow = document.createElement("div");
-        civPeriodRow.style.cssText = "display:flex;gap:3px;flex-wrap:wrap;";
+        civPeriodRow.style.cssText = "display:flex;gap:3px;flex-wrap:wrap;align-items:center;";
         [["All Time",""],["Week","Week"],["Month","Month"],["6 Months","6Month"],["Year","Year"]].forEach(([label,val]) => {
           civPeriodRow.appendChild(_mkChip(label,"period",val, _civState.period===val));
         });
 
+        // "Models" multi-select dropdown — filter the feed by one or more base
+        // models. Empty selection = all models. The panel is inline (normal
+        // flow) so it can't be clipped by the panel's overflow:hidden.
+        const _CIV_MODELS = [
+          "Illustrious", "SDXL 1.0", "Pony", "Flux.1 D", "ZImageTurbo", "Qwen",
+          "SDXL Lightning", "Flux.2 Klein 9B", "ZImageBase", "Krea 2", "Flux.2 D",
+          "OpenAI", "Nano Banana", "Seedream", "Ernie", "Imagen4", "Grok",
+        ];
+        const civModelsBtn = document.createElement("button");
+        civModelsBtn.style.cssText =
+          "font-size:11px;padding:2px 7px;border-radius:2px;cursor:pointer;margin-left:6px;" +
+          "font-family:inherit;background:#12171f;border:1px solid #1c2431;color:#7a8a9c;" +
+          "transition:color .1s,background .1s,border-color .1s;white-space:nowrap;";
+        const _updateModelsBtn = () => {
+          const n = _civState.baseModels.length;
+          civModelsBtn.textContent = (n ? "Models (" + n + ")" : "Models") + " ▾";
+          civModelsBtn.style.color       = n ? "#c2e2f8" : "#7a8a9c";
+          civModelsBtn.style.borderColor = n ? "#4e5c6e" : "#1c2431";
+          civModelsBtn.style.background  = n ? "#202a38" : "#12171f";
+        };
+        _updateModelsBtn();
+        civPeriodRow.appendChild(civModelsBtn);
+
+        // Dropdown panel — hidden until the button is clicked.
+        const civModelsPanel = document.createElement("div");
+        civModelsPanel.style.cssText =
+          "display:none;flex-wrap:wrap;gap:3px;padding:5px;margin-top:1px;" +
+          "max-height:150px;overflow-y:auto;background:#0d1119;" +
+          "border:1px solid #1c2431;border-radius:3px;";
+        const _mkModelChip = (name) => {
+          const c = document.createElement("button");
+          c.textContent = name;
+          const _sel = () => _civState.baseModels.indexOf(name) >= 0;
+          const _style = () => {
+            c.style.cssText =
+              "font-size:10px;padding:2px 6px;border-radius:2px;cursor:pointer;" +
+              "font-family:inherit;transition:color .1s,background .1s,border-color .1s;" +
+              (_sel()
+                ? "background:#202a38;border:1px solid #4e5c6e;color:#c2e2f8;"
+                : "background:#12171f;border:1px solid #1c2431;color:#6a7a8d;");
+          };
+          _style();
+          c.onmouseenter = () => { if(!_sel()){ c.style.color="#a8b6c6"; c.style.borderColor="#28364a"; } };
+          c.onmouseleave = () => { if(!_sel()){ c.style.color="#6a7a8d"; c.style.borderColor="#1c2431"; } };
+          c.onclick = () => {
+            const i = _civState.baseModels.indexOf(name);
+            if (i >= 0) _civState.baseModels.splice(i, 1);
+            else        _civState.baseModels.push(name);
+            _style();
+            _updateModelsBtn();
+            _civDoSearch();
+          };
+          return c;
+        };
+        _CIV_MODELS.forEach(m => civModelsPanel.appendChild(_mkModelChip(m)));
+        // Clear-all chip
+        const civModelsClear = document.createElement("button");
+        civModelsClear.textContent = "✕ Clear";
+        civModelsClear.style.cssText =
+          "font-size:10px;padding:2px 6px;border-radius:2px;cursor:pointer;font-family:inherit;" +
+          "background:#161d28;border:1px solid #202a38;color:#7a8a9c;";
+        civModelsClear.onclick = () => {
+          if (_civState.baseModels.length === 0) return;
+          _civState.baseModels = [];
+          // Re-render chips to reflect the cleared state.
+          civModelsPanel.innerHTML = "";
+          _CIV_MODELS.forEach(m => civModelsPanel.appendChild(_mkModelChip(m)));
+          civModelsPanel.appendChild(civModelsClear);
+          _updateModelsBtn();
+          _civDoSearch();
+        };
+        civModelsPanel.appendChild(civModelsClear);
+
+        civModelsBtn.onclick = () => {
+          civModelsPanel.style.display = (civModelsPanel.style.display === "none") ? "flex" : "none";
+        };
+
         civFilterBar.appendChild(civSearchRow);
         civFilterBar.appendChild(civSortRow);
         civFilterBar.appendChild(civPeriodRow);
+        civFilterBar.appendChild(civModelsPanel);
 
         // ── Card list (scrollable, infinite) ────────────────────────────
         const civList = document.createElement("div");
@@ -6664,8 +6755,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           cfg.list.appendChild(sentinel);
 
           const fetchPage = async (page) => {
-            const q = cfg.state.query.trim();
-            if (!q) return null;
+            const q = (cfg.state.query || "").trim();
+            if (!q && !cfg.allowEmpty) return null;
             const resp = await fetch(cfg.endpoint, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -6738,7 +6829,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
           const doSearch = () => {
             const q = cfg.searchInput.value.trim();
-            if (!q) return;
+            if (!q && !cfg.allowEmpty) return;
             // A new search always exits the detail view back to results.
             if (cfg.detail) {
               try { cfg.detail._cleanup && cfg.detail._cleanup(); cfg.detail._cleanup = null; } catch (_e) {}
@@ -6769,8 +6860,10 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           state: _civState, list: civList, status: civStatus, spinner: civSpinner, detail: civDetail,
           searchInput: civSearchInput, searchBtn: civSearchBtn,
           endpoint: "/epe/prompts/search", errLabel: "Prompt search error",
+          allowEmpty: true,   // empty query = browse the featured-style feed
           body: (q, page) => ({
             query: q, sort: _civState.sort, period: _civState.period,
+            baseModels: _civState.baseModels,
             nsfw: false, page, mediaType: _rpMediaType,
           }),
           filter: (items) => items.filter(i => i.prompt),
@@ -6798,7 +6891,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // GENUR.ART BROWSER
         // ══════════════════════════════════════════════════════════════════
 
-        const _genurState = { query:"", page:1, loading:false, exhausted:false, results:[], sort:"popular" };
+        const _genurState = { query:"", page:1, loading:false, exhausted:false, results:[], sort:"popular", baseModels:[] };
 
         const rpGenurPanel = document.createElement("div");
         rpGenurPanel.style.cssText = "flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0;";
@@ -6817,7 +6910,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         genurCalloutIcon.textContent = "\uD83D\uDD0D";
         genurCalloutIcon.style.cssText = "font-size:10px;flex-shrink:0;";
         const genurCalloutText = document.createElement("span");
-        genurCalloutText.textContent = "Search Genur.art for images \u2014 browse AI-generated image prompts";
+        genurCalloutText.textContent = "Browse Genur.art images, or type to search \u2014 use any prompt as inspiration";
         genurCalloutText.style.cssText = "font-size:9px;color:rgba(100,160,255,0.7);line-height:1.4;";
         genurCallout.appendChild(genurCalloutIcon);
         genurCallout.appendChild(genurCalloutText);
@@ -6827,8 +6920,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         genurSearchRow.style.cssText = "display:flex;gap:4px;";
         const genurSearchInput = document.createElement("input");
         genurSearchInput.type = "text";
-        genurSearchInput.placeholder = "fantasy portrait\u2026";
-        genurSearchInput.value = "fantasy portrait";
+        genurSearchInput.placeholder = "Search, or leave empty to browse\u2026";
+        genurSearchInput.value = "";
         genurSearchInput.style.cssText =
           "flex:1;background:#0b0f15;border:1px solid #1c2431;border-radius:3px;" +
           "color:#c2cddb;font-size:10px;padding:3px 7px;outline:none;font-family:inherit;";
@@ -6876,7 +6969,60 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         [["Most Popular","popular"],["Newest","newest"],["Oldest","oldest"],["Most Relevant","relevant"]].forEach(([label,val]) => {
           genurSortRow.appendChild(_mkGenurSortChip(label, val));
         });
+
+        // Model dropdown — Genur uses the same base-model names as Civitai, but
+        // its API only filters by ONE model at a time, so this is single-select.
+        const genurModelsBtn = document.createElement("button");
+        genurModelsBtn.style.cssText =
+          "font-size:11px;padding:2px 7px;border-radius:2px;cursor:pointer;margin-left:6px;" +
+          "font-family:inherit;background:#12171f;border:1px solid #1c2431;color:#7a8a9c;" +
+          "transition:color .1s,background .1s,border-color .1s;white-space:nowrap;";
+        const _genurUpdModelsBtn = () => {
+          const sel = _genurState.baseModels[0];
+          genurModelsBtn.textContent = (sel ? sel : "Model") + " ▾";
+          genurModelsBtn.style.color       = sel ? "#c2e2f8" : "#7a8a9c";
+          genurModelsBtn.style.borderColor = sel ? "#4e5c6e" : "#1c2431";
+          genurModelsBtn.style.background  = sel ? "#202a38" : "#12171f";
+        };
+        _genurUpdModelsBtn();
+        genurSortRow.appendChild(genurModelsBtn);
+
+        const genurModelsPanel = document.createElement("div");
+        genurModelsPanel.style.cssText =
+          "display:none;flex-wrap:wrap;gap:3px;padding:5px;margin-top:1px;" +
+          "max-height:150px;overflow-y:auto;background:#0d1119;border:1px solid #1c2431;border-radius:3px;";
+        const _mkGenurModelChip = (name) => {
+          const c = document.createElement("button");
+          c.textContent = name;
+          const _sel = () => _genurState.baseModels[0] === name;
+          const _style = () => {
+            c.style.cssText =
+              "font-size:10px;padding:2px 6px;border-radius:2px;cursor:pointer;font-family:inherit;" +
+              "transition:color .1s,background .1s,border-color .1s;" +
+              (_sel() ? "background:#202a38;border:1px solid #4e5c6e;color:#c2e2f8;"
+                      : "background:#12171f;border:1px solid #1c2431;color:#6a7a8d;");
+          };
+          _style();
+          c.onmouseenter = () => { if(!_sel()){ c.style.color="#a8b6c6"; c.style.borderColor="#28364a"; } };
+          c.onmouseleave = () => { if(!_sel()){ c.style.color="#6a7a8d"; c.style.borderColor="#1c2431"; } };
+          c.onclick = () => {
+            // Single-select: re-clicking the active model clears it.
+            _genurState.baseModels = _sel() ? [] : [name];
+            genurModelsPanel.querySelectorAll("button[data-gm='1']").forEach(b => b._restyle && b._restyle());
+            _genurUpdModelsBtn();
+            _genurDoSearch();
+          };
+          c._restyle = _style;
+          c.dataset.gm = "1";
+          return c;
+        };
+        _CIV_MODELS.forEach(m => genurModelsPanel.appendChild(_mkGenurModelChip(m)));
+        genurModelsBtn.onclick = () => {
+          genurModelsPanel.style.display = (genurModelsPanel.style.display === "none") ? "flex" : "none";
+        };
+
         genurFilterBar.appendChild(genurSortRow);
+        genurFilterBar.appendChild(genurModelsPanel);
 
         const genurList = document.createElement("div");
         genurList.style.cssText =
@@ -7103,7 +7249,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           state: _genurState, list: genurList, status: genurStatus, spinner: genurSpinner, detail: genurDetail,
           searchInput: genurSearchInput, searchBtn: genurSearchBtn,
           endpoint: "/epe/prompts/search-genur", errLabel: "Genur.art search error",
-          body: (q, page) => ({ query: q, page, sort: _genurState.sort }),
+          allowEmpty: true,   // empty query = browse the ranked feed
+          body: (q, page) => ({ query: q, page, sort: _genurState.sort, baseModels: _genurState.baseModels }),
           filter: (items) => items.filter(i => i.prompt),
           mapItem: (item) => ({
             id:       item.id,
@@ -7124,7 +7271,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // SEAART BROWSER
         // ══════════════════════════════════════════════════════════════════
 
-        const _seaartState = { query:"", page:1, loading:false, exhausted:false, results:[], sort:"hot" };
+        const _seaartState = { query:"", page:1, loading:false, exhausted:false, results:[], sort:"hot", category:"fan_art" };
 
         const rpSeaartPanel = document.createElement("div");
         rpSeaartPanel.style.cssText = "flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0;";
@@ -7143,7 +7290,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         seaartCalloutIcon.textContent = "\uD83D\uDD0D";
         seaartCalloutIcon.style.cssText = "font-size:10px;flex-shrink:0;";
         const seaartCalloutText = document.createElement("span");
-        seaartCalloutText.textContent = "Search SeaArt for images \u2014 browse AI-generated image prompts";
+        seaartCalloutText.textContent = "Browse SeaArt categories, or type to search \u2014 use any prompt as inspiration";
         seaartCalloutText.style.cssText = "font-size:9px;color:rgba(100,160,255,0.7);line-height:1.4;";
         seaartCallout.appendChild(seaartCalloutIcon);
         seaartCallout.appendChild(seaartCalloutText);
@@ -7153,8 +7300,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         seaartSearchRow.style.cssText = "display:flex;gap:4px;";
         const seaartSearchInput = document.createElement("input");
         seaartSearchInput.type = "text";
-        seaartSearchInput.placeholder = "fantasy portrait\u2026";
-        seaartSearchInput.value = "fantasy portrait";
+        seaartSearchInput.placeholder = "Search, or pick a category to browse\u2026";
+        seaartSearchInput.value = "";
         seaartSearchInput.style.cssText =
           "flex:1;background:#0b0f15;border:1px solid #1c2431;border-radius:3px;" +
           "color:#c2cddb;font-size:10px;padding:3px 7px;outline:none;font-family:inherit;";
@@ -7203,6 +7350,40 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           seaartSortRow.appendChild(_mkSeaartSortChip(label, val));
         });
         seaartFilterBar.appendChild(seaartSortRow);
+
+        // Category chips — single-select browse feeds from SeaArt's /post page.
+        // Picking one clears any keyword so it browses that category.
+        const seaartCatRow = document.createElement("div");
+        seaartCatRow.style.cssText = "display:flex;gap:3px;flex-wrap:wrap;";
+        const _mkSeaartCatChip = (label, slug) => {
+          const c = document.createElement("button");
+          c.textContent = label;
+          c._on = (_seaartState.category === slug);
+          const _style = () => {
+            c.style.cssText =
+              "font-size:10px;padding:2px 6px;border-radius:2px;cursor:pointer;" +
+              "font-family:inherit;transition:color .1s,background .1s,border-color .1s;" +
+              (c._on ? "background:#202a38;border:1px solid #4e5c6e;color:#c2e2f8;"
+                     : "background:#12171f;border:1px solid #1c2431;color:#6a7a8d;");
+          };
+          _style();
+          c.onmouseenter = () => { if(!c._on){ c.style.color="#a8b6c6"; c.style.borderColor="#28364a"; } };
+          c.onmouseleave = () => { if(!c._on){ c.style.color="#6a7a8d"; c.style.borderColor="#1c2431"; } };
+          c._setOn = (on) => { c._on = on; _style(); };
+          c.onclick = () => {
+            seaartCatRow.querySelectorAll("button").forEach(b => b._setOn && b._setOn(false));
+            c._setOn(true);
+            _seaartState.category = slug;
+            seaartSearchInput.value = "";   // category browse overrides keyword
+            _seaartDoSearch();
+          };
+          return c;
+        };
+        [["Fan Art","fan_art"],["GPT image 2","gpt image"],["Trending Seedance","seedance2.0"],
+         ["Short Film","short film"],["Viral Clips","viral clips"]].forEach(([label,slug]) => {
+          seaartCatRow.appendChild(_mkSeaartCatChip(label, slug));
+        });
+        seaartFilterBar.appendChild(seaartCatRow);
 
         const seaartList = document.createElement("div");
         seaartList.style.cssText =
@@ -7486,8 +7667,9 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           state: _seaartState, list: seaartList, status: seaartStatus, spinner: seaartSpinner, detail: seaartDetail,
           searchInput: seaartSearchInput, searchBtn: seaartSearchBtn,
           endpoint: "/epe/prompts/search-seaart", errLabel: "SeaArt search error",
-          body: (q, page) => ({ query: q, page, sort: _seaartState.sort, mediaType: _rpMediaType }),
-          filter: (items) => items,
+          allowEmpty: true,   // empty query = browse the selected category
+          body: (q, page) => ({ query: q, page, sort: _seaartState.sort, category: _seaartState.category, mediaType: _rpMediaType }),
+          filter: (items) => items.filter(i => i.prompt),
           mapItem: (item) => ({
             id:        item.id,
             name:      item.name      || "",
@@ -8409,6 +8591,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             _epeOwnerNode.properties.epe_ui = {
               tab: _rpActive,
               styleOpen: _styleOpen,
+              libraryWidth: parseInt(rightPanel.style.width, 10) || undefined,
             };
           } catch (_e) {}
         };
@@ -8441,6 +8624,16 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           // When switching away from a media tab reset Get Workflow button state
           if (!showWfBtn) _setGetWfBtn(false, null);
           _renderRpBody();
+          // Opening a browse-capable source lands on its default feed. Only
+          // auto-load the first time (empty results) so returning to the tab
+          // keeps whatever the user was already looking at.
+          if (id === "civitai" && !_civState.loading && _civState.results.length === 0) {
+            requestAnimationFrame(() => _civDoSearch());
+          } else if (id === "genur" && !_genurState.loading && _genurState.results.length === 0) {
+            requestAnimationFrame(() => _genurDoSearch());
+          } else if (id === "seaart" && !_seaartState.loading && _seaartState.results.length === 0) {
+            requestAnimationFrame(() => _seaartDoSearch());
+          }
         };
         Object.values(rpTabEls).forEach(t => { t.onclick=()=>_setRpTab(t._id); });
 
@@ -8501,6 +8694,60 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         leftPane.appendChild(btnRow);
 
         bodyWrap.appendChild(leftPane);
+
+        // ── Draggable divider — resize the Library column ────────────────
+        const LIB_MIN_W = 220, LIB_MAX_W = 620, LIB_DEFAULT_W = 300;
+        let _libDragging = false, _libStartX = 0, _libStartW = LIB_DEFAULT_W;
+        const libGrip = document.createElement("div");
+        libGrip.title = "Drag to resize — double-click to reset";
+        libGrip.style.cssText =
+          "flex-shrink:0;width:5px;cursor:ew-resize;background:#1c2431;" +
+          "align-self:stretch;transition:background .12s;";
+        libGrip.onmouseenter = () => { if (!_libDragging) libGrip.style.background = "#3a4a60"; };
+        libGrip.onmouseleave = () => { if (!_libDragging) libGrip.style.background = "#1c2431"; };
+        // Upper bound depends on the current node width so the editor is never
+        // crushed below a usable minimum.
+        const _libClampMax = () => {
+          const total = bodyWrap.clientWidth || 0;
+          const dynMax = total ? Math.max(LIB_MIN_W, total - 280) : LIB_MAX_W;
+          return Math.min(LIB_MAX_W, dynMax);
+        };
+        const _libOnMove = (e) => {
+          if (!_libDragging) return;
+          const delta = _libStartX - e.clientX;          // drag left → wider panel
+          let w = _libStartW + delta;
+          w = Math.max(LIB_MIN_W, Math.min(_libClampMax(), w));
+          rightPanel.style.width = w + "px";
+          e.preventDefault();
+        };
+        const _libOnUp = (e) => {
+          if (!_libDragging) return;
+          _libDragging = false;
+          libGrip.style.background = "#1c2431";
+          window.removeEventListener("pointermove", _libOnMove, true);
+          window.removeEventListener("pointerup", _libOnUp, true);
+          try { libGrip.releasePointerCapture(e.pointerId); } catch (_e) {}
+          _epePersistUi();
+        };
+        libGrip.addEventListener("pointerdown", (e) => {
+          _libDragging = true;
+          _libStartX = e.clientX;
+          _libStartW = parseInt(rightPanel.style.width, 10) || LIB_DEFAULT_W;
+          libGrip.style.background = "#4e5c6e";
+          try { libGrip.setPointerCapture(e.pointerId); } catch (_e) {}
+          window.addEventListener("pointermove", _libOnMove, true);
+          window.addEventListener("pointerup", _libOnUp, true);
+          // Keep the ComfyUI canvas from starting a node-drag on the grip.
+          e.preventDefault(); e.stopPropagation();
+        });
+        libGrip.addEventListener("dblclick", (e) => {
+          rightPanel.style.width = LIB_DEFAULT_W + "px";
+          _epePersistUi();
+          e.preventDefault(); e.stopPropagation();
+        });
+        libGrip.addEventListener("mousedown", (e) => e.stopPropagation());
+
+        bodyWrap.appendChild(libGrip);
         bodyWrap.appendChild(rightPanel);
 
         // ─────────────────────────────────────────────────────────────────
@@ -9074,6 +9321,9 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               styleBody.style.display = _styleOpen ? "" : "none";
               styleChev.style.transform = _styleOpen ? "" : "rotate(-90deg)";
               _updateStyleHdrState();
+            }
+            if (typeof ui.libraryWidth === "number" && ui.libraryWidth >= 180 && ui.libraryWidth <= 800) {
+              rightPanel.style.width = ui.libraryWidth + "px";
             }
           };
 

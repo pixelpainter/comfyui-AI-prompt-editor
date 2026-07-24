@@ -209,13 +209,15 @@ async def epe_prompts_search(request):
         nsfw       = body.get("nsfw", False)
         page       = int(body.get("page", 1))
         media_type = body.get("mediaType", "image")
+        base_models = body.get("baseModels", [])
 
         MEILI_URL = "https://search-new.civitai.com/multi-search"
         MEILI_KEY = "8c46eb2508e21db1e9828a97968d91ab1ca1caa5f70a00e88a2ba1e286603b61"
         IMAGE_CDN = "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA"
 
-        if not query:
-            return web.json_response({"items": [], "metadata": {"hasMore": False}})
+        # An empty query is a valid "browse" request — Meilisearch returns the
+        # index sorted by the chosen sort/period, which reproduces Civitai's
+        # homepage-style featured feed. We no longer short-circuit on empty q.
 
         # Shared sort/period config used by both image and video branches
         sort_map = {
@@ -238,6 +240,23 @@ async def epe_prompts_search(request):
             cutoff_ms = now_ms - period_ms_map[period]
             period_filter = f"createdAtUnix >= {cutoff_ms}"
 
+        # "Models" filter. When the user selects one or more base models we
+        # restrict the feed to exactly those (inclusion). With no selection we
+        # still hide legacy Stable Diffusion 1.x/2.x so the default browse feed
+        # stays modern. Values are sanitized and quote-stripped before building
+        # the Meilisearch expression, and the selection is capped for safety.
+        LEGACY_BASE_MODELS = ["SD 1.4", "SD 1.5", "SD 2.0", "SD 2.1"]
+        base_model_filter = None
+        if isinstance(base_models, list) and base_models:
+            vals = [str(m).replace('"', "").strip() for m in base_models]
+            vals = [v for v in vals if v][:40]
+            if vals:
+                quoted = ", ".join('"%s"' % v for v in vals)
+                base_model_filter = f"baseModel IN [{quoted}]"
+        else:
+            quoted = ", ".join('"%s"' % m for m in LEGACY_BASE_MODELS)
+            base_model_filter = f"baseModel NOT IN [{quoted}]"
+
         nsfw_filter = "(nsfwLevel != 32)" if nsfw else "(nsfwLevel = 1)"
 
         headers = {
@@ -252,6 +271,8 @@ async def epe_prompts_search(request):
             filters = ["(type = video)", nsfw_filter]
             if period_filter:
                 filters.append(period_filter)
+            if base_model_filter:
+                filters.append(base_model_filter)
 
             fetch_limit = 40
             offset = (page - 1) * fetch_limit
@@ -331,6 +352,8 @@ async def epe_prompts_search(request):
         filters = ["(type != video)", nsfw_filter]
         if period_filter:
             filters.append(period_filter)
+        if base_model_filter:
+            filters.append(base_model_filter)
 
         fetch_limit = 40
         offset = (page - 1) * fetch_limit
@@ -461,12 +484,18 @@ async def epe_prompts_search_genur(request):
         query      = body.get("query", "").strip()
         page       = int(body.get("page", 1))
         sort       = body.get("sort", "popular")     # "popular" | "newest" | "oldest" | "relevant"
+        base_models = body.get("baseModels", [])
 
-        if not query:
-            return web.json_response({"items": [], "metadata": {"hasMore": False, "page": page}})
-
+        # Empty query is a valid browse request — Genur returns its ranked feed.
+        # Genur's search API filters by a single base model (the `base_model`
+        # query param); it ignores repeated/comma values, so we send just the
+        # first selected model.
         url = "https://genur.art/api/search"
         params = {"q": query, "sort": sort, "page": page}
+        if isinstance(base_models, list) and base_models:
+            first = str(base_models[0]).strip()
+            if first:
+                params["base_model"] = first
         headers = {
             "Accept": "application/json",
             "User-Agent": "Mozilla/5.0",
@@ -541,6 +570,68 @@ async def epe_prompts_search_genur(request):
 # SeaArt prompt search + detail
 # ─────────────────────────────────────────────────────────────────────────────
 
+_SEAART_BROWSER_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept":       "application/json",
+    "Origin":       "https://www.seaart.ai",
+    "Referer":      "https://www.seaart.ai/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
+
+
+async def _seaart_post_detail(session, post_id):
+    """Resolve a SeaArt post's prompt + media via post/v2/detail.
+
+    This single endpoint works for BOTH image and video posts — video posts
+    return the prompt in meta.prompt and the playable .mp4 in banner.url, with
+    banner.cover_url as the poster. Returns a dict, or None on failure. The
+    caller treats an empty prompt as "no result" and drops it.
+    """
+    if not post_id:
+        return None
+    try:
+        async with session.post(
+            "https://www.seaart.ai/api/v1/post/v2/detail",
+            json={"id": post_id, "ss": 0},
+            headers=_SEAART_BROWSER_HEADERS,
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+    except Exception:
+        return None
+    if (data.get("status") or {}).get("code") != 10000:
+        return None
+    lst = ((data.get("data") or {}).get("list")) or []
+    if not lst:
+        return None
+    first  = lst[0]
+    meta   = first.get("meta") or {}
+    banner = first.get("banner") or {}
+    url    = banner.get("url", "") or ""
+    cover  = banner.get("cover_url", "") or ""
+    is_video = (
+        bool(first.get("is_video_has_audio"))
+        or url.lower().endswith(".mp4")
+        or first.get("sub_channel") == "video"
+    )
+    return {
+        "prompt":         (meta.get("prompt", "") or "").strip(),
+        "negativePrompt": meta.get("extra_prompt", "") or "",
+        "model":          first.get("model_name", "") or "",
+        "steps":          str(meta.get("steps", 0) or ""),
+        "cfg":            str(meta.get("guidance_scale", 0) or ""),
+        "seed":           str(meta.get("seed", 0) or ""),
+        "videoUrl":       url if is_video else "",
+        "imageUrl":       (cover or "") if is_video else url,
+        "mediaType":      "video" if is_video else "image",
+    }
+
+
 @routes.post("/epe/prompts/search-seaart")
 async def epe_prompts_search_seaart(request):
     """
@@ -555,13 +646,16 @@ async def epe_prompts_search_seaart(request):
         page       = int(body.get("page", 1))
         order      = body.get("sort", "hot")   # "hot" | "new"
         media_type = body.get("mediaType", "image")
+        category   = (body.get("category") or "fan_art").strip()  # browse tag slug
         # obj_type=4 = image posts, obj_type=15 = video posts
         obj_type   = 15 if media_type == "video" else 4
 
-        if not query:
-            return web.json_response({"items": [], "metadata": {"hasMore": False, "page": page}})
-
-        url = "https://www.seaart.ai/api/v1/square/v3/search/list"
+        # SeaArt changed their API — the old /search/list endpoint now 400s with
+        # "params error". This is the endpoint that powers the /post explore
+        # page. It browses by category tag (tag_ids) when there's no query, and
+        # free-text searches via `keyword`. Same response envelope as before, so
+        # the item parsing below is unchanged.
+        url = "https://www.seaart.ai/api/v1/square/v3/post/list"
         # Browser-like headers — SeaArt's edge has grown stricter over time and
         # bare ``Mozilla/5.0`` without Origin/Referer is more likely to be rejected.
         headers = {
@@ -576,15 +670,19 @@ async def epe_prompts_search_seaart(request):
             ),
         }
         payload = {
+            "canary_for_other": "sku",
+            "scene":     "ai_search_portfolio",
             "order_by":  order,
-            "scene":     "square",
-            "obj_name":  query,
             "obj_type":  obj_type,
             "page":      page,
-            "page_size": 35,
-            "offset":    0,
+            "page_size": 30,
+            "offset":    "",
             "ss":        0,
         }
+        if query:
+            payload["keyword"] = query
+        else:
+            payload["tag_ids"] = [category or "fan_art"]
 
         result = await _post_json_with_retries(
             url,
@@ -638,10 +736,14 @@ async def epe_prompts_search_seaart(request):
 
             cover = item.get("cover") or {}
             cover_url = cover.get("url", "") if isinstance(cover, dict) else ""
-            stream = item.get("stream") or {}
-            # Video items carry stream.url3 as the actual video URL
-            video_url = (stream.get("url3", "") or stream.get("url", "")) if isinstance(stream, dict) else ""
-            is_video  = bool(item.get("is_video_has_audio")) or media_type == "video"
+            # Video posts are flagged by sub_channel == "video"; the feed's
+            # is_video_has_audio field is unreliable here. The playable URL and
+            # prompt are resolved per-item below via post/v2/detail.
+            is_video = (
+                item.get("sub_channel") == "video"
+                or bool(item.get("is_video_has_audio"))
+                or media_type == "video"
+            )
 
             # Portfolio items (sub_obj_type=1) have a child list — the actual artwork
             # ID needed for detail lookup is child[0].id, not the portfolio id
@@ -651,15 +753,15 @@ async def epe_prompts_search_seaart(request):
             if not artwork_id:
                 filtered_noid += 1
                 continue
-            if not is_video and not cover_url:
+            if not cover_url:
                 filtered_nocover += 1
                 continue
 
             items_out.append({
                 "id":        item.get("id", ""),
                 "artworkId": artwork_id,
-                "imageUrl":  cover_url if not is_video else "",
-                "videoUrl":  video_url if is_video else "",
+                "imageUrl":  cover_url,          # thumbnail/poster for both images and videos
+                "videoUrl":  "",                 # filled in by enrichment for videos
                 "mediaType": "video" if is_video else "image",
                 "name":      (item.get("author") or {}).get("name", ""),
                 "prompt":    None,
@@ -668,6 +770,33 @@ async def epe_prompts_search_seaart(request):
                 "sampler":   "",
                 "seed":      "",
             })
+
+        # Enrich each item with its real prompt + media URL via post/v2/detail
+        # (concurrently), and DROP any item that has no usable prompt. This is
+        # what makes the feed show only results the user can actually pull a
+        # prompt from — SeaArt's browse feeds mix in prompt-less activity posts.
+        if items_out:
+            _sem = asyncio.Semaphore(8)
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as _dsession:
+                async def _enrich(it):
+                    async with _sem:
+                        det = await _seaart_post_detail(_dsession, it["id"])
+                    if not det or not det.get("prompt"):
+                        return None
+                    it["prompt"]    = det["prompt"]
+                    it["mediaType"] = det["mediaType"]
+                    if det["mediaType"] == "video":
+                        it["videoUrl"] = det["videoUrl"] or it["videoUrl"]
+                        if det.get("imageUrl") and not it["imageUrl"]:
+                            it["imageUrl"] = det["imageUrl"]
+                    it["steps"] = det.get("steps", "")
+                    it["cfg"]   = det.get("cfg", "")
+                    it["seed"]  = det.get("seed", "")
+                    return it
+                _enriched = await asyncio.gather(*[_enrich(it) for it in items_out])
+            items_out = [it for it in _enriched if it]
 
         # Defensive warning: if the API returned rows but our filter dropped
         # them all, something in the upstream schema likely changed again.
@@ -707,119 +836,37 @@ async def epe_prompts_seaart_detail(request):
     try:
         body       = await request.json()
         post_id    = body.get("id", "").strip()
-        # artworkId is the child artwork ID for portfolio items — use it if provided
-        artwork_id = body.get("artworkId", "").strip() or post_id
-        media_type = body.get("mediaType", "image")
 
         if not post_id:
             return web.json_response({"error": "Missing id"}, status=400)
 
-        headers = {
-            "Content-Type": "application/json",
-            "Accept":       "application/json",
-            "User-Agent":   "Mozilla/5.0",
-        }
+        # post/v2/detail resolves the prompt + media for both image and video
+        # posts (see _seaart_post_detail). Same endpoint the browse feed uses to
+        # enrich results, so click-to-load stays consistent with the grid.
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as session:
+            det = await _seaart_post_detail(session, post_id)
 
-        async def _fetch_detail(url, payload):
-            for _attempt in range(2):
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(
-                            url, json=payload, headers=headers,
-                            timeout=aiohttp.ClientTimeout(total=15)
-                        ) as resp:
-                            if resp.status != 200:
-                                return None, resp.status
-                            return await resp.json(content_type=None), 200
-                except asyncio.TimeoutError:
-                    if _attempt == 1:
-                        return None, 504
-                    await asyncio.sleep(0.5)
-            return None, 0
-
-        data = None
-
-        # If artwork_id differs from post_id it's a portfolio — go straight to artwork/detail
-        # which works for individual artwork IDs. Only use post/v2/detail for non-portfolio images.
-        if media_type != "video" and artwork_id == post_id:
-            data_v2, status_v2 = await _fetch_detail(
-                "https://www.seaart.ai/api/v1/post/v2/detail", {"id": post_id}
+        if not det:
+            return web.json_response(
+                {"error": "SeaArt detail fetch failed"}, status=502
             )
-            if data_v2 and data_v2.get("status", {}).get("code") == 10000:
-                data = data_v2
-                data_format = "v2"
-
-        if data is None:
-            data_art, status_art = await _fetch_detail(
-                "https://www.seaart.ai/api/v1/artwork/detail", {"id": artwork_id}
+        if not det["prompt"]:
+            return web.json_response(
+                {"error": "No prompt found for this post"}, status=404
             )
-            if data_art and data_art.get("status", {}).get("code") == 10000:
-                data = data_art
-                data_format = "artwork"
-            elif data_art and data_art.get("status", {}).get("code") == 10621:
-                return web.json_response(
-                    {"error": "This post is private or restricted on SeaArt"},
-                    status=403
-                )
-            else:
-                # Last resort: try post/v2/detail with the artwork_id
-                data_v2b, _ = await _fetch_detail(
-                    "https://www.seaart.ai/api/v1/post/v2/detail", {"id": artwork_id}
-                )
-                if data_v2b and data_v2b.get("status", {}).get("code") == 10000:
-                    data = data_v2b
-                    data_format = "v2"
-                else:
-                    return web.json_response(
-                        {"error": "SeaArt detail fetch failed (tried all endpoints)"},
-                        status=502
-                    )
-
-        # ── Parse v2 format (image posts) ────────────────────────────────
-        if data_format == "v2":
-            items = (data.get("data") or {}).get("list", [])
-            if not items:
-                return web.json_response({"error": "No detail data returned"}, status=404)
-            first   = items[0]
-            meta    = first.get("meta") or {}
-            banner  = first.get("banner") or {}
-            return web.json_response({
-                "prompt":         meta.get("prompt", "")          or "",
-                "negativePrompt": meta.get("extra_prompt", "")    or "",
-                "model":          first.get("model_name", "")     or "",
-                "steps":          str(meta.get("steps", 0) or ""),
-                "cfg":            str(meta.get("guidance_scale", 0) or ""),
-                "seed":           str(meta.get("seed", 0) or ""),
-                "sampler":        "",
-                "imageUrl":       banner.get("url", "")           or "",
-                "videoUrl":       "",
-                "mediaType":      "image",
-            })
-
-        # ── Parse artwork format (video posts) ───────────────────────────
-        art     = data.get("data") or {}
-        meta    = art.get("meta") or {}
-        banner  = art.get("banner") or {}
-        # banner.url is the mp4 for video posts; banner.cover_url may be a thumbnail
-        banner_url  = banner.get("url", "") or ""
-        cover_url   = banner.get("cover_url", "") or ""
-        is_video    = art.get("is_video_has_audio") or (media_type == "video")
-        # Detect video by file extension or explicit flag
-        if not is_video and banner_url.endswith(".mp4"):
-            is_video = True
-        video_url = banner_url if is_video else ""
-        image_url = cover_url  if is_video else banner_url
         return web.json_response({
-            "prompt":         meta.get("prompt", "")        or "",
-            "negativePrompt": meta.get("extra_prompt", "")  or "",
-            "model":          art.get("model_name", "")     or "",
-            "steps":          str(meta.get("steps", 0) or ""),
-            "cfg":            str(meta.get("guidance_scale", 0) or ""),
-            "seed":           str(meta.get("seed", 0) or ""),
+            "prompt":         det["prompt"],
+            "negativePrompt": det["negativePrompt"],
+            "model":          det["model"],
+            "steps":          det["steps"],
+            "cfg":            det["cfg"],
+            "seed":           det["seed"],
             "sampler":        "",
-            "imageUrl":       image_url,
-            "videoUrl":       video_url,
-            "mediaType":      "video" if is_video else "image",
+            "imageUrl":       det["imageUrl"],
+            "videoUrl":       det["videoUrl"],
+            "mediaType":      det["mediaType"],
         })
 
     except Exception as e:

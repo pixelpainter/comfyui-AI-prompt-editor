@@ -184,6 +184,14 @@ Bugs and feature requests → [open an issue](https://github.com/pixelpainter/co
 
 ## Changelog
 
+### 1.0.15
+- Library now browses without a search — Civitai, Genur.art and Sea.art open on a live feed you can scroll straight away; type any time to search.
+- Added a **Models** filter to the Civitai and Genur browsers to focus the feed on chosen base models (multi-select on Civitai, single on Genur).
+- Rebuilt the Sea.art browser on Sea.art's current API — fixes search (their old endpoint stopped working), adds category chips (Fan Art, GPT image 2, Trending Seedance, Short Film, Viral Clips), and restores video prompts and playback.
+- Sea.art results are filtered to posts that actually carry a prompt, so no more empty detail cards.
+- The Library panel is now resizable — drag the divider between the editor and the panel; double-click to reset.
+- Fixed Variations sometimes returning only two results (or a truncated third) by giving it a larger generation budget.
+
 ### 1.0.14
 - Fixed Ollama initialization on Linux — the node now starts Ollama automatically if it isn't running. Auto-start only works if Ollama is on your PATH.
 - Clearer message and a longer connection timeout when Ollama can't be reached.
