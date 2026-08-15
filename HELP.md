@@ -42,7 +42,7 @@ Wireless targets send your prompt into text widgets elsewhere in the workflow �
 **Video to Prompt** — samples multiple frames from a clip and writes an image prompt from a video.  
 **Extract from Image** — pulls the embedded prompt from a ComfyUI-generated PNG/JPEG/WebP.
 
-You can also run **Image to Prompt** or **Video to Prompt** directly on any search result from Civitai, Genur.art, or Sea.art, or just run an **Enhance** on the image prompt itself — click on/open a search result and use the button in its detail panel.
+You can also run **Image to Prompt** or **Video to Prompt** directly on any search result from Civitai or Genur.art, or just run an **Enhance** on the image prompt itself — click on/open a search result and use the button in its detail panel.
 
 ## Style tuning
 
@@ -67,7 +67,7 @@ Pick a **Style** (Midjourney, DALL·E, Anime, Cinematic…) to have the AI creat
 
 ## Library
 
-Search prompts from **Civitai**, **Genur.art**, and **Sea.art** — type a term and scroll to load more. Image/video previews included.
+Search prompts from **Civitai** and **Genur.art** — type a term and scroll to load more. Image/video previews included.
 - Click a result to open it, then **Use**, **Enhance**, **Variations**, **Save**, **Image to Prompt** on an image, or **Video to Prompt** on a video result.
 - **Workflows** — search and load ComfyUI workflows from the results.
 - **Favorites** / **Snippets** — your saved prompts and reusable fragments.

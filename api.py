@@ -196,271 +196,210 @@ async def _post_json_with_retries(
 @routes.post("/epe/prompts/search")
 async def epe_prompts_search(request):
     """
-    Search CivitAI for image or video prompts by topic.
-    mediaType="image" (default): Meilisearch images_v6 index.
-    mediaType="video": Civitai REST API /v1/images?type=video.
-    Returns a flat list of {id, imageUrl, videoUrl, mediaType, name, prompt, steps, cfg, sampler, seed}.
+    Search Civitai for image or video prompts.
+
+    Uses the public REST API (GET /api/v1/images). Civitai's Terms of Service
+    §11.4 prohibits automated access "except through interfaces we expressly
+    provide for automated access, such as our public API" — this route is that
+    interface. No API key is required for public reads.
+
+    Two server-side behaviours are worked around here:
+
+      * withMeta=true is what makes the API return the "meta" object at all;
+        without it there is no prompt to read. It is an include flag, not a
+        filter — items with "meta": null still come back — so prompt-bearing
+        items are additionally selected locally.
+      * The top-level "baseModel" field is always null, so it cannot be used
+        for local filtering; the baseModels request parameter is passed
+        through and relied on for that.
+
+    /api/v1/images also has no free-text query parameter. When a query is
+    supplied we walk the cursor, matching against prompt text locally, up to
+    SEARCH_MAX_PAGES pages so a term with no matches can't run away.
+
+    Returns a flat list of {id, imageUrl, videoUrl, mediaType, isPng, name,
+    prompt, steps, cfg, sampler, seed} plus metadata.nextCursor for paging.
     """
     try:
-        body       = await request.json()
-        query      = body.get("query", "").strip()
-        sort       = body.get("sort", "Most Reactions")
-        period     = body.get("period", "Month")
-        nsfw       = body.get("nsfw", False)
-        page       = int(body.get("page", 1))
-        media_type = body.get("mediaType", "image")
+        body        = await request.json()
+        query       = body.get("query", "").strip()
+        sort        = body.get("sort", "Most Reactions")
+        period      = body.get("period", "Month")
+        nsfw        = body.get("nsfw", False)
+        page        = int(body.get("page", 1))
+        cursor      = body.get("cursor") or None
+        media_type  = body.get("mediaType", "image")
         base_models = body.get("baseModels", [])
 
-        MEILI_URL = "https://search-new.civitai.com/multi-search"
-        MEILI_KEY = "8c46eb2508e21db1e9828a97968d91ab1ca1caa5f70a00e88a2ba1e286603b61"
-        IMAGE_CDN = "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA"
+        API_URL   = "https://civitai.com/api/v1/images"
+        FETCH_LIMIT     = 100      # API max is 200; 100 keeps responses quick
+        ITEMS_PER_PAGE  = 20
+        SEARCH_MAX_PAGES = 6       # only used when a query is supplied
 
-        # An empty query is a valid "browse" request — Meilisearch returns the
-        # index sorted by the chosen sort/period, which reproduces Civitai's
-        # homepage-style featured feed. We no longer short-circuit on empty q.
+        # sort/period pass through to the API, which accepts these verbatim.
+        VALID_SORT = {"Most Reactions", "Most Comments", "Most Collected",
+                      "Newest", "Oldest"}
+        sort_val = sort if sort in VALID_SORT else "Most Reactions"
 
-        # Shared sort/period config used by both image and video branches
-        sort_map = {
-            "Most Reactions":  "stats.reactionCountAllTime:desc",
-            "Most Collected":  "stats.collectedCountAllTime:desc",
-            "Newest":          "createdAt:desc",
-        }
-        sort_expr = sort_map.get(sort, "stats.reactionCountAllTime:desc")
+        # The API has no 6Month bucket; widen to Year rather than silently
+        # dropping the filter.
+        # The UI sends "" for its All Time chip. The API has no 6Month bucket,
+        # so that chip was dropped from the UI; the mapping stays as a guard for
+        # older saved state.
+        PERIOD_MAP = {"": "AllTime", "AllTime": "AllTime", "Day": "Day",
+                      "Week": "Week", "Month": "Month", "6Month": "Year",
+                      "Year": "Year"}
+        period_val = PERIOD_MAP.get(period, "AllTime")
 
-        period_ms_map = {
-            "Day":      86400    * 1000,
-            "Week":     604800   * 1000,
-            "Month":    2592000  * 1000,
-            "6Month":   15552000 * 1000,
-            "Year":     31536000 * 1000,
-        }
-        period_filter = None
-        if period in period_ms_map:
-            now_ms    = int(datetime.datetime.utcnow().timestamp() * 1000)
-            cutoff_ms = now_ms - period_ms_map[period]
-            period_filter = f"createdAtUnix >= {cutoff_ms}"
-
-        # "Models" filter. When the user selects one or more base models we
-        # restrict the feed to exactly those (inclusion). With no selection we
-        # still hide legacy Stable Diffusion 1.x/2.x so the default browse feed
-        # stays modern. Values are sanitized and quote-stripped before building
-        # the Meilisearch expression, and the selection is capped for safety.
-        LEGACY_BASE_MODELS = ["SD 1.4", "SD 1.5", "SD 2.0", "SD 2.1"]
-        base_model_filter = None
+        # aiohttp needs a list of pairs (not a dict) so baseModels can repeat.
+        params = [
+            ("limit",  str(FETCH_LIMIT)),
+            ("sort",   sort_val),
+            ("period", period_val),
+            ("type",   "video" if media_type == "video" else "image"),
+            ("nsfw",   "X" if nsfw else "None"),
+            # Required: without this the response carries no "meta" object,
+            # so every item looks prompt-less and gets dropped below.
+            ("withMeta", "true"),
+        ]
         if isinstance(base_models, list) and base_models:
-            vals = [str(m).replace('"', "").strip() for m in base_models]
-            vals = [v for v in vals if v][:40]
-            if vals:
-                quoted = ", ".join('"%s"' % v for v in vals)
-                base_model_filter = f"baseModel IN [{quoted}]"
-        else:
-            quoted = ", ".join('"%s"' % m for m in LEGACY_BASE_MODELS)
-            base_model_filter = f"baseModel NOT IN [{quoted}]"
-
-        nsfw_filter = "(nsfwLevel != 32)" if nsfw else "(nsfwLevel = 1)"
+            for m in [str(x).strip() for x in base_models if str(x).strip()][:40]:
+                params.append(("baseModels", m))
 
         headers = {
-            "Authorization":   f"Bearer {MEILI_KEY}",
-            "Content-Type":    "application/json",
-            "Origin":          "https://civitai.com",
-            "Referer":         "https://civitai.com/",
+            "Accept":     "application/json",
+            "User-Agent": "ComfyUI-Enhanced-Prompt-Editor",
         }
 
-        # ── VIDEO branch — images_v6 with (type = video) filter ──────────
-        if media_type == "video":
-            filters = ["(type = video)", nsfw_filter]
-            if period_filter:
-                filters.append(period_filter)
-            if base_model_filter:
-                filters.append(base_model_filter)
+        def _thumb(u):
+            """Civitai image URLs carry a transform segment; swap the
+               full-size one for a width-capped thumbnail."""
+            if not u or not u.startswith("http"):
+                return u
+            return u.replace("/original=true/", "/width=450/")
 
-            fetch_limit = 40
-            offset = (page - 1) * fetch_limit
-
-            meili_body = {
-                "queries": [{
-                    "q":                     query,
-                    "indexUid":              "images_v6",
-                    "attributesToHighlight": [],
-                    "highlightPreTag":       "__ais-highlight__",
-                    "highlightPostTag":      "__/ais-highlight__",
-                    "limit":                 fetch_limit,
-                    "offset":                offset,
-                    "filter":                filters,
-                    "sort":                  [sort_expr],
-                }]
+        def _norm(item):
+            """Map one API item to EPE's flat shape, or None if it carries
+               no prompt (meta is absent on a large share of items)."""
+            meta = item.get("meta") or {}
+            prompt = (meta.get("prompt") or "").strip()
+            if not prompt:
+                return None
+            url_val = item.get("url", "") or ""
+            is_video = (item.get("type") or "") == "video"
+            return {
+                "id":        str(item.get("id", "")),
+                "imageUrl":  _thumb(url_val),
+                "videoUrl":  url_val if is_video else "",
+                "mediaType": "video" if is_video else "image",
+                "isPng":     url_val.lower().endswith(".png"),
+                "name":      item.get("username", "") or "",
+                "prompt":    prompt,
+                "steps":     str(meta.get("steps")    or meta.get("Steps")    or ""),
+                "cfg":       str(meta.get("cfgScale") or meta.get("cfg_scale") or ""),
+                "sampler":   str(meta.get("sampler")  or meta.get("Sampler")  or ""),
+                "seed":      str(meta.get("seed")     or meta.get("Seed")     or ""),
             }
 
-            result = await _post_json_with_retries(
-                MEILI_URL,
-                json_body=meili_body,
-                headers=headers,
-                timeout_total=30.0,
-                label="civitai video search",
-            )
-            if result[0] == "status":
-                return web.json_response({"error": f"Video search failed ({result[1]})"}, status=502)
-            if result[0] == "error":
-                return web.json_response({"error": "Video search failed"}, status=504)
-            data = result[1]
+        # Local relevance test, standing in for the query parameter the API
+        # does not provide. Every whitespace-separated term must appear in the
+        # prompt at a word start — a plain substring test matches "elf" inside
+        # "herself"/"shelf" and floods the results with noise. Anchoring only
+        # the start still allows plurals and derived forms ("cyborg" matches
+        # "cyborgs", "elf" matches "elven").
+        terms = [t for t in query.lower().split() if t]
+        term_res = [re.compile(r"\b" + re.escape(t)) for t in terms]
 
-            results    = data.get("results", [])
-            hits       = results[0].get("hits", [])              if results else []
-            total_hits = results[0].get("estimatedTotalHits", 0) if results else 0
-
-            items_out = []
-            for hit in hits:
-                url_val   = hit.get("url", "")
-                video_url = f"{IMAGE_CDN}/{url_val}/original=true" if url_val and not url_val.startswith("http") else url_val
-                thumb_url = f"{IMAGE_CDN}/{url_val}/width=450"     if url_val and not url_val.startswith("http") else url_val
-                prompt = hit.get("prompt", "")
-                if not prompt:
-                    continue
-                meta = hit.get("metadata") or {}
-                items_out.append({
-                    "id":        str(hit.get("id", "")),
-                    "imageUrl":  thumb_url,
-                    "videoUrl":  video_url,
-                    "mediaType": "video",
-                    "isPng":     False,
-                    "name":      (hit.get("user") or {}).get("username", "") or hit.get("username", ""),
-                    "prompt":    prompt,
-                    "steps":     str(meta.get("steps")    or meta.get("Steps")    or ""),
-                    "cfg":       str(meta.get("cfgScale") or meta.get("cfg_scale") or ""),
-                    "sampler":   str(meta.get("sampler")  or meta.get("Sampler")  or ""),
-                    "seed":      str(meta.get("seed")     or meta.get("Seed")     or ""),
-                })
-
-            has_more = (offset + fetch_limit) < total_hits
-            server_ms = (data.get("results", [{}])[0] or {}).get("processingTimeMs")
-            logger.info(
-                f"epe_prompts_search video '{query}' page={page}: "
-                f"{len(items_out)} items, ~{total_hits} total, server={server_ms}ms"
-            )
-            return web.json_response({
-                "items":    items_out,
-                "metadata": {"hasMore": has_more, "page": page},
-            })
-
-        # ── IMAGE branch — images_v6 with (type != video) filter ──────────
-        #
-        # Adding (type != video) narrows Meilisearch's candidate set
-        # substantially (video is a small fraction of images_v6) and speeds
-        # up server-side processing by ~30%. We fetch 40 then dedup down to
-        # 20 — empirically only ~30 hits are needed to clear dedup.
-
-        filters = ["(type != video)", nsfw_filter]
-        if period_filter:
-            filters.append(period_filter)
-        if base_model_filter:
-            filters.append(base_model_filter)
-
-        fetch_limit = 40
-        offset = (page - 1) * fetch_limit
-        images_per_page = 20
-
-        meili_body = {
-            "queries": [{
-                "q":                     query,
-                "indexUid":              "images_v6",
-                "attributesToHighlight": [],
-                "highlightPreTag":       "__ais-highlight__",
-                "highlightPostTag":      "__/ais-highlight__",
-                "limit":                 fetch_limit,
-                "offset":                offset,
-                "filter":                filters,
-                "sort":                  [sort_expr],
-            }]
-        }
-
-        result = await _post_json_with_retries(
-            MEILI_URL,
-            json_body=meili_body,
-            headers=headers,
-            timeout_total=30.0,
-            label="civitai image search",
-        )
-        if result[0] == "status":
-            return web.json_response({"error": f"Search failed ({result[1]})"}, status=502)
-        if result[0] == "error":
-            return web.json_response({"error": "Search timed out, please try again"}, status=504)
-        data = result[1]
-
-        results    = data.get("results", [])
-        hits       = results[0].get("hits", [])              if results else []
-        total_hits = results[0].get("estimatedTotalHits", 0) if results else 0
-        server_ms  = results[0].get("processingTimeMs")      if results else None
+        def _matches(prompt_text):
+            if not term_res:
+                return True
+            low = prompt_text.lower()
+            return all(r.search(low) for r in term_res)
 
         def _prompt_sig(text):
-            """Fuzzy signature: lowercase, strip lora/embedding tags, collapse whitespace,
-               take first 120 chars of meaningful words for comparison."""
+            """Fuzzy signature: lowercase, strip lora/embedding tags, collapse
+               whitespace, take first 120 chars of meaningful words."""
             t = text.lower()
-            t = re.sub(r'<[^>]+>', '', t)          # strip <lora:...> etc
-            t = re.sub(r'[()\[\]{}:0-9._\-]+', ' ', t)  # strip weights/punctuation
+            t = re.sub(r'<[^>]+>', '', t)
+            t = re.sub(r'[()\[\]{}:0-9._\-]+', ' ', t)
             t = re.sub(r'\s+', ' ', t).strip()
             return t[:120]
 
         def _similar(a, b, threshold=0.75):
-            """Returns True if two prompt signatures share >= threshold of their words."""
-            wa = set(a.split())
-            wb = set(b.split())
+            wa, wb = set(a.split()), set(b.split())
             if not wa or not wb:
                 return False
-            overlap = len(wa & wb) / max(len(wa), len(wb))
-            return overlap >= threshold
+            return len(wa & wb) / max(len(wa), len(wb)) >= threshold
 
-        images_out = []
+        items_out  = []
         seen_sigs  = []
+        next_cursor = cursor
+        pages_walked = 0
+        scanned = 0
+        max_pages = SEARCH_MAX_PAGES if terms else 1
 
-        for hit in hits:
-            if len(images_out) >= images_per_page:
+        session = _get_session()
+        while pages_walked < max_pages and len(items_out) < ITEMS_PER_PAGE:
+            page_params = list(params)
+            if next_cursor:
+                page_params.append(("cursor", next_cursor))
+
+            try:
+                async with session.get(
+                    API_URL, params=page_params, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status != 200:
+                        if items_out:
+                            break
+                        return web.json_response(
+                            {"error": f"Civitai search failed ({resp.status})"},
+                            status=502,
+                        )
+                    data = await resp.json(content_type=None)
+            except asyncio.TimeoutError:
+                if items_out:
+                    break
+                return web.json_response(
+                    {"error": "Civitai search timed out, please try again"},
+                    status=504,
+                )
+
+            raw_items   = data.get("items") or []
+            next_cursor = ((data.get("metadata") or {}).get("nextCursor")) or None
+            pages_walked += 1
+            scanned += len(raw_items)
+
+            for raw in raw_items:
+                if len(items_out) >= ITEMS_PER_PAGE:
+                    break
+                norm = _norm(raw)
+                if not norm or not _matches(norm["prompt"]):
+                    continue
+                sig = _prompt_sig(norm["prompt"])
+                if any(_similar(sig, s) for s in seen_sigs):
+                    continue
+                seen_sigs.append(sig)
+                items_out.append(norm)
+
+            if not next_cursor:
                 break
 
-            prompt = hit.get("prompt", "")
-            if not prompt:
-                continue
-
-            sig = _prompt_sig(prompt)
-            if any(_similar(sig, s) for s in seen_sigs):
-                continue
-            seen_sigs.append(sig)
-
-            meta = hit.get("metadata") or {}
-
-            url_val = hit.get("url", "")
-            if url_val and not url_val.startswith("http"):
-                image_url = f"{IMAGE_CDN}/{url_val}/width=450"
-            else:
-                image_url = url_val
-
-            # Detect PNG vs JPEG from the URL or mimeType field so JS can skip probing JPEGs
-            mime   = (hit.get("mimeType") or hit.get("mime_type") or "").lower()
-            is_png = mime == "image/png" or url_val.lower().endswith(".png")
-
-            user = hit.get("user") or {}
-            images_out.append({
-                "id":        hit.get("id", ""),
-                "imageUrl":  image_url,
-                "videoUrl":  "",
-                "mediaType": "image",
-                "isPng":     is_png,
-                "name":      user.get("username", "") or hit.get("name", ""),
-                "prompt":    prompt,
-                "steps":     meta.get("steps")    or meta.get("Steps")    or "",
-                "cfg":       meta.get("cfgScale") or meta.get("cfg_scale") or meta.get("CfgScale") or "",
-                "sampler":   meta.get("sampler")  or meta.get("Sampler")  or "",
-                "seed":      meta.get("seed")     or meta.get("Seed")     or "",
-            })
-
-        has_more = (offset + fetch_limit) < total_hits
+        has_more = bool(next_cursor)
         logger.info(
-            f"epe_prompts_search image '{query}' page={page}: "
-            f"{len(images_out)}/{len(hits)} hits kept, server={server_ms}ms, hasMore={has_more}"
+            f"epe_prompts_search {media_type} '{query}' page={page}: "
+            f"{len(items_out)} kept from {scanned} scanned over "
+            f"{pages_walked} page(s), hasMore={has_more}"
         )
 
         return web.json_response({
-            "items":    images_out,
-            "metadata": {"hasMore": has_more, "page": page},
+            "items":    items_out,
+            "metadata": {
+                "hasMore":    has_more,
+                "page":       page,
+                "nextCursor": next_cursor,
+                "scanned":    scanned,
+            },
         })
 
     except Exception as e:
@@ -564,316 +503,6 @@ async def epe_prompts_search_genur(request):
     except Exception as e:
         logger.error(f"Error in epe_prompts_search_genur: {e}", exc_info=True)
         return web.json_response({"error": str(e)}, status=500)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SeaArt prompt search + detail
-# ─────────────────────────────────────────────────────────────────────────────
-
-_SEAART_BROWSER_HEADERS = {
-    "Content-Type": "application/json",
-    "Accept":       "application/json",
-    "Origin":       "https://www.seaart.ai",
-    "Referer":      "https://www.seaart.ai/",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-}
-
-
-async def _seaart_post_detail(session, post_id):
-    """Resolve a SeaArt post's prompt + media via post/v2/detail.
-
-    This single endpoint works for BOTH image and video posts — video posts
-    return the prompt in meta.prompt and the playable .mp4 in banner.url, with
-    banner.cover_url as the poster. Returns a dict, or None on failure. The
-    caller treats an empty prompt as "no result" and drops it.
-    """
-    if not post_id:
-        return None
-    try:
-        async with session.post(
-            "https://www.seaart.ai/api/v1/post/v2/detail",
-            json={"id": post_id, "ss": 0},
-            headers=_SEAART_BROWSER_HEADERS,
-        ) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json(content_type=None)
-    except Exception:
-        return None
-    if (data.get("status") or {}).get("code") != 10000:
-        return None
-    lst = ((data.get("data") or {}).get("list")) or []
-    if not lst:
-        return None
-    first  = lst[0]
-    meta   = first.get("meta") or {}
-    banner = first.get("banner") or {}
-    url    = banner.get("url", "") or ""
-    cover  = banner.get("cover_url", "") or ""
-    is_video = (
-        bool(first.get("is_video_has_audio"))
-        or url.lower().endswith(".mp4")
-        or first.get("sub_channel") == "video"
-    )
-    return {
-        "prompt":         (meta.get("prompt", "") or "").strip(),
-        "negativePrompt": meta.get("extra_prompt", "") or "",
-        "model":          first.get("model_name", "") or "",
-        "steps":          str(meta.get("steps", 0) or ""),
-        "cfg":            str(meta.get("guidance_scale", 0) or ""),
-        "seed":           str(meta.get("seed", 0) or ""),
-        "videoUrl":       url if is_video else "",
-        "imageUrl":       (cover or "") if is_video else url,
-        "mediaType":      "video" if is_video else "image",
-    }
-
-
-@routes.post("/epe/prompts/search-seaart")
-async def epe_prompts_search_seaart(request):
-    """
-    Search SeaArt for image prompts by topic.
-    POST https://www.seaart.ai/api/v1/square/v3/search/list
-    Returns { items, metadata } — prompt is null (fetched lazily on click).
-    mediaType="image" (default): obj_type=4. mediaType="video": obj_type=15.
-    """
-    try:
-        body       = await request.json()
-        query      = body.get("query", "").strip()
-        page       = int(body.get("page", 1))
-        order      = body.get("sort", "hot")   # "hot" | "new"
-        media_type = body.get("mediaType", "image")
-        category   = (body.get("category") or "fan_art").strip()  # browse tag slug
-        # obj_type=4 = image posts, obj_type=15 = video posts
-        obj_type   = 15 if media_type == "video" else 4
-
-        # SeaArt changed their API — the old /search/list endpoint now 400s with
-        # "params error". This is the endpoint that powers the /post explore
-        # page. It browses by category tag (tag_ids) when there's no query, and
-        # free-text searches via `keyword`. Same response envelope as before, so
-        # the item parsing below is unchanged.
-        url = "https://www.seaart.ai/api/v1/square/v3/post/list"
-        # Browser-like headers — SeaArt's edge has grown stricter over time and
-        # bare ``Mozilla/5.0`` without Origin/Referer is more likely to be rejected.
-        headers = {
-            "Content-Type":    "application/json",
-            "Accept":          "application/json",
-            "Origin":          "https://www.seaart.ai",
-            "Referer":         "https://www.seaart.ai/",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        }
-        payload = {
-            "canary_for_other": "sku",
-            "scene":     "ai_search_portfolio",
-            "order_by":  order,
-            "obj_type":  obj_type,
-            "page":      page,
-            "page_size": 30,
-            "offset":    "",
-            "ss":        0,
-        }
-        if query:
-            payload["keyword"] = query
-        else:
-            payload["tag_ids"] = [category or "fan_art"]
-
-        result = await _post_json_with_retries(
-            url,
-            json_body=payload,
-            headers=headers,
-            timeout_total=30.0,
-            label="seaart search",
-        )
-        if result[0] == "status":
-            return web.json_response({"error": f"SeaArt search failed ({result[1]})"}, status=502)
-        if result[0] == "error":
-            return web.json_response({"error": "SeaArt search failed"}, status=504)
-        data = result[1]
-
-        # Defensive shape check — log once if the envelope changes rather than
-        # 502-ing silently, so future breakage is diagnosable from the log.
-        status_obj  = data.get("status") or {}
-        status_code = status_obj.get("code")
-        if status_code != 10000:
-            msg = status_obj.get("msg", "Unknown error")
-            logger.warning(
-                f"seaart search API error: code={status_code} msg={msg!r} "
-                f"top-level keys={list(data.keys())}"
-            )
-            return web.json_response({"error": f"SeaArt API error: {msg}"}, status=502)
-
-        api_data  = data.get("data") or {}
-        raw_items = api_data.get("items") or []
-        has_more  = bool(api_data.get("has_more", False))
-
-        def _as_int(v, default=0):
-            """Tolerant int cast — handles None, strings, floats without raising."""
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                return default
-
-        items_out    = []
-        filtered_nsfw = 0
-        filtered_nocover = 0
-        filtered_noid    = 0
-
-        for item in raw_items:
-            # NSFW filter — only ``nsfw_level`` and ``c_nsfw_level`` reflect
-            # content safety. The ``nsfw`` field (observed value: 2 on every
-            # benign result) is a category/content-type tag, not a safety
-            # level, so it must NOT be part of the filter.
-            if _as_int(item.get("nsfw_level")) > 0 or _as_int(item.get("c_nsfw_level")) > 0:
-                filtered_nsfw += 1
-                continue
-
-            cover = item.get("cover") or {}
-            cover_url = cover.get("url", "") if isinstance(cover, dict) else ""
-            # Video posts are flagged by sub_channel == "video"; the feed's
-            # is_video_has_audio field is unreliable here. The playable URL and
-            # prompt are resolved per-item below via post/v2/detail.
-            is_video = (
-                item.get("sub_channel") == "video"
-                or bool(item.get("is_video_has_audio"))
-                or media_type == "video"
-            )
-
-            # Portfolio items (sub_obj_type=1) have a child list — the actual artwork
-            # ID needed for detail lookup is child[0].id, not the portfolio id
-            children   = item.get("child") or []
-            artwork_id = children[0].get("id", "") if children else item.get("id", "")
-
-            if not artwork_id:
-                filtered_noid += 1
-                continue
-            if not cover_url:
-                filtered_nocover += 1
-                continue
-
-            items_out.append({
-                "id":        item.get("id", ""),
-                "artworkId": artwork_id,
-                "imageUrl":  cover_url,          # thumbnail/poster for both images and videos
-                "videoUrl":  "",                 # filled in by enrichment for videos
-                "mediaType": "video" if is_video else "image",
-                "name":      (item.get("author") or {}).get("name", ""),
-                "prompt":    None,
-                "steps":     "",
-                "cfg":       "",
-                "sampler":   "",
-                "seed":      "",
-            })
-
-        # Enrich each item with its real prompt + media URL via post/v2/detail
-        # (concurrently), and DROP any item that has no usable prompt. This is
-        # what makes the feed show only results the user can actually pull a
-        # prompt from — SeaArt's browse feeds mix in prompt-less activity posts.
-        if items_out:
-            _sem = asyncio.Semaphore(8)
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=20)
-            ) as _dsession:
-                async def _enrich(it):
-                    async with _sem:
-                        det = await _seaart_post_detail(_dsession, it["id"])
-                    if not det or not det.get("prompt"):
-                        return None
-                    it["prompt"]    = det["prompt"]
-                    it["mediaType"] = det["mediaType"]
-                    if det["mediaType"] == "video":
-                        it["videoUrl"] = det["videoUrl"] or it["videoUrl"]
-                        if det.get("imageUrl") and not it["imageUrl"]:
-                            it["imageUrl"] = det["imageUrl"]
-                    it["steps"] = det.get("steps", "")
-                    it["cfg"]   = det.get("cfg", "")
-                    it["seed"]  = det.get("seed", "")
-                    return it
-                _enriched = await asyncio.gather(*[_enrich(it) for it in items_out])
-            items_out = [it for it in _enriched if it]
-
-        # Defensive warning: if the API returned rows but our filter dropped
-        # them all, something in the upstream schema likely changed again.
-        if raw_items and not items_out:
-            sample = raw_items[0]
-            logger.warning(
-                f"seaart search returned {len(raw_items)} items but all were filtered "
-                f"(nsfw={filtered_nsfw} no_id={filtered_noid} no_cover={filtered_nocover}). "
-                f"Sample keys: {list(sample.keys())[:20]} "
-                f"Sample nsfw fields: nsfw={sample.get('nsfw')} "
-                f"nsfw_level={sample.get('nsfw_level')} c_nsfw_level={sample.get('c_nsfw_level')}"
-            )
-
-        logger.info(
-            f"epe_prompts_search_seaart '{query}' page={page}: "
-            f"{len(items_out)}/{len(raw_items)} items kept, hasMore={has_more}"
-        )
-
-        return web.json_response({
-            "items":    items_out,
-            "metadata": {"hasMore": has_more, "page": page},
-        })
-
-    except Exception as e:
-        logger.error(f"Error in epe_prompts_search_seaart: {e}", exc_info=True)
-        return web.json_response({"error": str(e)}, status=500)
-
-
-@routes.post("/epe/prompts/seaart-detail")
-async def epe_prompts_seaart_detail(request):
-    """
-    Fetch full prompt + metadata for a single SeaArt post.
-    POST body: { "id": "<postId>", "mediaType": "image"|"video" }
-    Tries post/v2/detail first (image posts); falls back to artwork/detail (video posts).
-    Returns: { prompt, negativePrompt, model, steps, cfg, seed, imageUrl, videoUrl, mediaType }
-    """
-    try:
-        body       = await request.json()
-        post_id    = body.get("id", "").strip()
-
-        if not post_id:
-            return web.json_response({"error": "Missing id"}, status=400)
-
-        # post/v2/detail resolves the prompt + media for both image and video
-        # posts (see _seaart_post_detail). Same endpoint the browse feed uses to
-        # enrich results, so click-to-load stays consistent with the grid.
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as session:
-            det = await _seaart_post_detail(session, post_id)
-
-        if not det:
-            return web.json_response(
-                {"error": "SeaArt detail fetch failed"}, status=502
-            )
-        if not det["prompt"]:
-            return web.json_response(
-                {"error": "No prompt found for this post"}, status=404
-            )
-        return web.json_response({
-            "prompt":         det["prompt"],
-            "negativePrompt": det["negativePrompt"],
-            "model":          det["model"],
-            "steps":          det["steps"],
-            "cfg":            det["cfg"],
-            "seed":           det["seed"],
-            "sampler":        "",
-            "imageUrl":       det["imageUrl"],
-            "videoUrl":       det["videoUrl"],
-            "mediaType":      det["mediaType"],
-        })
-
-    except Exception as e:
-        logger.error(f"Error in epe_prompts_seaart_detail: {e}", exc_info=True)
-        return web.json_response({"error": str(e)}, status=500)
-
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1006,127 +635,89 @@ async def epe_prompts_extract_workflow(request):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Workflow search — unified Civitai + SeaArt ComfyUI templates
+# Workflow search — Civitai ComfyUI workflows
 # ─────────────────────────────────────────────────────────────────────────────
 
 @routes.post("/epe/prompts/search-workflows")
 async def epe_prompts_search_workflows(request):
     """
-    Search Civitai (type=Workflows) and SeaArt ComfyUI templates simultaneously.
-    POST body: { "query": str, "page": int, "source": "all"|"civitai"|"seaart" }
+    Search Civitai for ComfyUI workflows (type=Workflows).
+    POST body: { "query": str, "page": int, "source": "all"|"civitai" }
     Returns: { items: [{id, source, title, description, coverUrl, nodeCount, customNodes, hasWorkflow}], metadata }
     """
     try:
         body   = await request.json()
         query  = body.get("query", "").strip()
         page   = int(body.get("page", 1))
-        source = body.get("source", "all")  # "all" | "civitai" | "seaart"
+        source = body.get("source", "all")  # "all" | "civitai"
 
         IMAGE_CDN = "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA"
         items_out = []
 
-        # ── Civitai workflows via Meilisearch (models_v9, type=Workflows) ──
+        # ── Civitai workflows via the public REST API ─────────────────────
+        # /api/v1/models does support a free-text `query` parameter, so unlike
+        # the image feed this is a straight swap off Meilisearch.
         if source in ("all", "civitai"):
-            MEILI_URL = "https://search-new.civitai.com/multi-search"
-            MEILI_KEY = "8c46eb2508e21db1e9828a97968d91ab1ca1caa5f70a00e88a2ba1e286603b61"
-            fetch_limit = 20
-            offset = (page - 1) * fetch_limit
-            meili_body = {
-                "queries": [{
-                    "q":            query or "",
-                    "indexUid":     "models_v9",
-                    "attributesToHighlight": [],
-                    "highlightPreTag":  "__ais-highlight__",
-                    "highlightPostTag": "__/ais-highlight__",
-                    "limit":  fetch_limit,
-                    "offset": offset,
-                    "filter": ["type = Workflows", "nsfwLevel = 1"],
-                    "sort":   ["rank:desc"] if not query else [],
-                }]
-            }
+            API_URL = "https://civitai.com/api/v1/models"
+            params = [
+                ("types",  "Workflows"),
+                ("limit",  "20"),
+                ("page",   str(page)),
+                ("nsfw",   "false"),
+            ]
+            if query:
+                params.append(("query", query))
+            else:
+                # Sorting and paging are mutually exclusive with query on this
+                # endpoint (query switches it to relevance ranking), so only
+                # apply a sort for the no-query browse case.
+                params.append(("sort", "Highest Rated"))
             civ_headers = {
-                "Authorization": f"Bearer {MEILI_KEY}",
-                "Content-Type":  "application/json",
-                "Origin":        "https://civitai.com",
-                "Referer":       "https://civitai.com/",
+                "Accept":     "application/json",
+                "User-Agent": "ComfyUI-Enhanced-Prompt-Editor",
             }
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        MEILI_URL, json=meili_body, headers=civ_headers,
-                        timeout=aiohttp.ClientTimeout(total=20)
-                    ) as resp:
-                        if resp.status == 200:
-                            meili_data = await resp.json(content_type=None)
-                            results = meili_data.get("results", [])
-                            hits = results[0].get("hits", []) if results else []
-                            for hit in hits:
-                                mv = ((hit.get("modelVersions") or [{}])[0])
-                                imgs  = mv.get("images", []) or hit.get("images", []) or []
-                                files = mv.get("files", [])
-                                cover_url = ""
-                                if imgs:
-                                    raw_url = imgs[0].get("url", "")
-                                    cover_url = raw_url if raw_url.startswith("http") else f"{IMAGE_CDN}/{raw_url}/width=450"
-                                wf_file = next((f for f in files if f.get("type") in ("Model", "Archive")), None)
-                                download_url = (wf_file or {}).get("downloadUrl", "")
-                                items_out.append({
-                                    "id":          str(hit.get("id", "")),
-                                    "source":      "civitai",
-                                    "title":       hit.get("name", ""),
-                                    "description": re.sub(r'<[^>]+>', ' ', (hit.get("description") or "")).replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " ").replace("\n", " ").strip()[:1000],
-                                    "coverUrl":    cover_url,
-                                    "nodeCount":   0,
-                                    "customNodes": [],
-                                    "downloadUrl": download_url,
-                                    "versionId":   str(mv.get("id", "")),
-                                    "hasWorkflow": bool(download_url),
-                                })
+                session = _get_session()
+                async with session.get(
+                    API_URL, params=params, headers=civ_headers,
+                    timeout=aiohttp.ClientTimeout(total=20)
+                ) as resp:
+                    if resp.status == 200:
+                        civ_data = await resp.json(content_type=None)
+                        for hit in (civ_data.get("items") or []):
+                            mv    = ((hit.get("modelVersions") or [{}])[0])
+                            imgs  = mv.get("images", []) or []
+                            files = mv.get("files", []) or []
+                            cover_url = ""
+                            if imgs:
+                                raw_url = imgs[0].get("url", "") or ""
+                                cover_url = (
+                                    raw_url if raw_url.startswith("http")
+                                    else f"{IMAGE_CDN}/{raw_url}/width=450"
+                                )
+                            wf_file = next(
+                                (f for f in files if f.get("type") in ("Model", "Archive")),
+                                None,
+                            )
+                            download_url = (wf_file or {}).get("downloadUrl", "")
+                            desc = re.sub(r'<[^>]+>', ' ', (hit.get("description") or ""))
+                            for ent, ch in [("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                                            ("&quot;", '"'), ("&#39;", "'"), ("&nbsp;", " ")]:
+                                desc = desc.replace(ent, ch)
+                            items_out.append({
+                                "id":          str(hit.get("id", "")),
+                                "source":      "civitai",
+                                "title":       hit.get("name", ""),
+                                "description": " ".join(desc.split())[:1000],
+                                "coverUrl":    cover_url,
+                                "nodeCount":   0,
+                                "customNodes": [],
+                                "downloadUrl": download_url,
+                                "versionId":   str(mv.get("id", "")),
+                                "hasWorkflow": bool(download_url),
+                            })
             except Exception as e:
                 logger.warning(f"epe_prompts_search_workflows civitai error: {e}")
-
-        # ── SeaArt ComfyUI templates ──────────────────────────────────────
-        # SeaArt requires a query — without one it returns completely unfiltered content
-        if source in ("all", "seaart") and query:
-            sea_payload = {
-                "page":      page,
-                "page_size": 20,
-                "order_by":  "hot",
-            }
-            if query:
-                sea_payload["keyword"] = query
-            sea_headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "Mozilla/5.0"}
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        "https://www.seaart.ai/api/v1/square/v3/comfy_ui",
-                        json=sea_payload, headers=sea_headers,
-                        timeout=aiohttp.ClientTimeout(total=20)
-                    ) as resp:
-                        if resp.status == 200:
-                            sea_data = await resp.json(content_type=None)
-                            for item in (sea_data.get("data", {}).get("items") or []):
-                                if int(item.get("nsfw_level", 0)) > 0 or int(item.get("c_nsfw_level", 0)) > 0:
-                                    continue
-                                cover = item.get("cover") or {}
-                                cover_url = cover.get("url", "") if isinstance(cover, dict) else ""
-                                stat = item.get("stat") or {}
-                                items_out.append({
-                                    "id":          item.get("id", ""),
-                                    "source":      "seaart",
-                                    "title":       item.get("title", "") or item.get("description", ""),
-                                    "description": (item.get("description") or "")[:1000],
-                                    "coverUrl":    cover_url,
-                                    "nodeCount":   0,
-                                    "customNodes": [],
-                                    "downloadUrl": "",
-                                    "versionId":   "",
-                                    "hasWorkflow": True,
-                                    "runCount":    stat.get("num_of_task", 0),
-                                    "downloads":   stat.get("num_of_download", 0),
-                                })
-            except Exception as e:
-                logger.warning(f"epe_prompts_search_workflows seaart error: {e}")
 
         has_more = len(items_out) >= 20
         logger.info(f"epe_prompts_search_workflows '{query}' page={page}: {len(items_out)} total items")
@@ -1148,7 +739,7 @@ async def epe_prompts_search_workflows(request):
 async def epe_prompts_workflow_detail(request):
     """
     Fetch the full ComfyUI workflow JSON for a workflow item.
-    POST body: { "id": str, "source": "civitai"|"seaart", "downloadUrl": str, "versionId": str }
+    POST body: { "id": str, "source": "civitai", "downloadUrl": str, "versionId": str }
     Returns: { "workflow": {...}, "customNodes": [...], "nodeCount": int }
     """
     try:
@@ -1162,51 +753,6 @@ async def epe_prompts_workflow_detail(request):
             return web.json_response({"error": "Missing id or source"}, status=400)
 
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
-
-        # ── SeaArt: use template detail API ──────────────────────────────
-        if source == "seaart":
-            sea_headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "Mozilla/5.0"}
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://www.seaart.ai/api/v1/creativity/square/template/detail",
-                    json={"template_id": item_id}, headers=sea_headers,
-                    timeout=aiohttp.ClientTimeout(total=20)
-                ) as resp:
-                    if resp.status != 200:
-                        return web.json_response({"error": f"SeaArt template fetch failed ({resp.status})"}, status=502)
-                    data = await resp.json(content_type=None)
-            if (data.get("status") or {}).get("code") != 10000:
-                msg = (data.get("status") or {}).get("msg", "Unknown error")
-                return web.json_response({"error": f"SeaArt API error: {msg}"}, status=502)
-            template = data.get("data") or {}
-            preview_data = template.get("preview_data") or ""
-            node_group   = template.get("node_group") or []
-            workflow = None
-            if preview_data:
-                try: workflow = json.loads(preview_data) if isinstance(preview_data, str) else preview_data
-                except Exception: pass
-            custom_nodes = []
-            for group in node_group:
-                pkg = group.get("package_name", "") or ""
-                nodes = [n.get("value", "") for n in (group.get("nodes") or [])]
-                if pkg:
-                    custom_nodes.append({"package": pkg, "nodes": nodes})
-            node_count = template.get("node_num") or (len(workflow.get("nodes", [])) if workflow else 0)
-            # Extract full description from 'content' (HTML) or fall back to 'desc'
-            sea_desc = ""
-            raw_content = template.get("content") or template.get("desc") or ""
-            if raw_content:
-                sea_desc = re.sub(r'<[^>]+>', ' ', raw_content)
-                for ent, ch in [("&amp;","&"),("&lt;","<"),("&gt;",">"),("&quot;",'"'),("&#39;","'"),("&nbsp;"," ")]:
-                    sea_desc = sea_desc.replace(ent, ch)
-                sea_desc = ' '.join(sea_desc.split())[:2000]
-            logger.info(f"epe_prompts_workflow_detail seaart id={item_id} nodes={node_count}")
-            return web.json_response({
-                "workflow":     workflow,
-                "customNodes":  custom_nodes,
-                "nodeCount":    node_count,
-                "description":  sea_desc,
-            })
 
         # ── Civitai: download ZIP or JSON file ───────────────────────────
         if source == "civitai":

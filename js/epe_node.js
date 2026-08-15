@@ -5957,7 +5957,6 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         [
           ["civitai",   "Civitai",   "Browse Civitai image/video prompts",        rpTabRow1],
           ["genur",     "Genur.art", "Browse Genur.art image prompts",             rpTabRow1],
-          ["seaart",    "SEA.ART",   "Browse SeaArt image/video prompts",          rpTabRow1],
           ["workflows", "Workflows", "Search and load ComfyUI workflows",          rpTabRow2],
           ["favorites", "Favorites", "Saved prompts \u2014 click a card to load into editor", rpTabRow2],
           ["snippets",  "Snippets",  "Reusable fragments \u2014 click a card to insert at cursor", rpTabRow2]
@@ -6025,9 +6024,9 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         // ── Media bar (Image / Video / Get Workflow) ─────────────────────
         // Shown below the tab bar only on tabs that support media switching.
-        // Tabs that support Image/Video: civitai, seaart
+        // Tabs that support Image/Video: civitai
         // Tabs that support Get Workflow button: civitai, genur (PNG metadata)
-        const _MEDIA_TABS     = new Set(["civitai", "seaart"]);
+        const _MEDIA_TABS     = new Set(["civitai"]);
         const _WORKFLOW_TABS  = new Set(["civitai", "genur"]);
 
         const rpMediaBar = document.createElement("div");
@@ -6083,7 +6082,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // _resetActiveTab: clears and re-triggers a fresh search on the current tab
         const _resetActiveTab = () => {
           if (_rpActive === "civitai") {
-            _civState.query = ""; _civState.page = 1;
+            _civState.query = ""; _civState.page = 1; _civState.nextCursor = null;
             _civState.loading = false; _civState.exhausted = false; _civState.results = [];
             while (civList.lastChild) civList.removeChild(civList.lastChild);
             civList.appendChild(civStatus);
@@ -6102,16 +6101,6 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             // Empty query is valid (browse feed), so always load.
             _genurState.query = genurSearchInput.value.trim();
             requestAnimationFrame(() => _genurLoadMore());
-          } else if (_rpActive === "seaart") {
-            _seaartState.page = 1;
-            _seaartState.loading = false; _seaartState.exhausted = false; _seaartState.results = [];
-            while (seaartList.lastChild) seaartList.removeChild(seaartList.lastChild);
-            seaartList.appendChild(seaartStatus);
-            seaartList.appendChild(seaartSentinel);
-            seaartStatus.style.display = "none";
-            // Empty query is valid (browse the selected category), so always load.
-            _seaartState.query = seaartSearchInput.value.trim();
-            requestAnimationFrame(() => _seaartLoadMore());
           }
         };
 
@@ -6211,6 +6200,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           period:   "Week",           // "" | "Week" | "Month" | "6Month" | "Year"
           baseModel:"",               // "" = any, or "Flux.1 D", "SD 1.5", "SDXL 1.0" etc
           baseModels: [],             // selected base models to filter by ([] = all)
+          nextCursor: null,           // Civitai's REST API pages by cursor, not offset
           page:     1,
           loading:  false,
           exhausted:false,
@@ -6237,7 +6227,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         civCalloutIcon.textContent = "\uD83D\uDD0D";
         civCalloutIcon.style.cssText = "font-size:10px;flex-shrink:0;";
         const civCalloutText = document.createElement("span");
-        civCalloutText.textContent = "Browse featured Civitai images, or type to search \u2014 use any prompt as inspiration";
+        civCalloutText.textContent = "Browse Civitai images, or type words to match against prompt text \u2014 use any prompt as inspiration";
         civCalloutText.style.cssText = "font-size:9px;color:rgba(100,160,255,0.7);line-height:1.4;";
         civCallout.appendChild(civCalloutIcon);
         civCallout.appendChild(civCalloutText);
@@ -6248,7 +6238,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         civSearchRow.style.cssText = "display:flex;gap:4px;";
         const civSearchInput = document.createElement("input");
         civSearchInput.type = "text";
-        civSearchInput.placeholder = "Search, or leave empty to browse featured\u2026";
+        civSearchInput.placeholder = "Match words in prompts, or leave empty to browse\u2026";
         civSearchInput.value = "";
         civSearchInput.style.cssText =
           "flex:1;background:#0b0f15;border:1px solid #1c2431;border-radius:3px;" +
@@ -6306,7 +6296,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         const civPeriodRow = document.createElement("div");
         civPeriodRow.style.cssText = "display:flex;gap:3px;flex-wrap:wrap;align-items:center;";
-        [["All Time",""],["Week","Week"],["Month","Month"],["6 Months","6Month"],["Year","Year"]].forEach(([label,val]) => {
+        // No 6Month bucket exists on Civitai's public API, so that chip is gone.
+        [["All Time",""],["Day","Day"],["Week","Week"],["Month","Month"],["Year","Year"]].forEach(([label,val]) => {
           civPeriodRow.appendChild(_mkChip(label,"period",val, _civState.period===val));
         });
 
@@ -6537,7 +6528,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
           // Prompt label
           const pLabel = document.createElement("div");
-          pLabel.style.cssText = "font-size:9px;color:#31415a;font-weight:600;text-transform:uppercase;letter-spacing:.4px;";
+          pLabel.style.cssText = "font-size:9px;color:#31415a;font-weight:600;text-transform:uppercase;letter-spacing:.4px;flex-shrink:0;";
           pLabel.textContent = "Prompt";
           dBody.appendChild(pLabel);
 
@@ -6548,11 +6539,11 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const _taROCSS =
             "width:100%;box-sizing:border-box;background:#0e1319;border:1px solid #24303f;" +
             "border-radius:3px;color:#aab8c8;font-size:10px;line-height:1.5;padding:5px 7px;" +
-            "resize:none;height:"+COLLAPSED_H+";overflow:hidden;font-family:inherit;outline:none;cursor:pointer;";
+            "resize:none;height:"+COLLAPSED_H+";overflow-y:auto;font-family:inherit;outline:none;cursor:pointer;";
           const _taEditCSS =
             "width:100%;box-sizing:border-box;background:#0e1319;border:1px solid #4e5c6e;" +
             "border-radius:3px;color:#d4dfea;font-size:10px;line-height:1.5;padding:5px 7px;" +
-            "resize:vertical;min-height:144px;max-height:300px;overflow-y:auto;font-family:inherit;outline:none;cursor:text;padding-bottom:12px;margin-bottom:8px;";
+            "resize:vertical;min-height:90px;max-height:300px;overflow-y:auto;font-family:inherit;outline:none;cursor:text;padding-bottom:12px;margin-bottom:8px;";
 
           const civTA = document.createElement("textarea");
           civTA.style.cssText = _taROCSS;
@@ -6575,7 +6566,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
           // Row 1: Save as New | Snippets | Enhance
           const civRow1 = document.createElement("div");
-          civRow1.style.cssText = "display:flex;gap:4px;flex-wrap:wrap;";
+          civRow1.style.cssText = "display:flex;gap:4px;flex-wrap:wrap;flex-shrink:0;";
 
           const civSaveNewBtn = _mkBtn("Save as New", "Save to Favorites", "rgba(109,184,232,0.8)");
           civSaveNewBtn.onclick = (ev) => { ev.stopPropagation(); const _civSel = civTA.value.slice(civTA.selectionStart, civTA.selectionEnd).trim(); _libAddEntry("favorites", _civSel || civTA.value.trim() || cleaned); };
@@ -6596,7 +6587,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
           // Row 2: Variations | Use + token count right
           const civRow2 = document.createElement("div");
-          civRow2.style.cssText = "display:flex;align-items:center;gap:4px;";
+          civRow2.style.cssText = "display:flex;align-items:center;gap:4px;flex-shrink:0;";
 
           const civVarBtn = _mkBtn("Variations", "Run AI variations on this prompt", "rgba(140,200,240,0.7)");
           civVarBtn.onclick = (ev) => {
@@ -6624,13 +6615,13 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
           // ── New Prompt from Image ────────────────────────────────────────
           const civDivider = document.createElement("div");
-          civDivider.style.cssText = "border-top:1px solid #161d28;margin:2px 0;";
+          civDivider.style.cssText = "border-top:1px solid #161d28;margin:2px 0;flex-shrink:0;";
           dBody.appendChild(civDivider);
 
           const civImgPromptBtn = _mkBtn("\uD83D\uDDBC Image to Prompt",
             "Send this image to Ollama (qwen3.5 vision model) to generate a prompt",
             "rgba(109,184,232,0.8)");
-          civImgPromptBtn.style.width = "100%";
+          civImgPromptBtn.style.width = "100%"; civImgPromptBtn.style.flexShrink = "0";
           civImgPromptBtn.onclick = async (ev) => {
             ev.stopPropagation();
             const isVideo = item.mediaType === "video" && item.videoUrl;
@@ -6652,7 +6643,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             const civVidPromptBtn = _mkBtn("\uD83C\uDFAC Video to Prompt",
               "Send this video to Ollama (qwen3.5 vision model) to generate a prompt",
               "rgba(160,120,232,0.8)");
-            civVidPromptBtn.style.width = "100%";
+            civVidPromptBtn.style.width = "100%"; civVidPromptBtn.style.flexShrink = "0";
             civVidPromptBtn.onclick = async (ev) => {
               ev.stopPropagation();
               await _epeOllamaVision.run("video", item.videoUrl, showAiPanel, hideAiPanel, (prompt) => {
@@ -6673,7 +6664,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         // ── Build a Civitai card ─────────────────────────────────────────
         // Shared booru result-card builder. cfg carries per-source behavior:
-        //   video   : allow <video> thumbnails (civ/seaart yes, genur no)
+        //   video   : allow <video> thumbnails (civitai yes, genur no)
         //   preview : (item, cleaned) => string  — the two-line preview text
         //   previewStyle : extra css appended to the preview element
         //   requireClean : if true, return null when clean() yields nothing
@@ -6787,6 +6778,9 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
                 }
               } else {
                 const hasMore = data.metadata?.hasMore ?? false;
+                // Cursor-paged sources hand back the next cursor; offset-paged
+                // ones leave it undefined and this stays null.
+                cfg.state.nextCursor = data.metadata?.nextCursor ?? null;
                 const usable = cfg.filter(data.items || []);
                 if (usable.length > 0) {
                   cfg.state.results.push(...usable);
@@ -6839,6 +6833,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             if (cfg.list) cfg.list.style.display = "";
             cfg.state.query    = q;
             cfg.state.page     = 1;
+            cfg.state.nextCursor = null;
             cfg.state.loading  = false;
             cfg.state.exhausted= false;
             cfg.state.results  = [];
@@ -6865,6 +6860,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             query: q, sort: _civState.sort, period: _civState.period,
             baseModels: _civState.baseModels,
             nsfw: false, page, mediaType: _rpMediaType,
+            cursor: _civState.nextCursor,
           }),
           filter: (items) => items.filter(i => i.prompt),
           mapItem: (item) => ({
@@ -7134,7 +7130,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           }
 
           const pLabel = document.createElement("div");
-          pLabel.style.cssText = "font-size:9px;color:#31415a;font-weight:600;text-transform:uppercase;letter-spacing:.4px;";
+          pLabel.style.cssText = "font-size:9px;color:#31415a;font-weight:600;text-transform:uppercase;letter-spacing:.4px;flex-shrink:0;";
           pLabel.textContent = "Prompt";
           dBody.appendChild(pLabel);
 
@@ -7144,11 +7140,11 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const _taROCSS_G =
             "width:100%;box-sizing:border-box;background:#0e1319;border:1px solid #24303f;" +
             "border-radius:3px;color:#aab8c8;font-size:10px;line-height:1.5;padding:5px 7px;" +
-            "resize:none;height:"+COLLAPSED_H_G+";overflow:hidden;font-family:inherit;outline:none;cursor:pointer;";
+            "resize:none;height:"+COLLAPSED_H_G+";overflow-y:auto;font-family:inherit;outline:none;cursor:pointer;";
           const _taEditCSS_G =
             "width:100%;box-sizing:border-box;background:#0e1319;border:1px solid #4e5c6e;" +
             "border-radius:3px;color:#d4dfea;font-size:10px;line-height:1.5;padding:5px 7px;" +
-            "resize:vertical;min-height:144px;max-height:300px;overflow-y:auto;font-family:inherit;outline:none;cursor:text;padding-bottom:12px;margin-bottom:8px;";
+            "resize:vertical;min-height:90px;max-height:300px;overflow-y:auto;font-family:inherit;outline:none;cursor:text;padding-bottom:12px;margin-bottom:8px;";
 
           const genurTA = document.createElement("textarea");
           genurTA.style.cssText = _taROCSS_G;
@@ -7169,7 +7165,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           genurCharSpan.textContent = countTokens(cleaned) + " tokens";
 
           const genurRow1 = document.createElement("div");
-          genurRow1.style.cssText = "display:flex;gap:4px;flex-wrap:wrap;";
+          genurRow1.style.cssText = "display:flex;gap:4px;flex-wrap:wrap;flex-shrink:0;";
 
           const genurSaveNewBtn = _mkBtn("Save as New", "Save to Favorites", "rgba(109,184,232,0.8)");
           genurSaveNewBtn.onclick = (ev) => { ev.stopPropagation(); const _sel = genurTA.value.slice(genurTA.selectionStart, genurTA.selectionEnd).trim(); _libAddEntry("favorites", _sel || genurTA.value.trim() || cleaned); };
@@ -7189,7 +7185,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           genurRow1.appendChild(genurEnhBtn);
 
           const genurRow2 = document.createElement("div");
-          genurRow2.style.cssText = "display:flex;align-items:center;gap:4px;";
+          genurRow2.style.cssText = "display:flex;align-items:center;gap:4px;flex-shrink:0;";
 
           const genurVarBtn = _mkBtn("Variations", "Run AI variations on this prompt", "rgba(140,200,240,0.7)");
           genurVarBtn.onclick = (ev) => {
@@ -7216,13 +7212,13 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           dBody.appendChild(genurRow2);
 
           const genurDivider = document.createElement("div");
-          genurDivider.style.cssText = "border-top:1px solid #161d28;margin:2px 0;";
+          genurDivider.style.cssText = "border-top:1px solid #161d28;margin:2px 0;flex-shrink:0;";
           dBody.appendChild(genurDivider);
 
           const genurImgPromptBtn = _mkBtn("\uD83D\uDDBC Image to Prompt",
             "Send this image to Ollama (qwen3.5 vision model) to generate a prompt",
             "rgba(109,184,232,0.8)");
-          genurImgPromptBtn.style.width = "100%";
+          genurImgPromptBtn.style.width = "100%"; genurImgPromptBtn.style.flexShrink = "0";
           genurImgPromptBtn.onclick = async (ev) => {
             ev.stopPropagation();
             if (!item.imageUrl) return;
@@ -7267,424 +7263,6 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         const genurSentinel   = _genurEngine.sentinel;
         const _genurScrollObs = _genurEngine.observer;
 
-        // ══════════════════════════════════════════════════════════════════
-        // SEAART BROWSER
-        // ══════════════════════════════════════════════════════════════════
-
-        const _seaartState = { query:"", page:1, loading:false, exhausted:false, results:[], sort:"hot", category:"fan_art" };
-
-        const rpSeaartPanel = document.createElement("div");
-        rpSeaartPanel.style.cssText = "flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0;";
-
-        const seaartFilterBar = document.createElement("div");
-        seaartFilterBar.style.cssText =
-          "flex-shrink:0;padding:5px 6px;border-bottom:1px solid #1c2431;" +
-          "display:flex;flex-direction:column;gap:4px;background:#12171f;";
-
-        const seaartCallout = document.createElement("div");
-        seaartCallout.style.cssText =
-          "display:flex;align-items:center;gap:5px;padding:4px 6px;" +
-          "background:rgba(100,160,255,0.07);border:1px solid rgba(100,160,255,0.15);" +
-          "border-radius:3px;margin-bottom:1px;";
-        const seaartCalloutIcon = document.createElement("span");
-        seaartCalloutIcon.textContent = "\uD83D\uDD0D";
-        seaartCalloutIcon.style.cssText = "font-size:10px;flex-shrink:0;";
-        const seaartCalloutText = document.createElement("span");
-        seaartCalloutText.textContent = "Browse SeaArt categories, or type to search \u2014 use any prompt as inspiration";
-        seaartCalloutText.style.cssText = "font-size:9px;color:rgba(100,160,255,0.7);line-height:1.4;";
-        seaartCallout.appendChild(seaartCalloutIcon);
-        seaartCallout.appendChild(seaartCalloutText);
-        seaartFilterBar.appendChild(seaartCallout);
-
-        const seaartSearchRow = document.createElement("div");
-        seaartSearchRow.style.cssText = "display:flex;gap:4px;";
-        const seaartSearchInput = document.createElement("input");
-        seaartSearchInput.type = "text";
-        seaartSearchInput.placeholder = "Search, or pick a category to browse\u2026";
-        seaartSearchInput.value = "";
-        seaartSearchInput.style.cssText =
-          "flex:1;background:#0b0f15;border:1px solid #1c2431;border-radius:3px;" +
-          "color:#c2cddb;font-size:10px;padding:3px 7px;outline:none;font-family:inherit;";
-        seaartSearchInput.onfocus = () => { seaartSearchInput.style.borderColor="#28364a"; };
-        seaartSearchInput.onblur  = () => { seaartSearchInput.style.borderColor="#1c2431"; };
-        const seaartSearchBtn = document.createElement("button");
-        seaartSearchBtn.textContent = "Search";
-        seaartSearchBtn.style.cssText =
-          "background:#161d28;border:1px solid #202a38;border-radius:3px;" +
-          "color:#7a8a9c;font-size:9px;padding:2px 8px;cursor:pointer;font-family:inherit;" +
-          "white-space:nowrap;transition:color .1s,background .1s;";
-        seaartSearchBtn.onmouseenter = () => { seaartSearchBtn.style.background="#202a38"; seaartSearchBtn.style.color="#c2cddb"; };
-        seaartSearchBtn.onmouseleave = () => { seaartSearchBtn.style.background="#161d28"; seaartSearchBtn.style.color="#7a8a9c"; };
-        seaartSearchRow.appendChild(seaartSearchInput);
-        seaartSearchRow.appendChild(seaartSearchBtn);
-        seaartFilterBar.appendChild(seaartSearchRow);
-
-        // Sort chips
-        const seaartSortRow = document.createElement("div");
-        seaartSortRow.style.cssText = "display:flex;gap:3px;flex-wrap:wrap;";
-        const _mkSeaartSortChip = (label, value) => {
-          const c = document.createElement("button");
-          c.textContent = label;
-          c._on = (_seaartState.sort === value);
-          const _applySeaartChipStyle = () => {
-            c.style.cssText =
-              "font-size:11px;padding:2px 7px;border-radius:2px;cursor:pointer;" +
-              "font-family:inherit;transition:color .1s,background .1s,border-color .1s;" +
-              (c._on
-                ? "background:#202a38;border:1px solid #4e5c6e;color:#c2cddb;"
-                : "background:#12171f;border:1px solid #1c2431;color:#4e5c6e;");
-          };
-          _applySeaartChipStyle();
-          c.onmouseenter = () => { if(!c._on) { c.style.color="#7a8a9c"; c.style.borderColor="#28364a"; } };
-          c.onmouseleave = () => { if(!c._on) { c.style.color="#4e5c6e"; c.style.borderColor="#1c2431"; } };
-          c._setOn = (on) => { c._on = on; _applySeaartChipStyle(); };
-          c.onclick = () => {
-            seaartSortRow.querySelectorAll("button").forEach(b => b._setOn && b._setOn(false));
-            c._setOn(true);
-            _seaartState.sort = value;
-            _seaartDoSearch();
-          };
-          return c;
-        };
-        [["Hot","hot"],["New","new"]].forEach(([label,val]) => {
-          seaartSortRow.appendChild(_mkSeaartSortChip(label, val));
-        });
-        seaartFilterBar.appendChild(seaartSortRow);
-
-        // Category chips — single-select browse feeds from SeaArt's /post page.
-        // Picking one clears any keyword so it browses that category.
-        const seaartCatRow = document.createElement("div");
-        seaartCatRow.style.cssText = "display:flex;gap:3px;flex-wrap:wrap;";
-        const _mkSeaartCatChip = (label, slug) => {
-          const c = document.createElement("button");
-          c.textContent = label;
-          c._on = (_seaartState.category === slug);
-          const _style = () => {
-            c.style.cssText =
-              "font-size:10px;padding:2px 6px;border-radius:2px;cursor:pointer;" +
-              "font-family:inherit;transition:color .1s,background .1s,border-color .1s;" +
-              (c._on ? "background:#202a38;border:1px solid #4e5c6e;color:#c2e2f8;"
-                     : "background:#12171f;border:1px solid #1c2431;color:#6a7a8d;");
-          };
-          _style();
-          c.onmouseenter = () => { if(!c._on){ c.style.color="#a8b6c6"; c.style.borderColor="#28364a"; } };
-          c.onmouseleave = () => { if(!c._on){ c.style.color="#6a7a8d"; c.style.borderColor="#1c2431"; } };
-          c._setOn = (on) => { c._on = on; _style(); };
-          c.onclick = () => {
-            seaartCatRow.querySelectorAll("button").forEach(b => b._setOn && b._setOn(false));
-            c._setOn(true);
-            _seaartState.category = slug;
-            seaartSearchInput.value = "";   // category browse overrides keyword
-            _seaartDoSearch();
-          };
-          return c;
-        };
-        [["Fan Art","fan_art"],["GPT image 2","gpt image"],["Trending Seedance","seedance2.0"],
-         ["Short Film","short film"],["Viral Clips","viral clips"]].forEach(([label,slug]) => {
-          seaartCatRow.appendChild(_mkSeaartCatChip(label, slug));
-        });
-        seaartFilterBar.appendChild(seaartCatRow);
-
-        const seaartList = document.createElement("div");
-        seaartList.style.cssText =
-          "flex:1;overflow-y:auto;padding:5px 6px 5px 6px;min-height:0;box-sizing:border-box;" +
-          "overflow-x:hidden;";
-
-        const seaartStatus = document.createElement("div");
-        seaartStatus.style.cssText = "color:#31415a;font-size:10px;text-align:center;padding:16px 10px;line-height:1.8;";
-        seaartStatus.innerHTML = "Enter a search term and press<br><em>Enter</em> or <em>Search</em>.";
-        seaartList.appendChild(seaartStatus);
-
-        const seaartSpinner = document.createElement("div");
-        seaartSpinner.style.cssText =
-          "color:#31415a;font-size:9px;text-align:center;padding:10px;display:none;flex-shrink:0;";
-        seaartSpinner.textContent = "Loading\u2026";
-
-        rpSeaartPanel.appendChild(seaartFilterBar);
-        rpSeaartPanel.appendChild(seaartList);
-        rpSeaartPanel.appendChild(seaartSpinner);
-
-        const seaartDetail = document.createElement("div");
-        seaartDetail.style.cssText = "display:none;flex:1;flex-direction:column;overflow:hidden;min-height:0;";
-        rpSeaartPanel.appendChild(seaartDetail);
-
-        const _showSeaartDetail = async (item) => {
-          if (seaartDetail._cleanup) { seaartDetail._cleanup(); seaartDetail._cleanup = null; }
-          seaartDetail.innerHTML = "";
-          seaartList.style.display = "none";
-          seaartSpinner.style.display = "none";
-          seaartDetail.style.display = "flex";
-
-          const dHdr = document.createElement("div");
-          dHdr.style.cssText =
-            "display:flex;align-items:center;gap:6px;padding:6px 8px;" +
-            "border-bottom:1px solid #1c2431;background:#12171f;flex-shrink:0;";
-          const backBtn = document.createElement("button");
-          backBtn.textContent = "\u2190 Back to results";
-          backBtn.style.cssText =
-            "background:#19212d;border:1px solid #31415a;border-radius:3px;" +
-            "color:#aab8c8;font-size:9px;padding:2px 7px;" +
-            "cursor:pointer;font-family:inherit;flex-shrink:0;";
-          backBtn.onmouseenter = () => { backBtn.style.background="#202a38"; backBtn.style.borderColor="#4e5c6e"; backBtn.style.color="#dde6f0"; };
-          backBtn.onmouseleave = () => { backBtn.style.background="#19212d"; backBtn.style.borderColor="#31415a"; backBtn.style.color="#aab8c8"; };
-          backBtn.onclick = () => {
-            if (seaartDetail._cleanup) { seaartDetail._cleanup(); seaartDetail._cleanup = null; }
-            if (seaartDetail._activeVid) { seaartDetail._activeVid.pause(); seaartDetail._activeVid = null; }
-            seaartDetail.style.display = "none";
-            seaartList.style.display = "";
-          };
-          const dName = document.createElement("span");
-          dName.textContent = item.name || "Untitled";
-          dName.style.cssText = "font-size:9px;color:#4e5c6e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;";
-          dHdr.appendChild(backBtn);
-          dHdr.appendChild(dName);
-          seaartDetail.appendChild(dHdr);
-
-          const dBody = document.createElement("div");
-          dBody.style.cssText = "flex:1;min-height:0;overflow-y:auto;padding:7px 8px;display:flex;flex-direction:column;gap:6px;";
-
-          // Loading state while we fetch the prompt
-          let resolvedItem = item;
-          if (item.prompt === null || item.prompt === undefined) {
-            const loadMsg = document.createElement("div");
-            loadMsg.style.cssText = "font-size:9px;color:#4e5c6e;text-align:center;padding:16px 10px;";
-            loadMsg.textContent = "Loading prompt\u2026";
-            dBody.appendChild(loadMsg);
-            seaartDetail.appendChild(dBody);
-            try {
-              const detailResp = await fetch("/epe/prompts/seaart-detail", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ id: item.id, artworkId: item.artworkId || item.id, mediaType: item.mediaType || "image" }),
-              });
-              if (!detailResp.ok) throw new Error(`Detail fetch error ${detailResp.status}`);
-              const detailData = await detailResp.json();
-              if (detailData.error) throw new Error(detailData.error);
-              // Merge: prefer non-empty videoUrl from detail response
-              resolvedItem = Object.assign({}, item, detailData);
-              if (!resolvedItem.videoUrl && detailData.videoUrl) resolvedItem.videoUrl = detailData.videoUrl;
-              if (!resolvedItem.mediaType) resolvedItem.mediaType = item.mediaType || "image";
-              // Update the cached item in results so repeated clicks don't re-fetch
-              const idx = _seaartState.results.findIndex(r => r.id === item.id);
-              if (idx !== -1) _seaartState.results[idx] = resolvedItem;
-              dBody.removeChild(loadMsg);
-            } catch(err) {
-              loadMsg.style.color = "#744";
-              loadMsg.textContent = err.message === "This post is private or restricted on SeaArt"
-                ? "⚠ This post is private or restricted on SeaArt."
-                : "Failed to load prompt: " + (err.message || err);
-              return;
-            }
-          }
-
-          const cleaned = _civCleanPrompt(resolvedItem.prompt || "");
-
-          if (resolvedItem.mediaType === "video" && resolvedItem.videoUrl) {
-            const dVidWrap = document.createElement("div");
-            dVidWrap.style.cssText = "width:100%;background:#0b0f15;border-radius:3px;overflow:hidden;flex-shrink:0;";
-            const dVid = document.createElement("video");
-            dVid.src = resolvedItem.videoUrl;
-            dVid.controls = true; dVid.muted = true; dVid.loop = true; dVid.playsInline = true;
-            dVid.style.cssText = "width:100%;display:block;max-height:240px;object-fit:contain;";
-            dVid.onerror = () => { dVidWrap.style.display="none"; };
-            dVidWrap.appendChild(dVid);
-            dBody.appendChild(dVidWrap);
-            seaartDetail._activeVid = dVid;
-            // SeaArt videos: no PNG metadata, hide workflow button
-            rpGetWfBtn.style.display = "none";
-            _setGetWfBtn(false, null);
-          } else if (resolvedItem.imageUrl) {
-            const dImgWrap = document.createElement("div");
-            dImgWrap.style.cssText = "width:100%;background:#0b0f15;border-radius:3px;overflow:hidden;flex-shrink:0;";
-            const dImg = document.createElement("img");
-            dImg.src = resolvedItem.imageUrl;
-            dImg.style.cssText = "width:100%;display:block;max-height:240px;object-fit:contain;";
-            dImg.onerror = () => { dImgWrap.style.display="none"; };
-            dImgWrap.appendChild(dImg);
-            dBody.appendChild(dImgWrap);
-            // SeaArt images: CDN-locked, can't extract PNG metadata
-            rpGetWfBtn.style.display = "none";
-            _setGetWfBtn(false, null);
-          }
-
-          const metaFields = [
-            resolvedItem.steps  ? "Steps: "+resolvedItem.steps  : null,
-            resolvedItem.cfg    ? "CFG: "+resolvedItem.cfg      : null,
-            resolvedItem.seed   ? "Seed: "+resolvedItem.seed    : null,
-            resolvedItem.model  ? "Model: "+resolvedItem.model  : null,
-          ].filter(Boolean);
-          if (metaFields.length) {
-            const metaRow = document.createElement("div");
-            metaRow.style.cssText = "display:flex;flex-wrap:wrap;gap:3px;";
-            metaFields.forEach(label => {
-              const chip = document.createElement("span");
-              chip.textContent = label;
-              chip.style.cssText =
-                "font-size:8px;color:#4e5c6e;background:#10151d;border:1px solid #1c2431;" +
-                "border-radius:2px;padding:2px 5px;white-space:nowrap;";
-              metaRow.appendChild(chip);
-            });
-            dBody.appendChild(metaRow);
-          }
-
-          const pLabel = document.createElement("div");
-          pLabel.style.cssText = "font-size:9px;color:#31415a;font-weight:600;text-transform:uppercase;letter-spacing:.4px;";
-          pLabel.textContent = "Prompt";
-          dBody.appendChild(pLabel);
-
-          const LINE_H_S = 10 * 1.5;
-          const PADDING_V_S = 10;
-          const COLLAPSED_H_S = Math.round(LINE_H_S * 3 + PADDING_V_S) + "px";
-          const _taROCSS_S =
-            "width:100%;box-sizing:border-box;background:#0e1319;border:1px solid #24303f;" +
-            "border-radius:3px;color:#aab8c8;font-size:10px;line-height:1.5;padding:5px 7px;" +
-            "resize:none;height:"+COLLAPSED_H_S+";overflow:hidden;font-family:inherit;outline:none;cursor:pointer;";
-          const _taEditCSS_S =
-            "width:100%;box-sizing:border-box;background:#0e1319;border:1px solid #4e5c6e;" +
-            "border-radius:3px;color:#d4dfea;font-size:10px;line-height:1.5;padding:5px 7px;" +
-            "resize:vertical;min-height:144px;max-height:300px;overflow-y:auto;font-family:inherit;outline:none;cursor:text;padding-bottom:12px;margin-bottom:8px;";
-
-          const seaartTA = document.createElement("textarea");
-          seaartTA.style.cssText = _taROCSS_S;
-          seaartTA.value = cleaned;
-          seaartTA.readOnly = true;
-
-          const _seaartCollapseTA = () => { seaartTA.style.cssText=_taROCSS_S; seaartTA.readOnly=true; };
-          const _seaartExpandTA   = () => { seaartTA.style.cssText=_taEditCSS_S; seaartTA.readOnly=false; seaartTA.focus(); };
-          seaartTA.onclick = (ev) => { ev.stopPropagation(); if(seaartTA.readOnly) _seaartExpandTA(); };
-          const _seaartOutside = (ev) => { if(!dBody.contains(ev.target)) _seaartCollapseTA(); };
-          document.addEventListener("mousedown", _seaartOutside, true);
-          seaartDetail._cleanup = () => document.removeEventListener("mousedown", _seaartOutside, true);
-
-          dBody.appendChild(_mkFontSizerWrap(seaartTA, 10));
-
-          const seaartCharSpan = document.createElement("span");
-          seaartCharSpan.style.cssText = "font-size:9px;color:#4e5c6e;flex-shrink:0;";
-          seaartCharSpan.textContent = countTokens(cleaned) + " tokens";
-
-          const seaartRow1 = document.createElement("div");
-          seaartRow1.style.cssText = "display:flex;gap:4px;flex-wrap:wrap;";
-
-          const seaartSaveNewBtn = _mkBtn("Save as New", "Save to Favorites", "rgba(109,184,232,0.8)");
-          seaartSaveNewBtn.onclick = (ev) => { ev.stopPropagation(); const _sel = seaartTA.value.slice(seaartTA.selectionStart, seaartTA.selectionEnd).trim(); _libAddEntry("favorites", _sel || seaartTA.value.trim() || cleaned); };
-
-          const seaartSnipBtn = _mkBtn("Snippets", "Save to Snippets");
-          seaartSnipBtn.onclick = (ev) => { ev.stopPropagation(); const _sel = seaartTA.value.slice(seaartTA.selectionStart, seaartTA.selectionEnd).trim(); _libAddEntry("snippets", _sel || seaartTA.value.trim() || cleaned); };
-
-          const seaartEnhBtn = _mkBtn("Enhance", "Run AI enhance on this prompt", "rgba(100,160,255,0.7)");
-          seaartEnhBtn.onclick = (ev) => {
-            ev.stopPropagation();
-            textEl.value = seaartTA.value.trim()||cleaned; updateTokenBadge(textEl.value);
-            runAiAction("expand");
-          };
-
-          seaartRow1.appendChild(seaartSaveNewBtn);
-          seaartRow1.appendChild(seaartSnipBtn);
-          seaartRow1.appendChild(seaartEnhBtn);
-
-          const seaartRow2 = document.createElement("div");
-          seaartRow2.style.cssText = "display:flex;align-items:center;gap:4px;";
-
-          const seaartVarBtn = _mkBtn("Variations", "Run AI variations on this prompt", "rgba(140,200,240,0.7)");
-          seaartVarBtn.onclick = (ev) => {
-            ev.stopPropagation();
-            textEl.value = seaartTA.value.trim()||cleaned; updateTokenBadge(textEl.value);
-            runAiAction("variations");
-          };
-
-          const seaartUseBtn = _mkBtn("Use", "Send to main prompt editor", "rgba(109,184,232,0.8)");
-          seaartUseBtn.onclick = (ev) => {
-            ev.stopPropagation();
-            const t = seaartTA.value.trim()||cleaned;
-            if (textEl._epePushUndo) textEl._epePushUndo();
-            textEl.value = t; updateTokenBadge(t);
-            textEl.dispatchEvent(new Event("input"));
-            hideAiPanel();
-          };
-
-          seaartRow2.appendChild(seaartVarBtn);
-          seaartRow2.appendChild(seaartUseBtn);
-          seaartRow2.appendChild(seaartCharSpan);
-
-          dBody.appendChild(seaartRow1);
-          dBody.appendChild(seaartRow2);
-
-          const seaartDivider = document.createElement("div");
-          seaartDivider.style.cssText = "border-top:1px solid #161d28;margin:2px 0;";
-          dBody.appendChild(seaartDivider);
-
-          const seaartImgPromptBtn = _mkBtn("\uD83D\uDDBC Image to Prompt",
-            "Send this image to Ollama (qwen3.5 vision model) to generate a prompt",
-            "rgba(109,184,232,0.8)");
-          seaartImgPromptBtn.style.width = "100%";
-          seaartImgPromptBtn.onclick = async (ev) => {
-            ev.stopPropagation();
-            const isVideo = resolvedItem.mediaType === "video" && resolvedItem.videoUrl;
-            const imgSrc = resolvedItem.imageUrl;
-            if (!isVideo && !imgSrc) return;
-            await _epeOllamaVision.run(
-              isVideo ? "video-frame" : "image-url",
-              isVideo ? resolvedItem.videoUrl : imgSrc,
-              showAiPanel, hideAiPanel,
-              (prompt) => { if (textEl) { textEl.value = prompt; updateTokenBadge(prompt); } },
-              {
-                onFavorites: (t) => { _libAddEntry("favorites", t); },
-                onSnippets:  (t) => { _libAddEntry("snippets", t); },
-              }
-            );
-          };
-          dBody.appendChild(seaartImgPromptBtn);
-
-          if (resolvedItem.mediaType === "video" && resolvedItem.videoUrl) {
-            const seaartVidPromptBtn = _mkBtn("\uD83C\uDFAC Video to Prompt",
-              "Send this video to Ollama (qwen3.5 vision model) to generate a prompt",
-              "rgba(160,120,232,0.8)");
-            seaartVidPromptBtn.style.width = "100%";
-            seaartVidPromptBtn.onclick = async (ev) => {
-              ev.stopPropagation();
-              await _epeOllamaVision.run("video", resolvedItem.videoUrl, showAiPanel, hideAiPanel, (prompt) => {
-                if (textEl) { textEl.value = prompt; updateTokenBadge(prompt); }
-              }, {
-                onFavorites: (t) => { _libAddEntry("favorites", t); },
-                onSnippets:  (t) => { _libAddEntry("snippets", t); },
-              });
-            };
-            dBody.appendChild(seaartVidPromptBtn);
-          }
-
-          seaartDetail.appendChild(dBody);
-        };
-
-        const _mkSeaartCard = (item) => _mkBooruCard(item, {
-          video: true,
-          clean: () => "",
-          preview: (it) => it.mediaType === "video" ? "Click to view prompt" : "Click to load prompt",
-          previewStyle: "color:#31415a;font-style:italic;",
-          onClick: _showSeaartDetail,
-        });
-
-        const _seaartEngine = _mkBooruEngine({
-          state: _seaartState, list: seaartList, status: seaartStatus, spinner: seaartSpinner, detail: seaartDetail,
-          searchInput: seaartSearchInput, searchBtn: seaartSearchBtn,
-          endpoint: "/epe/prompts/search-seaart", errLabel: "SeaArt search error",
-          allowEmpty: true,   // empty query = browse the selected category
-          body: (q, page) => ({ query: q, page, sort: _seaartState.sort, category: _seaartState.category, mediaType: _rpMediaType }),
-          filter: (items) => items.filter(i => i.prompt),
-          mapItem: (item) => ({
-            id:        item.id,
-            name:      item.name      || "",
-            prompt:    item.prompt,
-            imageUrl:  item.imageUrl  || "",
-            videoUrl:  item.videoUrl  || "",
-            mediaType: item.mediaType || "image",
-          }),
-          mkCard: _mkSeaartCard,
-        });
-        const _seaartDoSearch  = _seaartEngine.doSearch;
-        const _seaartLoadMore  = _seaartEngine.loadMore;
-        const seaartSentinel   = _seaartEngine.sentinel;
-        const _seaartScrollObs = _seaartEngine.observer;
-
         // ── Micro action button ──────────────────────────────────────────
         // ── Font sizer helper — wraps any textarea with an always-visible ──
         // ── centered A/size/A bar above it. Faded by default; brightens on ──
@@ -7706,10 +7284,14 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           });
           _fsObs.observe(ta, { attributes: true, attributeFilter: ["style"] });
 
-          // Outer wrap — column so bar sits above textarea; preserves flex:1 behavior
-          // by forwarding the textarea's grow to itself via display:flex.
+          // Outer wrap — column so the bar sits above the textarea.
+          // Deliberately flex:0 0 auto: it sizes to the textarea's own height
+          // instead of competing for space. When the panel is short the parent
+          // (dBody, overflow-y:auto) scrolls, rather than the wrap being
+          // squeezed below the textarea's min-height and letting the textarea
+          // overflow on top of the buttons underneath it.
           const wrap = document.createElement("div");
-          wrap.style.cssText = "display:flex;flex-direction:column;min-height:0;flex:1 1 auto;";
+          wrap.style.cssText = "display:flex;flex-direction:column;flex:0 0 auto;min-width:0;";
 
           // Font-size bar — always visible, centered, faded by default
           const bar = document.createElement("div");
@@ -7797,7 +7379,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           "font-size:8px;color:#484848;line-height:1.5;padding:3px 4px;background:#10151d;" +
           "border:1px solid #161d28;border-radius:3px;";
         wfCallout.textContent =
-          "Search Civitai & SeaArt ComfyUI workflows. Click Load to open in a new canvas tab.";
+          "Search Civitai ComfyUI workflows. Click Load to open in a new canvas tab.";
 
         const wfSearchRow = document.createElement("div");
         wfSearchRow.style.cssText = "display:flex;gap:4px;";
@@ -7819,53 +7401,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         wfSearchRow.appendChild(wfSearchInput);
         wfSearchRow.appendChild(wfSearchBtn);
 
-        // Source chips
-        const wfSourceRow = document.createElement("div");
-        wfSourceRow.style.cssText = "display:flex;gap:3px;";
-        const _mkWfChip = (label, val) => {
-          const c = document.createElement("button");
-          c.textContent = label; c._val = val; c._on = (val === "all");
-          const _applyWfChip = () => {
-            c.style.cssText =
-              "font-size:10px;padding:2px 7px;border-radius:2px;cursor:pointer;" +
-              "font-family:inherit;transition:color .1s,background .1s,border-color .1s;" +
-              (c._on
-                ? "background:#202a38;border:1px solid #4e5c6e;color:#c2cddb;"
-                : "background:#12171f;border:1px solid #1c2431;color:#4e5c6e;");
-          };
-          _applyWfChip();
-          c.onmouseenter = () => { if (!c._on) { c.style.background="#161d28"; c.style.color="#7a8a9c"; } };
-          c.onmouseleave = () => { _applyWfChip(); };
-          c.onclick = () => {
-            wfSourceChips.forEach(x => { x._on = (x === c); _applyWfChip.call(x); });
-            wfSourceChips.forEach(x => x.style.cssText = x.style.cssText); // force re-apply
-            // Re-apply each chip's own style
-            wfSourceChips.forEach(x => {
-              x.style.cssText =
-                "font-size:10px;padding:2px 7px;border-radius:2px;cursor:pointer;" +
-                "font-family:inherit;transition:color .1s,background .1s,border-color .1s;" +
-                (x._on
-                  ? "background:#202a38;border:1px solid #4e5c6e;color:#c2cddb;"
-                  : "background:#12171f;border:1px solid #1c2431;color:#4e5c6e;");
-            });
-            _wfState.query = ""; _wfState.page = 1;
-            _wfState.loading = false; _wfState.exhausted = false; _wfState.results = [];
-            wfList.innerHTML = ""; wfStatus.style.display = "none";
-            const q = wfSearchInput.value.trim();
-            if (q) { _wfState.query = q; _wfLoadMore(); }
-          };
-          return c;
-        };
-        const wfSourceChips = [
-          _mkWfChip("All",     "all"),
-          _mkWfChip("Civitai", "civitai"),
-          _mkWfChip("SeaArt",  "seaart"),
-        ];
-        wfSourceChips.forEach(c => wfSourceRow.appendChild(c));
-
         wfFilterBar.appendChild(wfCallout);
         wfFilterBar.appendChild(wfSearchRow);
-        wfFilterBar.appendChild(wfSourceRow);
 
         // ── Status / spinner ─────────────────────────────────────────────
         const wfStatus = document.createElement("div");
@@ -8006,7 +7543,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         };
 
         // ── Fetch + load logic ────────────────────────────────────────────
-        const _wfActiveSource = () => (wfSourceChips.find(c => c._on) || wfSourceChips[0])._val;
+        // Civitai is the only workflow source left, so this is constant.
+        const _wfActiveSource = () => "civitai";
 
         const _wfFetchPage = async (page) => {
           const q = _wfState.query.trim();
@@ -8136,7 +7674,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const dTitleRow = document.createElement("div");
           dTitleRow.style.cssText = "display:flex;align-items:center;gap:5px;";
           const dBadge = document.createElement("span");
-          dBadge.textContent = item.source === "civitai" ? "CIVITAI" : "SEAART";
+          dBadge.textContent = "CIVITAI";
           dBadge.style.cssText =
             "font-size:7px;font-weight:700;padding:1px 5px;border-radius:2px;flex-shrink:0;" +
             (item.source === "civitai"
@@ -8166,7 +7704,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
           // Description — full, scrollable read-only textarea
           const dDescLabel = document.createElement("div");
-          dDescLabel.style.cssText = "font-size:9px;color:#31415a;font-weight:600;text-transform:uppercase;letter-spacing:.4px;";
+          dDescLabel.style.cssText = "font-size:9px;color:#31415a;font-weight:600;text-transform:uppercase;letter-spacing:.4px;flex-shrink:0;";
           dDescLabel.textContent = "Description";
           dBody.appendChild(dDescLabel);
 
@@ -8187,9 +7725,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           dBody.appendChild(dInfoSection);
 
           // Only fetch if there is something to fetch:
-          // SeaArt always has an id; Civitai needs downloadUrl or versionId
-          // SeaArt: always has id. Civitai: needs downloadUrl, versionId, or at minimum item.id (backend will resolve)
-          const _canFetchWf = item.source === "seaart" || !!(item.downloadUrl || item.versionId || item.id);
+          // Civitai needs downloadUrl, versionId, or at minimum item.id (the backend will resolve)
+          const _canFetchWf = !!(item.downloadUrl || item.versionId || item.id);
 
           if (_canFetchWf) {
             const dInfoStatus = document.createElement("div");
@@ -8631,8 +8168,6 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             requestAnimationFrame(() => _civDoSearch());
           } else if (id === "genur" && !_genurState.loading && _genurState.results.length === 0) {
             requestAnimationFrame(() => _genurDoSearch());
-          } else if (id === "seaart" && !_seaartState.loading && _seaartState.results.length === 0) {
-            requestAnimationFrame(() => _seaartDoSearch());
           }
         };
         Object.values(rpTabEls).forEach(t => { t.onclick=()=>_setRpTab(t._id); });
@@ -8642,7 +8177,6 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           rpBody.innerHTML="";
           if(_rpActive==="civitai"){   rpBody.appendChild(rpCivPanel);      return; }
           if(_rpActive==="genur"){     rpBody.appendChild(rpGenurPanel);    return; }
-          if(_rpActive==="seaart"){    rpBody.appendChild(rpSeaartPanel);   return; }
           if(_rpActive==="workflows"){ rpBody.appendChild(rpWorkflowPanel); return; }
           rpBody.appendChild(rpSearchWrap);
           rpBody.appendChild(rpList);
@@ -10002,10 +9536,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
                 try { _closePopovers(); } catch (_e) {}
                 try { civDetail && civDetail._cleanup && civDetail._cleanup(); } catch (_e) {}
                 try { genurDetail && genurDetail._cleanup && genurDetail._cleanup(); } catch (_e) {}
-                try { seaartDetail && seaartDetail._cleanup && seaartDetail._cleanup(); } catch (_e) {}
                 try { _civScrollObs.disconnect(); } catch (_e) {}
                 try { _genurScrollObs.disconnect(); } catch (_e) {}
-                try { _seaartScrollObs.disconnect(); } catch (_e) {}
                 try { _wfObserver.disconnect(); } catch (_e) {}
                 try { typeof _closeStyleMenu === "function" && _closeStyleMenu(); } catch (_e) {}
                 try { _epeTip.remove(); } catch (_e) {}
@@ -10156,7 +9688,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               '<b>Image to Prompt</b> — open any image to describe as a prompt (needs a vision model, e.g. qwen3.5, gemma4).<br>' +
               '<b>Video to Prompt</b> — samples multiple frames from a clip and writes an image prompt from a video.<br>' +
               '<b>Extract from Image</b> — pulls the embedded prompt from a ComfyUI-generated PNG/JPEG/WebP.<br><br>' +
-              'You can also run <b>Image to Prompt</b> or <b>Video to Prompt</b> directly on any search result from Civitai, Genur.art, or Sea.art, or just run an <b>Enhance</b> on the image prompt itself — click on/open a search result and use the button in its detail panel.' +
+              'You can also run <b>Image to Prompt</b> or <b>Video to Prompt</b> directly on any search result from Civitai or Genur.art, or just run an <b>Enhance</b> on the image prompt itself — click on/open a search result and use the button in its detail panel.' +
               '</div>',
           },
           {
@@ -10199,7 +9731,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             label: "Library",
             html:
               '<div style="line-height:1.8;">' +
-              'Search prompts from <b>Civitai</b>, <b>Genur.art</b>, and <b>Sea.art</b> — type a term and scroll to load more. Image/video previews included.' +
+              'Search prompts from <b>Civitai</b> and <b>Genur.art</b> — type a term and scroll to load more. Image/video previews included.' +
               '<ul style="margin:6px 0 0;padding-left:18px;line-height:1.7;">' +
               '<li>Click a result to open it, then <b>Use</b>, <b>Enhance</b>, <b>Variations</b>, <b>Save</b>, <b>Image to Prompt</b> on an image, or <b>Video to Prompt</b> on a video result.</li>' +
               '<li><b>Workflows</b> — search and load ComfyUI workflows from the results.</li>' +

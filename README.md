@@ -38,7 +38,7 @@ EPE replaces the humble prompt textbox with a complete writing environment. Writ
 
 **Style tuning** — 8 style targets and 6 sliders that reshape the AI's aesthetic vocabulary, not just an appended suffix.
 
-**Library** — Browse prompts from **Civitai**, **Genur.art**, and **Sea.art** with image/video previews, infinite scroll, and one-click Use / Enhance / Variations. Personal **Favorites** and **Snippets** collections, plus a **Workflows** browser.
+**Library** — Browse prompts from **Civitai** and **Genur.art** with image/video previews, infinite scroll, and one-click Use / Enhance / Variations. Personal **Favorites** and **Snippets** collections, plus a **Workflows** browser.
 
 **Wireless targets** — Push the prompt into any text widget in your workflow at run time — no wires needed.
 
@@ -147,7 +147,7 @@ Click **+ Add target** and a picker opens listing every text widget in your grap
 
 ## Library
 
-Search **Civitai**, **Genur.art**, and **Sea.art** without leaving the node — image *and* video results, with infinite scroll. Open any result to see its full prompt on a detail card: **Use** sends it to the main editor, **Enhance** / **Variations** transform it on the spot, and **Save as New** / **Snippets** file it into your collections. The media itself is workable too — **Image to Prompt** (or **Video to Prompt** on video results) writes a fresh prompt from the image using your vision model.
+Search **Civitai** and **Genur.art** without leaving the node — image *and* video results, with infinite scroll. Open any result to see its full prompt on a detail card: **Use** sends it to the main editor, **Enhance** / **Variations** transform it on the spot, and **Save as New** / **Snippets** file it into your collections. The media itself is workable too — **Image to Prompt** (or **Video to Prompt** on video results) writes a fresh prompt from the image using your vision model.
 
 <div align="center">
 <img src="assets/library.gif" alt="Library: search, open the detail card, Use the prompt, and run Image to Prompt" width="840">
@@ -155,7 +155,7 @@ Search **Civitai**, **Genur.art**, and **Sea.art** without leaving the node — 
 
 ### Workflows
 
-The **Workflows** tab searches Civitai's workflow listings and Sea.art's ComfyUI templates directly — one click on **⬇ Load Workflow** opens the full node graph in a new canvas tab, ready to queue. Image results can carry workflows too: when a Civitai or Genur.art image has one embedded in its PNG metadata, the **⚡ Workflow** button lights up to load it.
+The **Workflows** tab searches Civitai's ComfyUI workflow listings directly — one click on **⬇ Load Workflow** opens the full node graph in a new canvas tab, ready to queue. Image results can carry workflows too: when a Civitai or Genur.art image has one embedded in its PNG metadata, the **⚡ Workflow** button lights up to load it.
 
 <div align="center">
 <img src="assets/workflows.gif" alt="Workflows: search and load a full ComfyUI graph from the library" width="640">
@@ -183,6 +183,12 @@ Bugs and feature requests → [open an issue](https://github.com/pixelpainter/co
 ⭐ If EPE has earned a place in your workflow, a star helps others find it — and I always love a good cup of [coffee](https://buymeacoffee.com/pixelpainter). ☕
 
 ## Changelog
+
+### 1.0.16
+- The Civitai browser now runs on Civitai's public API. More stable, but search works differently: it matches words against prompt text across the feed rather than searching the whole site index, so expect different — sometimes fewer — results, and narrow terms take a couple of seconds longer.
+- Search no longer matches inside words. Searching "elf" returned every prompt containing "herself".
+- Fixed the Library detail card overlapping its buttons on a short node.
+- Sea.art browsing removed due to instability.
 
 ### 1.0.15
 - Library now browses without a search — Civitai, Genur.art and Sea.art open on a live feed you can scroll straight away; type any time to search.
