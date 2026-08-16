@@ -23,7 +23,7 @@ No cloud APIs. No keys. Nothing leaves your machine.
 EPE replaces the humble prompt textbox with a complete writing environment. Write a rough idea, and your local LLM expands it into a rich, diffusion-ready prompt engineered for modern encoders (Flux, Qwen-Image, and similar): subject-first openings, declarative prose, no negations, spatial placement, verbatim quoted text. Then refine it in plain language, aim it at a specific aesthetic, and push it into any node in your workflow — without a single wire.
 
 <div align="center">
-<img src="assets/anatomy.png" alt="EPE feature map — one node, seven tools" width="920">
+<img src="assets/anatomy.png" alt="EPE feature map — one node, nine tools" width="920">
 </div>
 
 ## Features
@@ -39,6 +39,8 @@ EPE replaces the humble prompt textbox with a complete writing environment. Writ
 **Style tuning** — 8 style targets and 6 sliders that reshape the AI's aesthetic vocabulary, not just an appended suffix.
 
 **Library** — Browse prompts from **Civitai** and **Genur.art** with image/video previews, infinite scroll, and one-click Use / Enhance / Variations. Personal **Favorites** and **Snippets** collections, plus a **Workflows** browser.
+
+**Collapsible layout** — Fold the Transform rail, the style tuning block or the Library away and the editor takes back the space. Drag any divider, or click its tab.
 
 **Wireless targets** — Push the prompt into any text widget in your workflow at run time — no wires needed.
 
@@ -102,7 +104,7 @@ ollama pull qwen3-vl
 5. Queue — the prompt is injected into your targets automatically on every run
 
 <div align="center">
-<img src="assets/enhance.gif" alt="Enhance: a rough idea becomes a diffusion-ready prompt" width="840">
+<img src="assets/enhance.gif" alt="Enhance: open a new tab, write a rough idea, and it becomes a diffusion-ready prompt" width="840">
 </div>
 
 ## Example workflows
@@ -118,7 +120,7 @@ To load it, drag the `.json` onto your canvas, or use **Workflow → Open**.
 Describe the change; the model rewrites the prompt coherently — one instruction can ripple through lighting, shadows, and atmosphere while everything else stays put.
 
 <div align="center">
-<img src="assets/instruct.gif" alt="Instruct edit: change the lighting to golden hour" width="840">
+<img src="assets/instruct.gif" alt="Instruct edit: red hair, then a harvest moon, then wings — each edit builds on the last" width="840">
 </div>
 
 ## Style tuning
@@ -126,7 +128,15 @@ Describe the change; the model rewrites the prompt coherently — one instructio
 Pick a style target and the AI writes *for* that aesthetic. **Override Off** fills only the gaps your prompt leaves open; **Override On** re-art-directs the look while subjects, poses, and scene stay. Six sliders fine-tune every transform, on top of any style.
 
 <div align="center">
-<img src="assets/style-tuning.png" alt="Style tuning: 8 style targets, override modes, 6 sliders" width="920">
+<img src="assets/style-tuning.png" alt="Style tuning: 8 style targets, override modes, 6 sliders" width="760">
+</div>
+
+## Collapsible layout
+
+Three dividers, three panels. Drag one to resize, or click its pull-tab to fold that panel away entirely — the Transform rail, the style tuning block and the Library each collapse on their own, and the editor takes back every pixel they give up. Panels keep their place when you switch away and come back.
+
+<div align="center">
+<img src="assets/layout.gif" alt="Collapsible layout: fold the rail, the tuning block or the Library away and the editor takes the space" width="840">
 </div>
 
 ## Wireless targets
@@ -158,7 +168,7 @@ Search **Civitai** and **Genur.art** without leaving the node — image *and* vi
 The **Workflows** tab searches Civitai's ComfyUI workflow listings directly — one click on **⬇ Load Workflow** opens the full node graph in a new canvas tab, ready to queue. Image results can carry workflows too: when a Civitai or Genur.art image has one embedded in its PNG metadata, the **⚡ Workflow** button lights up to load it.
 
 <div align="center">
-<img src="assets/workflows.gif" alt="Workflows: search and load a full ComfyUI graph from the library" width="640">
+<img src="assets/workflows.gif" alt="Workflows: search and load a full ComfyUI graph into a new canvas tab" width="840">
 </div>
 
 ### Favorites & Snippets
@@ -183,6 +193,12 @@ Bugs and feature requests → [open an issue](https://github.com/pixelpainter/co
 ⭐ If EPE has earned a place in your workflow, a star helps others find it — and I always love a good cup of [coffee](https://buymeacoffee.com/pixelpainter). ☕
 
 ## Changelog
+
+### 1.0.17
+- The Transform rail, style tuning block and Library can each be folded away — drag the divider or click its tab, and the editor takes back the space. Panels keep their place when you switch away.
+- Style sliders remapped so each one moves a single quality instead of several at once.
+- Rewritten prompt construction — layered fidelity with an invention quota, so enhanced prompts stay closer to what you actually asked for.
+- Per-prompt **↺ Default** now sticks instead of resetting when you come back to it.
 
 ### 1.0.16
 - The Civitai browser now runs on Civitai's public API. More stable, but search works differently: it matches words against prompt text across the feed rather than searching the whole site index, so expect different — sometimes fewer — results, and narrow terms take a couple of seconds longer.
