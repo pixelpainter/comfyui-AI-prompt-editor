@@ -1239,14 +1239,24 @@ const _epeOllama = {
 
 The user will give you a brief description. Expand it into one complete image generation prompt. Where they left gaps, fill them with commitments, not generic coverage.
 
-SUBJECT PRESERVATION — hard rule. The subject the user wrote is locked. Every named thing — animal, object, person, place, count, action, pose — must survive unchanged. Apply the aesthetic TO the user's subject; never swap the subject to match the aesthetic.
+SUBJECT FIDELITY — layered. Not everything the user wrote is protected the same way, and treating it all as locked is why prompts come back sounding like the input.
 
-- User wrote "elephant" → output says elephant, not jaguar or "a sacred creature."
-- User wrote "three children playing chess" → three children, playing chess. Not two, not checkers.
+LOCKED, word for word. Subject nouns, counts and numbers, named actions and poses, proper nouns, and anything in "double quotes" carry through exactly as the user typed them.
+- User wrote "elephant" → output says elephant. Not jaguar, not pachyderm, not "a sacred creature."
+- User wrote "three children playing chess" → three children playing chess. Not two, not a trio of youngsters, not checkers.
+A synonym is a subject change. Diffusion text encoders do not read "elephant" and "pachyderm" as the same thing, so swapping one for the other costs you the subject and buys nothing.
+
+KEPT, but reworded. Setting, mood, and any attribute the user specified survive in meaning — expressed in your own fresh wording, not theirs.
+
+NEVER DROPPED. If the user wrote it, it appears somewhere in your output.
+
+EVERYTHING ELSE IS YOURS. Adjectives, sentence shapes, descriptive vocabulary, and the order you reveal things in are all your choice. Do not build your prompt by threading new words around the user's original phrasing — write fresh sentences that happen to contain the locked terms.
 
 If a tradition implies a different subject, apply its technique to the user's actual subject.
 
 IMMERSIVE VISUAL DETAIL — every noun earns concrete visible detail. Flesh out what the user left generic.
+
+INVENTION QUOTA — your output must introduce AT LEAST 8 concrete visual specifics that are not in the user's description and are not restatements of it. A specific is something a viewer could point at: a material, a named colour, a light direction, a surface behaviour, a spatial relationship, a garment, a time of day, a weather condition. Count them before you answer. Preserving the subject is the floor, not the task — a prompt that says only what the user already said has failed. If an instruction below shortens the output, scale this to roughly one new specific per 20 words.
 
 - Generic "lawn" → neatly edged, lush emerald green, freshly mowed with visible stripes, meeting a brick path.
 - Generic "woman" → age range, eye color, hair color and style, expression, posture, fabric and cut of clothing, what her hands are doing. DO NOT invent ethnicity, religion, nationality, or other identity-defining traits the user didn't specify.
@@ -1281,14 +1291,24 @@ Output ONLY the expanded prompt paragraph. No preamble, no explanation, no <thin
 
 Each variation should feel like a genuinely different creative vision of the same moment, not a tonal nudge. The subject stays intact; the visual world changes entirely.
 
-SUBJECT PRESERVATION — hard rule, across all three variations. Every named thing in the source — animal, object, person, place, count, action, pose — must appear unchanged in every variation.
+SUBJECT FIDELITY — layered, across all three variations. Not everything in the source is protected the same way, and treating it all as locked is why variations come back as paraphrases of each other.
 
-- Source says "elephant" → all three variations say elephant, not a jaguar.
-- Source says "three children playing chess" → all three have three children playing chess.
+LOCKED, word for word, in every variation. Subject nouns, counts and numbers, named actions and poses, proper nouns, and anything in "double quotes" carry through exactly as the source has them.
+- Source says "elephant" → all three variations say elephant. Not jaguar, not pachyderm.
+- Source says "three children playing chess" → all three have three children playing chess. Not a trio of youngsters, not checkers.
+A synonym is a subject change. Diffusion text encoders do not read "elephant" and "pachyderm" as the same thing, so swapping one for the other costs you the subject and buys nothing.
+
+KEPT, but reworded — differently in each variation. Setting, mood, and any attribute the source specified survive in meaning, in wording that belongs to that variation's tradition.
+
+NEVER DROPPED. If the source says it, every variation contains it.
+
+EVERYTHING ELSE IS YOURS. Adjectives, sentence shapes, descriptive vocabulary, and the order you reveal things in are your choice, and should differ sharply between the three. Do not use the source's sentences as a template and swap words inside them — write each variation from scratch around the locked terms. If two variations could be diffed word by word, you have written one variation three times.
 
 If a tradition implies a different subject, pick another or apply its technique to the actual subject.
 
 IMMERSIVE VISUAL DETAIL — every noun earns concrete visible detail, in every variation. Generic "lawn" → neatly edged, lush emerald green, freshly mowed. Generic "woman" → age range, eye color, hair, expression, posture, fabric and cut of clothing. DO NOT invent ethnicity, religion, or identity-defining traits the user didn't specify. Surfaces get active behavior: subsurface scattering, fabric fibers in rim light, wet asphalt holding oil-slick rainbow. The rendering tradition you pick isn't just named — its vocabulary describes the scene.
+
+INVENTION QUOTA — each variation must introduce AT LEAST 6 concrete visual specifics that are not in the source, and no specific may be reused between variations. A specific is something a viewer could point at: a material, a named colour, a light direction, a surface behaviour, a spatial relationship, a garment, a time of day, a weather condition. Count them before you answer. Preserving the subject is the floor, not the task — a variation that says only what the source already said has failed.
 
 ENCODER RULES — written for diffusion text encoders:
 - Each variation's FIRST sentence names the subject and the rendering tradition.
@@ -1355,14 +1375,24 @@ Plain descriptive prose. No keyword lists, no parentheses weighting, no markdown
 Output ONLY the prompt paragraph. No preamble, no labels, no explanation, no <think> tags.`,
     invertPrompt: `You write image generation prompts for modern open-weight diffusion models (Flux 2, Qwen-Image, Z-Image, and similar). The user will give you an existing prompt. Produce a counterpart that reinterprets the source in a different aesthetic tradition — same creative energy, different visual world. Not a destructive reversal. Shadow, melancholy, and grit are welcome; wounds, ruin, horror, and despair are not.
 
-SUBJECT PRESERVATION — hard rule. What changes is the AESTHETIC WORLD. What does NOT change is the subject. Every named thing in the source — animal, object, person, place, count, action, pose — must appear unchanged in the counterpart.
+SUBJECT FIDELITY — layered. What changes is the AESTHETIC WORLD. What does NOT change is the subject. But not everything in the source is protected the same way, and treating it all as locked is why counterparts come back as paraphrases.
 
-- Source says "elephant" → counterpart says elephant, in a different aesthetic.
-- Source says "three children playing chess" → counterpart has three children playing chess.
+LOCKED, word for word. Subject nouns, counts and numbers, named actions and poses, proper nouns, and anything in "double quotes" carry through exactly as the source has them.
+- Source says "elephant" → counterpart says elephant, in a different aesthetic. Not jaguar, not pachyderm.
+- Source says "three children playing chess" → counterpart has three children playing chess. Not a trio of youngsters, not checkers.
+A synonym is a subject change. Diffusion text encoders do not read "elephant" and "pachyderm" as the same thing, so swapping one for the other costs you the subject and buys nothing.
+
+KEPT, but reworded. Setting, mood, and any attribute the source specified survive in meaning, expressed in the new tradition's vocabulary rather than the source's.
+
+NEVER DROPPED. If the source says it, the counterpart contains it.
+
+EVERYTHING ELSE IS YOURS. Adjectives, sentence shapes, descriptive vocabulary, and the order you reveal things in are all your choice. Do not use the source's sentences as a template and swap words inside them — write the counterpart from scratch around the locked terms. If the counterpart could be diffed against the source phrase by phrase, you have edited it rather than reimagined it.
 
 If a tradition implies a different subject, pick another, or apply its technique to the user's actual subject.
 
 IMMERSIVE VISUAL DETAIL — every noun earns concrete visible detail in the counterpart, same as the source. Generic "woman" → age range, eye color, hair, expression, posture, clothing. DO NOT invent ethnicity, religion, or identity-defining traits not in the source. Surfaces get active behavior: subsurface scattering, fabric fibers in rim light, impasto brushstrokes — whatever the new tradition's materials actually do.
+
+INVENTION QUOTA — the counterpart must introduce AT LEAST 6 concrete visual specifics that are not in the source. A specific is something a viewer could point at: a material, a named colour, a light direction, a surface behaviour, a spatial relationship, a garment, a time of day, a weather condition. Count them before you answer. Preserving the subject is the floor, not the task — a counterpart that says only what the source already said has failed.
 
 ENCODER RULES — written for diffusion text encoders:
 - The FIRST sentence names the subject and the rendering tradition.
@@ -1393,7 +1423,37 @@ Empty quality words ("beautiful," "detailed," "stunning," "masterpiece," "4k/8k"
 
 Write one flowing paragraph of 170-190 words. Plain descriptive prose. No keyword lists, no parentheses weighting, no markdown.
 
-Output ONLY the inverted prompt paragraph. No preamble, no explanation, no <think> tags.`
+Output ONLY the inverted prompt paragraph. No preamble, no explanation, no <think> tags.`,
+
+    instructPrompt: `You revise image generation prompts for modern open-weight diffusion models (Flux 2, Qwen-Image, Z-Image, and similar) by carrying out a direction the user gives you. Think of yourself as taking notes from an art director: they say what they want changed, you rewrite the prompt so it is true.
+
+SUBJECT — preserved by default. Every named thing in the prompt — person, animal, object, place, count, action, pose — survives unless the user's direction explicitly asks you to change it. "Reframe this as a war photograph" rebuilds the whole world around the subject but keeps the subject. "Make the woman a man" or "change the dog to a wolf" names the subject, so you change it.
+
+MATCH THE SCOPE OF THE DIRECTION. Do not default to minimal edits.
+- Narrow direction ("change her jacket to red", "make it rain") → change that and only what must follow from it, leave the rest word for word.
+- Sweeping direction ("reframe as war photography", "make this feel like a memory", "start over but keep the subject") → you are expected to rewrite most of the prompt. Lighting, palette, framing, atmosphere, rendering tradition and detail may all change. Timidity here is a failure.
+
+RIPPLE — carry dependent details so the image stays coherent. Changing gender updates pronouns, clothing, hairstyle, body description. Changing age updates skin, hair, posture, clothing. Changing species swaps in that creature's anatomy. Changing material updates texture, transparency, reflections. Changing time of day, season or weather updates lighting, shadows, sky and environment.
+
+ABSTRACT DIRECTION MUST BECOME VISIBLE FACT — this is the most important rule. When the user names a mood, feeling, genre, intent or memory, you render what a camera would actually see. Never write the abstract word into the prompt.
+- "make it melancholy" → overcast flat light, desaturated blue-grey palette, downcast gaze, rain beading on a window. NOT "a melancholy atmosphere."
+- "make it feel like something just happened" → an overturned chair, dust still hanging in the air, a door left open, tracks through wet ground. NOT "a sense of aftermath."
+- "more tension" → compressed framing, a hand half-raised, hard shadow cutting the face. NOT "tension fills the scene."
+
+NEVER EXPLAIN YOUR EDIT. The output is a prompt, not a description of a prompt or a report on what you changed. Banned constructions anywhere in the output: "the scene captures", "the composition conveys", "creating a sense of", "evoking", "the mood is now", "this change makes", "reflecting the". State what IS there.
+
+CRAFT RULES — the result must still be a well-formed prompt:
+- Direct declarative description. State what IS there; never describe by absence ("no harsh light" → "soft diffuse light").
+- Every noun earns concrete visible detail.
+- Place elements spatially: "to her left", "lower foreground", "behind the fence".
+- Words the user wants rendered as text in the image stay in "double quotes" verbatim.
+- Empty quality words ("beautiful", "detailed", "stunning", "masterpiece", "4k/8k", "award-winning") → replace with the concrete quality you mean, or delete.
+- Do NOT invent ethnicity, religion or nationality the prompt didn't already specify.
+- Keep the prompt's existing form — if it is one flowing paragraph, return one flowing paragraph. No keyword lists, no parentheses weighting, no markdown.
+
+EARLIER DIRECTION may be supplied for context. It is the history of what the user already asked for on this prompt, so relative instructions resolve against it — "dial that back" softens the most recent change, "more like dusk than night" refines it. Apply only the CURRENT instruction; the history is there to interpret it.
+
+Output ONLY the full revised prompt. No preamble, no quotes around it, no commentary, no <think> tags.`
   },
 
   // Get stored settings from localStorage
@@ -1413,6 +1473,25 @@ Output ONLY the inverted prompt paragraph. No preamble, no explanation, no <thin
     try {
       localStorage.setItem("epe_ollama_settings", JSON.stringify(settings));
     } catch (e) { /* ignore */ }
+  },
+
+  // Drop ONE stored override (e.g. a single system prompt) and leave every other
+  // stored value exactly as it was. Returns true if something was removed.
+  //
+  // Operates on the RAW stored object, never on what getSettings() returns.
+  // getSettings() hands back { ...defaults, ...stored }, so deleting a key from
+  // that and saving it would write every current default into localStorage as an
+  // explicit value — freezing today's prompts permanently and defeating the
+  // "only persist what the user customized" design.
+  clearStoredKey(key) {
+    try {
+      const stored = localStorage.getItem("epe_ollama_settings");
+      const parsed = stored ? (JSON.parse(stored) || {}) : {};
+      if (!Object.prototype.hasOwnProperty.call(parsed, key)) return false;
+      delete parsed[key];
+      localStorage.setItem("epe_ollama_settings", JSON.stringify(parsed));
+      return true;
+    } catch (e) { return false; }
   },
 
   // Clean LLM response — strip thinking tags, code blocks, etc.
@@ -1548,8 +1627,8 @@ Output ONLY the inverted prompt paragraph. No preamble, no explanation, no <thin
           think: false,
           options: {
             temperature: opts.temperature || 0.7,
-            // forward any extra Ollama options (top_p, top_k,
-            // num_predict, min_p, seed, presence_penalty) supplied by callers.
+            // forward any extra Ollama options (top_p, top_k, num_predict,
+            // min_p, seed, repeat_penalty, repeat_last_n) supplied by callers.
             // Spread comes last so option fields here override the temperature
             // default above when the caller provides their own.
             ...(opts.options || {}),
@@ -4011,7 +4090,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           aiSettingsPanel.appendChild(modelRow);
           
           // Helper to create collapsible section
-          const makeCollapsible = (title, textareaValue, defaultValue) => {
+          const makeCollapsible = (title, textareaValue, defaultValue, settingsKey) => {
             const section = document.createElement("div");
             section.style.cssText = "border: 1px solid #2b3849; border-radius: 4px; overflow: hidden;";
             
@@ -4040,7 +4119,25 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             resetToDefaultBtn.onmouseleave = () => { resetToDefaultBtn.style.color = "#5b6b7e"; resetToDefaultBtn.style.borderColor = "#28364a"; };
             resetToDefaultBtn.onclick = (ev) => {
               ev.stopPropagation();
-              if (defaultValue != null) { ta.value = defaultValue; ta.style.display = "block"; arrow.style.transform = "rotate(90deg)"; hint.textContent = "click to collapse"; }
+              if (defaultValue == null) return;
+              ta.value = defaultValue;
+              ta.style.display = "block";
+              arrow.style.transform = "rotate(90deg)";
+              hint.textContent = "click to collapse";
+              // Commit the revert straight away, and touch nothing else. Without
+              // this the reverted text lives only in the textarea, so closing the
+              // panel with the X or the toolbar toggle silently discards it and
+              // the user's old custom prompt stays in force — the button would
+              // look like it worked and would not have. Only this one prompt's
+              // stored override is removed; url, model and every other prompt are
+              // left exactly as they are.
+              if (settingsKey) _epeOllama.clearStoredKey(settingsKey);
+              resetToDefaultBtn.textContent = "✓ Restored";
+              if (resetToDefaultBtn._epeRevertT) clearTimeout(resetToDefaultBtn._epeRevertT);
+              resetToDefaultBtn._epeRevertT = setTimeout(() => {
+                resetToDefaultBtn.textContent = "↺ Default";
+                resetToDefaultBtn._epeRevertT = null;
+              }, 1500);
             };
             
             header.appendChild(arrow);
@@ -4108,18 +4205,21 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           advWrap.appendChild(advBody);
           aiSettingsPanel.appendChild(advWrap);
 
-          const { section: expandSection, ta: expandTA } = makeCollapsible("Expand System Prompt", s.expandPrompt, _epeOllama._defaults.expandPrompt);
+          const { section: expandSection, ta: expandTA } = makeCollapsible("Expand System Prompt", s.expandPrompt, _epeOllama._defaults.expandPrompt, "expandPrompt");
           advBody.appendChild(expandSection);
-          
-          const { section: variSection, ta: variTA } = makeCollapsible("Variations System Prompt", s.variationsPrompt, _epeOllama._defaults.variationsPrompt);
+
+          const { section: variSection, ta: variTA } = makeCollapsible("Variations System Prompt", s.variationsPrompt, _epeOllama._defaults.variationsPrompt, "variationsPrompt");
           advBody.appendChild(variSection);
-          
-          const { section: img2imgSection, ta: img2imgTA } = makeCollapsible("Img2Img System Prompt", s.img2imgPrompt || _epeOllama._defaults.img2imgPrompt, _epeOllama._defaults.img2imgPrompt);
+
+          const { section: img2imgSection, ta: img2imgTA } = makeCollapsible("Img2Img System Prompt", s.img2imgPrompt || _epeOllama._defaults.img2imgPrompt, _epeOllama._defaults.img2imgPrompt, "img2imgPrompt");
           advBody.appendChild(img2imgSection);
 
-          const { section: invertSection, ta: invertTA } = makeCollapsible("Aesthetic Inverter Prompt", s.invertPrompt || _epeOllama._defaults.invertPrompt, _epeOllama._defaults.invertPrompt);
+          const { section: invertSection, ta: invertTA } = makeCollapsible("Aesthetic Inverter Prompt", s.invertPrompt || _epeOllama._defaults.invertPrompt, _epeOllama._defaults.invertPrompt, "invertPrompt");
           advBody.appendChild(invertSection);
-          
+
+          const { section: instructSection, ta: instructTA } = makeCollapsible("Instruct Edit Prompt", s.instructPrompt || _epeOllama._defaults.instructPrompt, _epeOllama._defaults.instructPrompt, "instructPrompt");
+          advBody.appendChild(instructSection);
+
           // Save / Reset row
           const saveRow = document.createElement("div");
           saveRow.style.cssText = "display: flex; gap: 6px; justify-content: flex-end;";
@@ -4246,6 +4346,9 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             if (invertTA.value !== _epeOllama._defaults.invertPrompt) {
               toSave.invertPrompt = invertTA.value;
             }
+            if (instructTA.value !== _epeOllama._defaults.instructPrompt) {
+              toSave.instructPrompt = instructTA.value;
+            }
             _epeOllama.saveSettings(toSave);
             aiSettingsPanel.style.display = "none";
           };
@@ -4256,6 +4359,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             img2imgTA.value = _epeOllama._defaults.img2imgPrompt;
             urlInput.value = _epeOllama._defaults.url;
             invertTA.value = _epeOllama._defaults.invertPrompt;
+            instructTA.value = _epeOllama._defaults.instructPrompt;
           };
           
           // Auto-test on open
@@ -4580,6 +4684,11 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             textEl.value = _originalPrompt;
             updateTokenBadge(textEl.value);
           }
+          // Auto-discarding an instruct result unwinds its direction too.
+          if (_ieReviewIsInstruct && _ieThreadSnapshot) {
+            _ieThreadSet(_ieThreadSnapshot);
+          }
+          _ieThreadSnapshot = null;
           _reviewExit();
           try { _epeOllama.unloadModel(); } catch (_e) {}
           _showReviewDiscardToast(reason);
@@ -4711,6 +4820,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             // a fresh entry — _reviewEnter will snapshot the current prompt.
             if (_reviewMode) _reviewSetMode("streaming");
             else _reviewEnter("streaming");
+            _ieReviewIsInstruct = false;
             singleActionRow.style.display = "none";
             // Save and swap the placeholder so the empty textarea doesn't show
             // "Enter your prompt..." between the click and the first token.
@@ -4749,7 +4859,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             // base prompt already contains a stale or partial addendum block.
             const systemPrompt = _composeSystemPromptForStyle(baseSystemPrompt);
             // map current slider values to Ollama options
-            // (temperature, top_p, top_k, num_predict, min_p, seed, presence_penalty).
+            // (temperature, top_p, top_k, num_predict, min_p, seed, repeat_penalty, repeat_last_n).
             const sliderOpts = _composeOllamaOpts();
             // Variations emits THREE ~180-word paragraphs — roughly 3x the output of
             // a single prompt. The Length slider's num_predict cap (200-800) starves
@@ -4900,10 +5010,14 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         // --- Editor area (textarea + optional line numbers) ---
         const editorWrap = document.createElement("div");
+        // flex-shrink 1 (was 0) and a much lower floor: the tuning block below
+        // now has a draggable height, so the editor has to be able to give space
+        // back as well as take it. Without the shrink the editor would refuse to
+        // yield and leftPane would just scroll instead.
         editorWrap.style.cssText = `
           display: flex;
-          flex: 1 0 auto;
-          min-height: 220px;
+          flex: 1 1 auto;
+          min-height: 120px;
           overflow: hidden;
           position: relative;
           flex-direction: column;
@@ -5244,6 +5358,11 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             textEl.value = _originalPrompt;
             updateTokenBadge(textEl.value);
           }
+          // Rejecting an instruct result also rejects the direction behind it.
+          if (_ieReviewIsInstruct && _ieThreadSnapshot) {
+            _ieThreadSet(_ieThreadSnapshot);
+          }
+          _ieThreadSnapshot = null;
           _reviewExit();
           singleActionRow.style.display = "none";
           try { _epeOllama.unloadModel(); } catch (_e) {}
@@ -5396,6 +5515,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         useThisBtn.onclick = () => {
           // textEl.value is already what we want to commit. Capture pre-commit
           // value into the recall slot, then exit review.
+          if (!_ieReviewIsInstruct) _ieThreadClear();
+          _ieThreadSnapshot = null;   // committed — nothing to roll back to
           _reviewExit();
           singleActionRow.style.display = "none";
           try { _epeOllama.unloadModel(); } catch (_e) {}
@@ -5415,6 +5536,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           textEl.value = combined;
           textEl.dispatchEvent(new Event("input"));
           updateTokenBadge(textEl.value);
+          if (!_ieReviewIsInstruct) _ieThreadClear();
+          _ieThreadSnapshot = null;
           _reviewExit();
           singleActionRow.style.display = "none";
           try { _epeOllama.unloadModel(); } catch (_e) {}
@@ -5920,6 +6043,79 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           requestAnimationFrame(()=>textEl.focus());
         }
 
+        // ══════════════════════════════════════════════════════════════════
+        // INSTRUCT EDIT — thread state + saved sequences
+        // ══════════════════════════════════════════════════════════════════
+        // The "thread" is the running list of instructions given for the
+        // current prompt tab. The last few are sent to the model as context so
+        // relative direction ("dial that back", "more like dusk") resolves
+        // against what came before. Threads are scoped per prompt tab (read
+        // from the persisted epe_tab_active) and saved with the node.
+        const IE_CONTEXT_DEPTH = 5;
+
+        const _ieSeqKey  = "epe_library_sequences";
+        const _ieSeqLoad = () => { try { return JSON.parse(localStorage.getItem(_ieSeqKey) || "[]"); } catch(_e) { return []; } };
+        const _ieSeqSave = (a) => { try { localStorage.setItem(_ieSeqKey, JSON.stringify(a)); } catch(_e) {} };
+
+        let _ieThreads = {};                       // { "<promptTabIndex>": [instruction, …] }
+        const _ieTabKey = () => {
+          try {
+            const p = (_epeOwnerNode && _epeOwnerNode.properties) || {};
+            return String(p.epe_tab_active || 0);
+          } catch(_e) { return "0"; }
+        };
+        const _iePersistThreads = () => {
+          if (!_epeOwnerNode) return;
+          if (!_epeOwnerNode.properties) _epeOwnerNode.properties = {};
+          try { _epeOwnerNode.properties.epe_ie_threads = JSON.parse(JSON.stringify(_ieThreads)); } catch(_e) {}
+        };
+        // Declared here rather than beside the divider: _epePersistUi reads it and
+        // runs during the initial _setRpTab, which happens before the divider is
+        // built — a `let` read before its declaration throws (temporal dead zone).
+        let _libCollapsed = false;
+        // Same reasoning for the other two collapsible edges. Both are built far
+        // below (the rail divider near the action rail, the tuning divider at the
+        // end of layout assembly) but _epePersistUi is defined above them and runs
+        // on the first _setRpTab, so these must exist by then.
+        let _railCollapsed = false, _railW = 0;
+        let _tuneH = 0;
+
+        // Marks whether the active review came from Instruct Edit. Committing an
+        // Enhance / Variations / Inverter result replaces the prompt wholesale,
+        // which makes the existing direction stale — committing an instruct
+        // result does not, because the thread is what produced it.
+        let _ieReviewIsInstruct = false;
+        // Thread contents as they were when the current instruct review began.
+        // Discarding the result must also unwind the direction that produced it,
+        // otherwise the context would describe a change the prompt no longer has.
+        let _ieThreadSnapshot = null;
+
+        // Assigned for real once the panel DOM / instruct row exist; no-ops until then.
+        let _ieRefresh     = () => {};
+        let _ieUpdateChip  = () => {};
+        let _ieRunSequence = () => {};
+
+        // Shared collapse chevron — points sideways when closed, down when open,
+        // matching the Style tuning header. Used by Instruct Edit sequence cards
+        // and by the Favorites / Snippets cards.
+        const _mkChevron = () => {
+          const c = document.createElement("span");
+          c.style.cssText =
+            "width:0;height:0;border-top:4px solid transparent;border-bottom:4px solid transparent;" +
+            "border-left:5px solid #7a8a9c;transition:transform .15s;flex-shrink:0;";
+          return c;
+        };
+        const _setChevron = (el, open) => {
+          if (el) el.style.transform = open ? "rotate(90deg)" : "";
+        };
+
+        const _ieThreadGet   = () => (_ieThreads[_ieTabKey()] || []);
+        const _ieThreadSet   = (arr) => { _ieThreads[_ieTabKey()] = arr.slice(); _iePersistThreads(); _ieRefresh(); };
+        const _ieThreadPush  = (t) => { const a = _ieThreadGet().slice(); a.push(t); _ieThreadSet(a); };
+        const _ieThreadClear = () => { _ieThreadSet([]); };
+        // Context handed to the model: the most recent few, oldest first.
+        const _ieContext     = () => _ieThreadGet().slice(-IE_CONTEXT_DEPTH);
+
         // ── Right panel — Phase 2 Local Library ─────────────────────────────────
 
         // ── localStorage helpers ────────────────────────────────────────
@@ -5942,9 +6138,14 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         // ── Tab bar ──────────────────────────────────────────────────────
         const rpTabs = document.createElement("div");
-        rpTabs.style.cssText = "display:flex;flex-direction:column;gap:6px;flex-shrink:0;background:#12171f;padding:8px 8px 6px;";
+        // Compact spacing — a third tab row was added, so the block is tightened
+        // to keep the overall vertical footprint roughly where it was.
+        rpTabs.style.cssText = "display:flex;flex-direction:column;gap:4px;flex-shrink:0;background:#12171f;padding:5px 8px 4px;";
+        // Flex centring keeps labels on the optical centre in both axes
+        // regardless of length; min-height stops short labels collapsing.
         const _rpTabBase =
-          "flex:1;white-space:nowrap;padding:5px 4px;text-align:center;font-size:10px;font-weight:500;" +
+          "flex:1;white-space:nowrap;padding:4px;font-size:10px;font-weight:500;line-height:1;" +
+          "display:flex;align-items:center;justify-content:center;min-height:22px;" +
           "color:#8ba5be;cursor:pointer;background:rgba(109,184,232,0.05);" +
           "border:1px solid rgba(109,184,232,0.15);user-select:none;transition:color .12s,background .12s,border-color .12s;";
         const rpTabEls = {};
@@ -5953,13 +6154,18 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         rpTabRow1.style.cssText = "display:flex;";
         const rpTabRow2 = document.createElement("div");
         rpTabRow2.style.cssText = "display:flex;";
+        // Row 3 carries Instruct Edit alone, full width \u2014 it's a different kind
+        // of thing from the browsers and collections, and the label needs room.
+        const rpTabRow3 = document.createElement("div");
+        rpTabRow3.style.cssText = "display:flex;";
 
         [
           ["civitai",   "Civitai",   "Browse Civitai image/video prompts",        rpTabRow1],
           ["genur",     "Genur.art", "Browse Genur.art image prompts",             rpTabRow1],
           ["workflows", "Workflows", "Search and load ComfyUI workflows",          rpTabRow2],
           ["favorites", "Favorites", "Saved prompts \u2014 click a card to load into editor", rpTabRow2],
-          ["snippets",  "Snippets",  "Reusable fragments \u2014 click a card to insert at cursor", rpTabRow2]
+          ["snippets",  "Snippets",  "Reusable fragments \u2014 click a card to insert at cursor", rpTabRow2],
+          ["instruct",  "Instruct Edit", "Your prompt's direction \u2014 live thread and saved sequences", rpTabRow3]
         ].forEach(([id, label, title, row]) => {
           const tab = document.createElement("div");
           tab.textContent=label; tab.title=title;
@@ -5971,10 +6177,11 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         // Segmented-bar shaping: round outer corners; overlap by 1px so shared
         // edges don't double but every tab keeps a full 4-sided border.
-        [rpTabRow1, rpTabRow2].forEach(row => {
+        [rpTabRow1, rpTabRow2, rpTabRow3].forEach(row => {
           const kids = Array.from(row.children);
           kids.forEach((t, i) => {
-            if (i === 0) t.style.borderRadius = "8px 0 0 8px";
+            if (kids.length === 1) t.style.borderRadius = "8px";
+            else if (i === 0) t.style.borderRadius = "8px 0 0 8px";
             else if (i === kids.length - 1) t.style.borderRadius = "0 8px 8px 0";
             if (i > 0) t.style.marginLeft = "-1px";
           });
@@ -5982,6 +6189,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         rpTabs.appendChild(rpTabRow1);
         rpTabs.appendChild(rpTabRow2);
+        rpTabs.appendChild(rpTabRow3);
 
         // ── Body container ───────────────────────────────────────────────
         const rpBody = document.createElement("div");
@@ -7890,7 +8098,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           b.textContent=label; b.title=title;
           b.style.cssText =
             "background:#161d28;border:1px solid #202a38;border-radius:3px;" +
-            "color:"+(col||"#6a7a8d")+";font-size:11px;padding:2px 6px;cursor:pointer;font-family:inherit;" +
+            "color:"+(col||"#6a7a8d")+";font-size:11px;padding:3px 7px;cursor:pointer;font-family:inherit;" +
+            "display:inline-flex;align-items:center;justify-content:center;line-height:1;min-height:20px;" +
             "transition:color .1s,border-color .1s,background .1s;";
           b.onmouseenter=()=>{b.style.background="#202a38";b.style.color="#c2cddb";b.style.borderColor="#31415a";};
           b.onmouseleave=()=>{b.style.background="#161d28";b.style.color=(col||"#6a7a8d");b.style.borderColor="#202a38";};
@@ -7902,6 +8111,9 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           // loading a library entry while a review is active
           // implicitly abandons the result. Auto-discard with toast.
           if (_reviewMode) _autoDiscardReview("Library load — result discarded");
+          // Loading a saved prompt replaces the text wholesale, so the direction
+          // that shaped the previous prompt no longer describes what's here.
+          _ieThreadClear();
           textEl.value=item.text; updateTokenBadge(item.text); textEl.focus();
         };
         const _insertItem = (item) => {
@@ -7935,12 +8147,17 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const card=document.createElement("div");
           card.style.cssText=_cardBase;
 
-          // Name
+          // Name row — chevron matches every other collapsible in the node:
+          // sideways when closed, down when open. Clicking it toggles the card.
+          const nameRow=document.createElement("div");
+          nameRow.style.cssText="display:flex;align-items:center;gap:7px;margin-bottom:2px;cursor:pointer;user-select:none;";
+          const nameChev=_mkChevron();
           const nameEl=document.createElement("div");
           nameEl.style.cssText =
-            "font-size:11px;font-weight:600;color:#9aaaba;margin-bottom:2px;" +
+            "font-size:11px;font-weight:600;color:#9aaaba;flex:1;" +
             "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
           nameEl.textContent=item.name; nameEl.title=item.name;
+          nameRow.appendChild(nameChev); nameRow.appendChild(nameEl);
 
           // Date
           const dateEl=document.createElement("div");
@@ -7976,27 +8193,62 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const _upCardChar=()=>{ charSpan.textContent=countTokens(editTA.value)+" tokens"; };
           editTA.oninput=_upCardChar; _upCardChar();
 
+          // Declared here, before _collapseTA/_expandTA close over it — those
+          // run during the initial render, so a `const` further down puts this
+          // in the temporal dead zone and the whole extension fails to load.
+          const cardBodyWrap = document.createElement("div");
+          cardBodyWrap.style.cssText = "display:none;";
+
           // Track open card across all cards in this render
           if(!rpList._openTA) rpList._openTA=null;
 
+          // Commit an edit without the user having to press Save. Called on every
+          // close path — chevron, outside click, another card opening, or focus
+          // moving to the Instruct box — so switching away never loses work.
+          // Declared before _collapseTA because that closes over it.
+          const _commitEdit=()=>{
+            const newText=editTA.value.trim();
+            if(!newText || newText===(item.text||"").trim()) return false;
+            const arr=_libLoad(tabId);
+            const idx=arr.findIndex(x=>x.id===item.id);
+            if(idx<0) return false;
+            arr[idx].text=newText; item.text=newText;
+            _libSaveItems(tabId,arr);
+            return true;
+          };
           const _collapseTA=()=>{
+            _commitEdit();
             editTA.style.cssText=_taCollapsedCSS;
             editTA.readOnly=true;
+            cardBodyWrap.style.display="none";
+            _setChevron(nameChev,false);
             if(rpList._openTA===editTA) rpList._openTA=null;
             try { document.removeEventListener("mousedown",_outsideHandler,true); } catch(_e){}
           };
           const _expandTA=()=>{
             // Close any other open card first
             if(rpList._openTA && rpList._openTA!==editTA){
+              if(rpList._openTA._epeCommit) rpList._openTA._epeCommit();
               rpList._openTA.style.cssText=_taCollapsedCSS;
               rpList._openTA.readOnly=true;
+              if(rpList._openTA._epeBody) rpList._openTA._epeBody.style.display="none";
+              if(rpList._openTA._epeChev) _setChevron(rpList._openTA._epeChev,false);
             }
+            cardBodyWrap.style.display="";
             editTA.style.cssText=_taExpandedCSS;
             editTA.readOnly=false;
+            _setChevron(nameChev,true);
             editTA.focus();
             rpList._openTA=editTA;
             // Listen for outside clicks only while expanded; _collapseTA removes it.
             document.addEventListener("mousedown",_outsideHandler,true);
+          };
+          editTA._epeChev=nameChev;
+          editTA._epeBody=cardBodyWrap;
+          editTA._epeCommit=_commitEdit;
+          nameRow.onclick=(ev)=>{
+            ev.stopPropagation();
+            if(editTA.readOnly) _expandTA(); else _collapseTA();
           };
 
           editTA.onclick=(ev)=>{
@@ -8091,11 +8343,26 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           card.onmouseleave=()=>_cardOut(card);
           card.onclick=(ev)=>ev.stopPropagation();
 
-          card.appendChild(nameEl);
-          card.appendChild(dateEl);
-          card.appendChild(_mkFontSizerWrap(editTA, 10));
-          card.appendChild(saveRow);
-          card.appendChild(acts);
+          // Everything below the title row goes in the wrapper hoisted above, so
+          // a collapsed card shows only chevron + name + token count — the same
+          // shape as an Instruct Edit saved sequence card.
+          cardBodyWrap.appendChild(dateEl);
+          cardBodyWrap.appendChild(_mkFontSizerWrap(editTA, 10));
+          cardBodyWrap.appendChild(saveRow);
+          cardBodyWrap.appendChild(acts);
+          // Token count sits on the title row and stays visible when collapsed.
+          const nameTokens = document.createElement("span");
+          nameTokens.style.cssText =
+            "font-size:9px;color:#4e5c6e;flex-shrink:0;margin-left:6px;";
+          const _syncNameTokens = () => {
+            try { nameTokens.textContent = countTokens(editTA.value) + " tokens"; }
+            catch (_e) { nameTokens.textContent = ""; }
+          };
+          _syncNameTokens();
+          editTA.addEventListener("input", _syncNameTokens);
+          nameRow.appendChild(nameTokens);
+          card.appendChild(nameRow);
+          card.appendChild(cardBodyWrap);
           return card;
         };
 
@@ -8125,10 +8392,23 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           if (!_epeOwnerNode) return;
           if (!_epeOwnerNode.properties) _epeOwnerNode.properties = {};
           try {
+            // Width is only meaningful when expanded — reading it while collapsed
+            // would persist 0 and reopen to a zero-width panel.
+            const _w = _libCollapsed ? undefined : (parseInt(rightPanel.style.width, 10) || undefined);
+            const _prev = (_epeOwnerNode.properties || {}).epe_ui || {};
+            // Same rule for the rail and the tuning block: only record a size
+            // while the panel is open, or a collapsed session would persist 0
+            // and reopen to nothing.
+            const _rw = _railCollapsed ? undefined : (_railW || undefined);
+            const _th = !_styleOpen ? undefined : (_tuneH || undefined);
             _epeOwnerNode.properties.epe_ui = {
               tab: _rpActive,
               styleOpen: _styleOpen,
-              libraryWidth: parseInt(rightPanel.style.width, 10) || undefined,
+              libraryWidth: _w || _prev.libraryWidth || undefined,
+              libraryCollapsed: _libCollapsed || undefined,
+              railWidth: _rw || _prev.railWidth || undefined,
+              railCollapsed: _railCollapsed || undefined,
+              tuneHeight: _th || _prev.tuneHeight || undefined,
             };
           } catch (_e) {}
         };
@@ -8174,10 +8454,18 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         // ── Render body ──────────────────────────────────────────────────
         const _renderRpBody = () => {
+          // Leaving Favorites/Snippets rebuilds the list from storage, so commit
+          // any card still open before it is thrown away.
+          try { if (rpList && rpList._openTA && rpList._openTA._epeCommit) rpList._openTA._epeCommit(); } catch (_e) {}
           rpBody.innerHTML="";
           if(_rpActive==="civitai"){   rpBody.appendChild(rpCivPanel);      return; }
           if(_rpActive==="genur"){     rpBody.appendChild(rpGenurPanel);    return; }
           if(_rpActive==="workflows"){ rpBody.appendChild(rpWorkflowPanel); return; }
+          if(_rpActive==="instruct"){
+            rpBody.appendChild(rpInstructPanel);
+            _ieShowPane(_iePane);
+            return;
+          }
           rpBody.appendChild(rpSearchWrap);
           rpBody.appendChild(rpList);
           rpList.innerHTML="";
@@ -8205,6 +8493,267 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           _setRpTab(tabId);
         };
 
+        // ══════════════════════════════════════════════════════════════════
+        // INSTRUCT EDIT PANEL — Live thread + Saved sequences
+        // ══════════════════════════════════════════════════════════════════
+        const rpInstructPanel = document.createElement("div");
+        rpInstructPanel.style.cssText = "flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0;";
+
+        // Live / Saved sub-toggle
+        const ieSubBar = document.createElement("div");
+        ieSubBar.style.cssText = "display:flex;gap:5px;padding:0 8px 5px;flex-shrink:0;";
+        let _iePane = "live";
+        const _mkIeSub = (label, id) => {
+          const b = document.createElement("button");
+          b.textContent = label;
+          const paint = () => {
+            b.style.cssText =
+              "font-size:10px;padding:4px 13px;border-radius:4px;cursor:pointer;font-family:inherit;" +
+              "display:flex;align-items:center;justify-content:center;line-height:1;min-height:22px;" +
+              "transition:color .12s,background .12s,border-color .12s;" +
+              (_iePane === id
+                ? "background:#202a38;border:1px solid #4e5c6e;color:#c2e2f8;"
+                : "background:#12171f;border:1px solid #1c2431;color:#6a7a8d;");
+          };
+          paint(); b._paint = paint;
+          b.onclick = () => _ieShowPane(id);
+          return b;
+        };
+        const ieSubLive  = _mkIeSub("Live", "live");
+        const ieSubSaved = _mkIeSub("Saved", "saved");
+        ieSubBar.appendChild(ieSubLive); ieSubBar.appendChild(ieSubSaved);
+
+        const ieBody = document.createElement("div");
+        ieBody.style.cssText = "flex:1;overflow-y:auto;padding:0 8px 10px;min-height:0;";
+
+        const _mkIeCallout = (txt) => {
+          const c = document.createElement("div");
+          c.style.cssText =
+            "display:flex;gap:5px;padding:5px 7px;background:rgba(100,160,255,0.07);" +
+            "border:1px solid rgba(100,160,255,0.15);border-radius:3px;margin-bottom:8px;";
+          const s = document.createElement("span");
+          s.textContent = txt;
+          s.style.cssText = "font-size:9px;color:rgba(100,160,255,0.7);line-height:1.5;";
+          c.appendChild(s); return c;
+        };
+
+        // ── Live view ──────────────────────────────────────────────────
+        const ieLiveView = document.createElement("div");
+        ieLiveView.appendChild(_mkIeCallout(
+          "Your direction for this prompt. The last few steps are sent as context, so “dial that back” knows what you meant."));
+
+        const ieThreadHead = document.createElement("div");
+        ieThreadHead.style.cssText = "display:flex;align-items:center;gap:6px;margin-bottom:6px;";
+        const ieThreadTitle = document.createElement("span");
+        ieThreadTitle.textContent = "This prompt's direction";
+        ieThreadTitle.style.cssText = "font-size:10px;color:#8ba5be;font-weight:500;";
+        const ieThreadCount = document.createElement("span");
+        ieThreadCount.style.cssText = "font-size:9px;color:#5d6f85;margin-left:auto;";
+        const ieThreadClearBtn = document.createElement("span");
+        ieThreadClearBtn.textContent = "✕";
+        ieThreadClearBtn.title = "Clear this thread";
+        ieThreadClearBtn.style.cssText = "font-size:11px;color:#4e5c6e;cursor:pointer;padding:0 3px;";
+        ieThreadClearBtn.onmouseenter = () => { ieThreadClearBtn.style.color = "#e08a8a"; };
+        ieThreadClearBtn.onmouseleave = () => { ieThreadClearBtn.style.color = "#4e5c6e"; };
+        ieThreadClearBtn.onclick = () => { if (_ieThreadGet().length) _ieThreadClear(); };
+        ieThreadHead.appendChild(ieThreadTitle);
+        ieThreadHead.appendChild(ieThreadCount);
+        ieThreadHead.appendChild(ieThreadClearBtn);
+        ieLiveView.appendChild(ieThreadHead);
+
+        const ieStepsBox = document.createElement("div");
+        ieLiveView.appendChild(ieStepsBox);
+
+        const ieSaveSeqWrap = document.createElement("div");
+        ieSaveSeqWrap.style.cssText = "margin-top:8px;";
+        const ieSaveSeqBtn = document.createElement("button");
+        ieSaveSeqBtn.textContent = "☆ Save sequence";
+        ieSaveSeqBtn.title = "Save these steps as a reusable sequence";
+        ieSaveSeqBtn.style.cssText =
+          "width:100%;background:rgba(109,184,232,0.14);border:1px solid rgba(140,200,240,0.4);" +
+          "border-radius:5px;color:#c2e2f8;font-size:10px;padding:7px;cursor:pointer;font-family:inherit;" +
+          "display:flex;align-items:center;justify-content:center;line-height:1;";
+        ieSaveSeqBtn.onmouseenter = () => { ieSaveSeqBtn.style.background = "rgba(109,184,232,0.24)"; };
+        ieSaveSeqBtn.onmouseleave = () => { ieSaveSeqBtn.style.background = "rgba(109,184,232,0.14)"; };
+        ieSaveSeqBtn.onclick = () => {
+          const steps = _ieThreadGet();
+          if (!steps.length) { _toast("Nothing to save — the thread is empty."); return; }
+          const def = steps[0].slice(0, 40).replace(/\s+/g, " ").trim() + (steps.length > 1 ? "…" : "");
+          const name = window.prompt("Save sequence as:", def);
+          if (!name || !name.trim()) return;
+          const all = _ieSeqLoad();
+          all.push({ id: _libNewId(), name: name.trim(), steps: steps.slice(), date: new Date().toISOString() });
+          _ieSeqSave(all);
+          _ieShowPane("saved");
+        };
+        ieSaveSeqWrap.appendChild(ieSaveSeqBtn);
+        ieLiveView.appendChild(ieSaveSeqWrap);
+
+        // ── Saved view ─────────────────────────────────────────────────
+        const ieSavedView = document.createElement("div");
+        ieSavedView.style.display = "none";
+        ieSavedView.appendChild(_mkIeCallout(
+          "Saved sequences replay step by step against the current prompt, and land in the live thread."));
+        const ieCardsBox = document.createElement("div");
+        ieSavedView.appendChild(ieCardsBox);
+
+        ieBody.appendChild(ieLiveView);
+        ieBody.appendChild(ieSavedView);
+        rpInstructPanel.appendChild(ieSubBar);
+        rpInstructPanel.appendChild(ieBody);
+
+        // ── Renderers ──────────────────────────────────────────────────
+        // Highlight state during a sequence replay: index of the running step.
+        let _ieRunningIdx = -1;
+
+        const _ieRenderThreadList = () => {
+          const steps = _ieThreadGet();
+          ieStepsBox.innerHTML = "";
+          ieThreadCount.textContent = steps.length + (steps.length === 1 ? " step" : " steps");
+          if (!steps.length) {
+            const e = document.createElement("div");
+            e.style.cssText = "color:#3a4a5c;font-size:10px;text-align:center;padding:22px 10px;line-height:1.8;";
+            e.innerHTML = "No direction yet.<br><span style=\"font-size:9px;color:#2b3949;\">Describe an edit above and it appears here.</span>";
+            ieStepsBox.appendChild(e);
+            return;
+          }
+          steps.forEach((txt, i) => {
+            const row = document.createElement("div");
+            const running = (i === _ieRunningIdx);
+            const done    = (_ieRunningIdx >= 0 && i < _ieRunningIdx);
+            const pending = (_ieRunningIdx >= 0 && i > _ieRunningIdx);
+            row.style.cssText =
+              "display:flex;gap:7px;align-items:flex-start;padding:7px 8px;margin-bottom:5px;border-radius:5px;" +
+              "background:" + (running ? "rgba(109,184,232,0.08)" : "#0d1119") + ";" +
+              "border:1px solid " + (running ? "rgba(140,200,240,0.55)" : "#1c2431") + ";" +
+              (pending ? "opacity:0.45;" : "");
+            const n = document.createElement("span");
+            n.textContent = String(i + 1);
+            n.style.cssText =
+              "font-size:9px;border-radius:3px;padding:1px 5px;flex-shrink:0;margin-top:1px;" +
+              (done ? "color:#8fe0cc;background:rgba(93,208,181,0.14);"
+                    : "color:#6db8e8;background:rgba(109,184,232,0.14);");
+            const tx = document.createElement("span");
+            tx.textContent = txt;
+            tx.style.cssText = "font-size:10.5px;color:#aab8c8;line-height:1.5;flex:1;word-break:break-word;";
+            const del = document.createElement("span");
+            del.textContent = "✕";
+            del.title = "Remove this step";
+            del.style.cssText = "font-size:10px;color:#5d6f85;cursor:pointer;flex-shrink:0;display:none;";
+            del.onclick = () => { const a = _ieThreadGet().slice(); a.splice(i, 1); _ieThreadSet(a); };
+            row.onmouseenter = () => { del.style.display = "block"; if (!running) row.style.borderColor = "#28364a"; };
+            row.onmouseleave = () => { del.style.display = "none";  if (!running) row.style.borderColor = "#1c2431"; };
+            row.appendChild(n); row.appendChild(tx); row.appendChild(del);
+            ieStepsBox.appendChild(row);
+          });
+        };
+
+        const _ieRenderSaved = () => {
+          const all = _ieSeqLoad();
+          ieCardsBox.innerHTML = "";
+          if (!all.length) {
+            const e = document.createElement("div");
+            e.style.cssText = "color:#3a4a5c;font-size:10px;text-align:center;padding:24px 10px;line-height:1.8;";
+            e.innerHTML = "No saved sequences yet.<br><span style=\"font-size:9px;color:#2b3949;\">Build a thread, then <em>Save sequence</em>.</span>";
+            ieCardsBox.appendChild(e);
+            return;
+          }
+          all.slice().reverse().forEach(seq => ieCardsBox.appendChild(_mkIeSeqCard(seq)));
+        };
+
+        const _mkIeSeqCard = (seq) => {
+          const card = document.createElement("div");
+          card.style.cssText =
+            "background:#0d1119;border:1px solid #1c2431;border-radius:6px;margin-bottom:8px;overflow:hidden;";
+          let open = false;
+
+          const head = document.createElement("div");
+          head.style.cssText = "display:flex;align-items:center;gap:7px;padding:7px 9px;cursor:pointer;user-select:none;";
+          const chev = _mkChevron();
+          const nm = document.createElement("span");
+          nm.textContent = seq.name; nm.title = seq.name;
+          nm.style.cssText =
+            "font-size:10.5px;color:#c2cddb;font-weight:500;flex:1;overflow:hidden;" +
+            "text-overflow:ellipsis;white-space:nowrap;";
+          const sc = document.createElement("span");
+          sc.style.cssText = "font-size:9px;color:#5d6f85;flex-shrink:0;";
+          const _steps = () => ta.value.split("\n").map(x => x.trim()).filter(Boolean);
+          head.appendChild(chev); head.appendChild(nm); head.appendChild(sc);
+
+          const body = document.createElement("div");
+          body.style.cssText = "padding:0 9px 9px;display:none;";
+          const ta = document.createElement("textarea");
+          ta.spellcheck = false;
+          ta.value = (seq.steps || []).join("\n");
+          ta.style.cssText =
+            "width:100%;box-sizing:border-box;background:#121821;border:1px solid #24303f;border-radius:4px;" +
+            "color:#aab8c8;font-size:10.5px;line-height:1.6;padding:7px 9px;resize:vertical;" +
+            "font-family:inherit;outline:none;min-height:70px;";
+          const _upCount = () => { const n2 = _steps().length; sc.textContent = n2 + (n2 === 1 ? " step" : " steps"); };
+          ta.oninput = _upCount; _upCount();
+
+          const acts = document.createElement("div");
+          acts.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;margin-top:7px;";
+          const runBtn = _mkBtn("▶ Run on current prompt", "Replay these steps in order against the current prompt", "#c2e2f8");
+          runBtn.style.borderColor = "rgba(140,200,240,0.5)";
+          runBtn.style.background  = "rgba(109,184,232,0.16)";
+          runBtn.onclick = (ev) => { ev.stopPropagation(); const s = _steps(); if (s.length) _ieRunSequence(s, seq.name); };
+          const saveBtn = _mkBtn("Save", "Save edits to this sequence", "rgba(109,184,232,0.8)");
+          saveBtn.onclick = (ev) => {
+            ev.stopPropagation();
+            const s = _steps(); if (!s.length) return;
+            const arr = _ieSeqLoad(); const i = arr.findIndex(x => x.id === seq.id);
+            if (i >= 0) { arr[i].steps = s; seq.steps = s; _ieSeqSave(arr); }
+            saveBtn.textContent = "Saved!"; setTimeout(() => saveBtn.textContent = "Save", 1200);
+          };
+          const saveNewBtn = _mkBtn("Save as New", "Save these steps as a new sequence", "rgba(140,200,240,0.7)");
+          saveNewBtn.onclick = (ev) => {
+            ev.stopPropagation();
+            const s = _steps(); if (!s.length) return;
+            const name = window.prompt("Save sequence as:", seq.name + " copy");
+            if (!name || !name.trim()) return;
+            const arr = _ieSeqLoad();
+            arr.push({ id: _libNewId(), name: name.trim(), steps: s, date: new Date().toISOString() });
+            _ieSeqSave(arr); _ieRenderSaved();
+          };
+          const renBtn = _mkBtn("Rename", "Rename this sequence");
+          renBtn.onclick = (ev) => {
+            ev.stopPropagation();
+            const name = window.prompt("Rename sequence:", seq.name);
+            if (!name || !name.trim()) return;
+            const arr = _ieSeqLoad(); const i = arr.findIndex(x => x.id === seq.id);
+            if (i >= 0) { arr[i].name = name.trim(); _ieSeqSave(arr); _ieRenderSaved(); }
+          };
+          const delBtn = _mkBtn("✕", "Delete this sequence", "#664");
+          delBtn.onclick = (ev) => {
+            ev.stopPropagation();
+            if (!window.confirm('Delete "' + seq.name + '"?')) return;
+            _ieSeqSave(_ieSeqLoad().filter(x => x.id !== seq.id)); _ieRenderSaved();
+          };
+          [runBtn, saveBtn, saveNewBtn, renBtn, delBtn].forEach(b => acts.appendChild(b));
+          body.appendChild(ta); body.appendChild(acts);
+
+          head.onclick = () => {
+            open = !open;
+            body.style.display = open ? "block" : "none";
+            _setChevron(chev, open);
+            card.style.borderColor = open ? "#28364a" : "#1c2431";
+          };
+          card.appendChild(head); card.appendChild(body);
+          return card;
+        };
+
+        function _ieShowPane(which) {
+          _iePane = which;
+          ieLiveView.style.display  = which === "live"  ? "" : "none";
+          ieSavedView.style.display = which === "saved" ? "" : "none";
+          ieSubLive._paint(); ieSubSaved._paint();
+          if (which === "live") _ieRenderThreadList(); else _ieRenderSaved();
+        }
+
+        // Real implementation of the early no-op hook.
+        _ieRefresh = () => { _ieRenderThreadList(); _ieUpdateChip(); };
+
         // ── Assemble right panel ─────────────────────────────────────────
         rightPanel.appendChild(rpTabs);
         rightPanel.appendChild(rpMediaBar);
@@ -8231,11 +8780,42 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         // ── Draggable divider — resize the Library column ────────────────
         const LIB_MIN_W = 220, LIB_MAX_W = 620, LIB_DEFAULT_W = 300;
+        // Publishes the current column width on the root element for code in the
+        // onNodeCreated scope. It no longer drives the node's minimum width —
+        // that is fixed at the editor floor, because a minimum that moved with
+        // this value snapped the node back out whenever the column reopened.
+        // Kept as a read-only signal of the column's state.
+        const _epeRootEl = () =>
+          rightPanel.closest(".epe-panel") || rightPanel.parentElement;
+        const _publishLibW = () => {
+          try {
+            const w = _libCollapsed ? 0 : (parseInt(rightPanel.style.width, 10) || LIB_DEFAULT_W);
+            const root = _epeRootEl();
+            if (root) root._epeLibW = w;
+          } catch (_e) {}
+        };
+        // Same signal for the Transform rail, so the node's minimum width can
+        // drop when the rail is collapsed instead of always reserving room.
+        const _publishRailW = (w) => {
+          try {
+            const root = _epeRootEl();
+            if (root) root._epeRailW = Math.max(0, w | 0);
+          } catch (_e) {}
+        };
+        // Ask the node to widen if a just-expanded column left it under its
+        // minimum. No-op while dragging — a drag is the user setting the size
+        // directly and must not be fought.
+        const _epeGrowToMin = () => {
+          try {
+            const root = _epeRootEl();
+            if (root && typeof root._epeGrowToMin === "function") root._epeGrowToMin();
+          } catch (_e) {}
+        };
         let _libDragging = false, _libStartX = 0, _libStartW = LIB_DEFAULT_W;
         const libGrip = document.createElement("div");
         libGrip.title = "Drag to resize — double-click to reset";
         libGrip.style.cssText =
-          "flex-shrink:0;width:5px;cursor:ew-resize;background:#1c2431;" +
+          "flex-shrink:0;width:5px;cursor:ew-resize;background:#1c2431;position:relative;" +
           "align-self:stretch;transition:background .12s;";
         libGrip.onmouseenter = () => { if (!_libDragging) libGrip.style.background = "#3a4a60"; };
         libGrip.onmouseleave = () => { if (!_libDragging) libGrip.style.background = "#1c2431"; };
@@ -8249,9 +8829,10 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         const _libOnMove = (e) => {
           if (!_libDragging) return;
           const delta = _libStartX - e.clientX;          // drag left → wider panel
-          let w = _libStartW + delta;
-          w = Math.max(LIB_MIN_W, Math.min(_libClampMax(), w));
-          rightPanel.style.width = w + "px";
+          // Floor is 0, not LIB_MIN_W: the drag runs smoothly all the way shut
+          // and back out again, with no snap and no separate collapsed mode.
+          const w = Math.max(0, Math.min(_libClampMax(), _libStartW + delta));
+          _libSetCollapsed(w <= 0, w);
           e.preventDefault();
         };
         const _libOnUp = (e) => {
@@ -8263,10 +8844,14 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           try { libGrip.releasePointerCapture(e.pointerId); } catch (_e) {}
           _epePersistUi();
         };
+        _publishLibW();   // initial value for a fresh node with no saved UI state
         libGrip.addEventListener("pointerdown", (e) => {
+          // No early-out when collapsed: dragging back out is how you reopen
+          // without reaching for the tab.
+          if (e.target === libHandle) return;
           _libDragging = true;
           _libStartX = e.clientX;
-          _libStartW = parseInt(rightPanel.style.width, 10) || LIB_DEFAULT_W;
+          _libStartW = _libCollapsed ? 0 : (parseInt(rightPanel.style.width, 10) || LIB_DEFAULT_W);
           libGrip.style.background = "#4e5c6e";
           try { libGrip.setPointerCapture(e.pointerId); } catch (_e) {}
           window.addEventListener("pointermove", _libOnMove, true);
@@ -8275,14 +8860,112 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           e.preventDefault(); e.stopPropagation();
         });
         libGrip.addEventListener("dblclick", (e) => {
-          rightPanel.style.width = LIB_DEFAULT_W + "px";
+          // Explicit width: this is the "reset the column" gesture, so unlike the
+          // ensure-visible callers it does want to overwrite the current width.
+          _libSetCollapsed(false, LIB_DEFAULT_W);
           _epePersistUi();
           e.preventDefault(); e.stopPropagation();
         });
         libGrip.addEventListener("mousedown", (e) => e.stopPropagation());
 
+        // ── Collapse pull-tab ────────────────────────────────────────────
+        // Hides the whole Library column so the editor gets the full width.
+        // Its own pointer handlers stop the grip starting a resize drag (and
+        // the ComfyUI canvas dragging the node) on the same press.
+        rightPanel.style.transition = "width .16s ease";
+        const libHandle = document.createElement("div");
+        libHandle.textContent = "›";
+        libHandle.style.cssText =
+          "position:absolute;top:50%;left:-7px;transform:translateY(-50%);" +
+          "width:16px;height:46px;border-radius:4px;background:#1b2430;border:1px solid #2b3a4e;" +
+          "display:flex;align-items:center;justify-content:center;cursor:pointer;color:#7a8a9c;" +
+          "font-size:12px;line-height:1;z-index:3;transition:color .12s,background .12s,border-color .12s;";
+        libHandle.onmouseenter = () => {
+          libHandle.style.background = "#26333f"; libHandle.style.color = "#c2e2f8";
+          libHandle.style.borderColor = "#4e5c6e";
+        };
+        libHandle.onmouseleave = () => {
+          libHandle.style.background = "#1b2430"; libHandle.style.color = "#7a8a9c";
+          libHandle.style.borderColor = "#2b3a4e";
+        };
+        // Width the panel needs to show its controls without wrapping. Measured
+        // so the tab reopens to something usable rather than to the last drag
+        // width, which may have been a two-pixel sliver.
+        // Deliberately NOT measured from content. The Library's scrollWidth is
+        // whatever its image results happen to be, which is enormous and has
+        // nothing to do with a sensible column width — measuring it made the
+        // panel balloon every time something reopened it. The rail and the
+        // tuning block do measure, because their content has a real intrinsic
+        // size; this one has a designed width instead.
+        const _libOpenW = () => {
+          const props = (_epeOwnerNode && _epeOwnerNode.properties) || {};
+          const saved = (typeof props.epe_ui === "object" && props.epe_ui && props.epe_ui.libraryWidth) || 0;
+          const want = saved >= LIB_MIN_W ? saved : LIB_DEFAULT_W;
+          return Math.max(LIB_MIN_W, Math.min(_libClampMax(), want));
+        };
+        // `w` is optional: mid-drag the caller passes the exact width so the edge
+        // tracks the cursor. Without it (tab click, restore) we open at _libOpenW.
+        const _libSetCollapsed = (v, w) => {
+          const wasCollapsed = _libCollapsed;
+          _libCollapsed = !!v;
+          if (_libCollapsed) {
+            rightPanel.style.width = "0px";
+            rightPanel.style.borderLeft = "none";
+          } else if (typeof w === "number") {
+            rightPanel.style.width = w + "px";
+            rightPanel.style.borderLeft = "1px solid #1c2431";
+          } else if (wasCollapsed) {
+            // Only choose a width when actually reopening. Callers like the
+            // Instruct Edit box call this to *ensure* the panel is visible; if
+            // it already was, its current width is the user's and must not be
+            // touched.
+            rightPanel.style.width = _libOpenW() + "px";
+            rightPanel.style.borderLeft = "1px solid #1c2431";
+          } else {
+            rightPanel.style.borderLeft = "1px solid #1c2431";
+          }
+          rightPanel.style.overflow = "hidden";
+          libHandle.textContent = _libCollapsed ? "‹" : "›";
+          libHandle.title = _libCollapsed ? "Show the Library panel" : "Collapse the Library panel";
+          _publishLibW();
+          // Mid-drag this runs on every pointermove; persisting there would write
+          // node.properties dozens of times a second and mark the graph dirty on
+          // each one. The pointerup handler persists once at the end instead.
+          if (!_libDragging) { _epePersistUi(); if (!_libCollapsed) _epeGrowToMin(); }
+        };
+        libHandle.addEventListener("pointerdown", (e) => { e.preventDefault(); e.stopPropagation(); });
+        libHandle.addEventListener("mousedown",   (e) => { e.stopPropagation(); });
+        libHandle.addEventListener("dblclick",    (e) => { e.preventDefault(); e.stopPropagation(); });
+        libHandle.addEventListener("click", (e) => {
+          e.preventDefault(); e.stopPropagation();
+          _libSetCollapsed(!_libCollapsed);
+        });
+        libGrip.appendChild(libHandle);
+        libHandle.title = "Collapse the Library panel";
+
         bodyWrap.appendChild(libGrip);
         bodyWrap.appendChild(rightPanel);
+
+        // The node's minimum width is fixed at the editor's floor, so narrowing
+        // the node can leave the Library wider than there is room for. Rather
+        // than pushing the node back out (which is what produced the "jumps to
+        // a default size" snap), the column trims itself to fit. _libClampMax
+        // never returns less than LIB_MIN_W, so it can shrink but not vanish —
+        // collapsing stays something the user does deliberately.
+        try {
+          const _libFitRO = new ResizeObserver(() => {
+            if (_libCollapsed || _libDragging) return;
+            const cur = parseInt(rightPanel.style.width, 10) || 0;
+            const max = _libClampMax();
+            if (cur > max) {
+              rightPanel.style.width = max + "px";
+              _publishLibW();
+              // No persist here: this fires on every frame of a node drag. The
+              // next deliberate action writes the trimmed width out.
+            }
+          });
+          _libFitRO.observe(bodyWrap);
+        } catch (_e) {}
 
         // ─────────────────────────────────────────────────────────────────
         // Style strip — UI scaffolding only
@@ -8476,8 +9159,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           else if (bld >= 75) mods.push("Make bold, dramatic stylistic choices where they enhance the result.");
 
           const sg = _sliderValues.subjectGrip;
-          if      (sg <= 30) mods.push("SUBJECT PRESERVATION OVERRIDE — this relaxes the hard rule above: preservation is loose; you may metaphorize or transform named subjects if the result is more evocative.");
-          else if (sg >= 70) mods.push("Subject preservation is strict. Keep all named subjects, locations, and entities exactly as the user wrote them. No substitutions.");
+          if      (sg <= 30) mods.push("SUBJECT FIDELITY OVERRIDE — this unlocks the LOCKED layer above: named subjects are no longer word-for-word, and you may metaphorize or transform them if the result is more evocative. The invention quota still applies.");
+          else if (sg >= 70) mods.push("SUBJECT FIDELITY — the LOCKED layer is absolute: named subjects, counts, locations and entities appear exactly as the user wrote them, no substitutions and no synonyms. This tightens the LOCKED layer only — everything outside it is still yours to reword freshly, and the invention quota still applies.");
 
           return mods.join("\n");
         };
@@ -8494,22 +9177,31 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             result = block + "\n\n" + cleaned;
           }
           if (_styleOverride && _styleActive !== "default") {
-            result = result + "\n\nAESTHETIC OVERRIDE — the STYLE TARGET above REPLACES the source's aesthetic. This relaxes SUBJECT PRESERVATION for aesthetic language only: discard the source's rendering style, medium, lighting, and global color grade, and re-render the scene fully in the style target. PRESERVE unchanged: subjects, counts, poses, actions, scene layout, and named objects with their identity colors — a red bicycle stays red, expressed in the target style's idiom.";
+            result = result + "\n\nAESTHETIC OVERRIDE — the STYLE TARGET above REPLACES the source's aesthetic. This relaxes SUBJECT FIDELITY for aesthetic language only: discard the source's rendering style, medium, lighting, and global color grade, and re-render the scene fully in the style target. PRESERVE unchanged: subjects, counts, poses, actions, scene layout, and named objects with their identity colors — a red bicycle stays red, expressed in the target style's idiom.";
           }
           const mods = _composeSliderModifiers();
           if (mods) result = result + "\n\n" + mods;
           return result;
         };
 
-        // Map current slider values to an Ollama options object. Ranges chosen
-        // to span "noticeably more conservative" to "noticeably more bold" at
-        // the extremes without producing unhinged output. Phase 3 mapping:
-        //   creativity → temperature (0.40–1.10), top_p (0.85–0.98)
+        // Map current slider values to an Ollama options object. Phase 4 mapping:
+        // each slider owns exactly one sampling lever, so no slider can silently
+        // cancel part of another. Neutral (50) sits close to Ollama's own stock
+        // sampling rather than well below it.
+        //   creativity → temperature (0.55–1.20)   50 → 0.875
         //   length     → num_predict (200–800)
-        //   focus      → top_p min cap (0.95–0.75), top_k (60–20)
-        //   variability→ seed (fixed 42 at <=10, else random), presence_penalty
-        //   boldness   → min_p (0.15–0.02)
+        //   focus      → top_p (0.98–0.78), top_k (100–40)   50 → 0.88 / 70
+        //   variability→ repeat_penalty (1.00–1.15), repeat_last_n,
+        //                seed (fixed 42 at <=10, else random)
+        //   boldness   → min_p (0.06–0.00)   50 → 0.03
         //   subjectGrip→ system prompt modifier only (no sampling param)
+        //
+        // Phase 3 sent presence_penalty, which is not an Ollama parameter — it was
+        // silently discarded, leaving Variability inert apart from the seed pin.
+        // repeat_penalty / repeat_last_n are the supported repetition controls.
+        // Phase 3 also took top_p as min(creativity term, focus term); at Focus >= 50
+        // the focus term always won, so Creativity's top_p contribution never applied.
+        // Focus now owns top_p outright.
         const _composeOllamaOpts = () => {
           const cr = _sliderValues.creativity;
           const ln = _sliderValues.length;
@@ -8517,17 +9209,17 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const vb = _sliderValues.variability;
           const bd = _sliderValues.boldness;
 
-          const temperature = +(0.40 + (cr / 100) * 0.70).toFixed(3);
-          const creativityTopP = 0.85 + (cr / 100) * 0.13;
-          const focusTopP = 0.95 - (fc / 100) * 0.20;
-          const top_p = +Math.min(creativityTopP, focusTopP).toFixed(3);
-          const top_k = Math.round(60 - (fc / 100) * 40);
+          const temperature = +(0.55 + (cr / 100) * 0.65).toFixed(3);
+          const top_p = +(0.98 - (fc / 100) * 0.20).toFixed(3);
+          const top_k = Math.round(100 - (fc / 100) * 60);
           const num_predict = Math.round(200 + (ln / 100) * 600);
           const seed = (vb <= 10) ? 42 : -1;
-          const presence_penalty = vb > 50 ? +(((vb - 50) / 100) * 0.5).toFixed(3) : 0;
-          const min_p = +(0.15 - (bd / 100) * 0.13).toFixed(3);
+          const repeat_penalty = +(1.00 + (vb / 100) * 0.15).toFixed(3);
+          const repeat_last_n = vb > 50 ? 256 : 64;
+          const min_p = +(0.06 - (bd / 100) * 0.06).toFixed(3);
 
-          return { temperature, top_p, top_k, num_predict, min_p, seed, presence_penalty };
+          return { temperature, top_p, top_k, num_predict, min_p, seed,
+                   repeat_penalty, repeat_last_n };
         };
         // ─────────────────────────────────────────────────────────────────
 
@@ -8847,18 +9539,39 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         if (_epeOwnerNode) {
           // Restore panel tab + style section open/closed.
           _epeOwnerNode._epeUiRestore = () => {
+            // Instruct Edit threads ride along with the prompt tabs they belong
+            // to, so reopening a workflow restores the direction that built it.
+            try {
+              const th = (_epeOwnerNode.properties || {}).epe_ie_threads;
+              if (th && typeof th === "object") {
+                const clean = {};
+                Object.keys(th).forEach(k => {
+                  if (Array.isArray(th[k])) clean[k] = th[k].filter(x => typeof x === "string");
+                });
+                _ieThreads = clean;
+                _ieRefresh();
+              }
+            } catch (_e) {}
             const ui = (_epeOwnerNode.properties || {}).epe_ui;
             if (!ui) return;
             if (ui.tab && rpTabEls[ui.tab]) _setRpTab(ui.tab);
-            if (typeof ui.styleOpen === "boolean" && ui.styleOpen !== _styleOpen) {
-              _styleOpen = ui.styleOpen;
-              styleBody.style.display = _styleOpen ? "" : "none";
-              styleChev.style.transform = _styleOpen ? "" : "rotate(-90deg)";
-              _updateStyleHdrState();
+            // Tuning block: restore its height first, then its open state, so
+            // reopening lands on the height this node was saved at.
+            if (typeof ui.tuneHeight === "number" && ui.tuneHeight > 40 && ui.tuneHeight <= 1200) {
+              _tuneH = ui.tuneHeight;
+            }
+            if (typeof ui.styleOpen === "boolean") {
+              _tuneApply(ui.styleOpen ? (_tuneH || _tuneOpenH()) : 0);
             }
             if (typeof ui.libraryWidth === "number" && ui.libraryWidth >= 180 && ui.libraryWidth <= 800) {
               rightPanel.style.width = ui.libraryWidth + "px";
             }
+            if (ui.libraryCollapsed) _libSetCollapsed(true);
+            if (typeof ui.railWidth === "number" && ui.railWidth >= 40 && ui.railWidth <= 400) {
+              _railApply(ui.railWidth);
+            }
+            if (ui.railCollapsed) _railApply(0);
+            _publishLibW();   // so the node's min width is right from the first frame
           };
 
           _epeOwnerNode._epeStyleRestore = () => {
@@ -8892,16 +9605,12 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           "flex-shrink:0;background:rgba(109,184,232,0.04);" +
           "border-top:1px solid rgba(109,184,232,0.14);";
         const styleHdr = document.createElement("div");
-        styleHdr.title = "Click to show or hide Style tuning";
+        // No longer a toggle: the divider above the block owns collapse now, the
+        // same way the Library divider owns the Library column. Cursor stays
+        // default so the bar doesn't advertise a click it no longer handles.
         styleHdr.style.cssText =
-          "display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;user-select:none;" +
-          "background:rgba(109,184,232,0.08);border:1px solid rgba(109,184,232,0.2);border-radius:8px;" +
-          "transition:background .12s,border-color .12s;";
-        styleHdr.onmouseenter = () => { styleHdr.style.background = "rgba(109,184,232,0.14)"; styleHdr.style.borderColor = "rgba(109,184,232,0.35)"; };
-        styleHdr.onmouseleave = () => { styleHdr.style.background = "rgba(109,184,232,0.08)"; styleHdr.style.borderColor = "rgba(109,184,232,0.2)"; };
-        const styleChev = document.createElement("span");
-        styleChev.textContent = "\u25BC";
-        styleChev.style.cssText = "font-size:11px;color:#8cc8f0;transition:transform .12s;display:inline-block;width:12px;text-align:center;";
+          "display:flex;align-items:center;gap:8px;padding:8px 12px;user-select:none;" +
+          "background:rgba(109,184,232,0.08);border:1px solid rgba(109,184,232,0.2);border-radius:8px;";
         const styleHdrLabel = document.createElement("span");
         styleHdrLabel.textContent = "Style tuning";
         styleHdrLabel.style.cssText = "font-size:10px;color:#8ba5be;";
@@ -8909,7 +9618,6 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         styleHdrState.style.cssText = "font-size:10px;color:#6d849a;margin-left:auto;";
         const styleHdrToggle = document.createElement("span");
         styleHdrToggle.style.cssText = "font-size:9px;color:#5f7a92;";
-        styleHdr.appendChild(styleChev);
         styleHdr.appendChild(styleHdrLabel);
         styleHdr.appendChild(styleHdrToggle);
         // Compact chips: restyle the Style dropdown / Override boxes into
@@ -8942,19 +9650,15 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         styleSection.appendChild(styleHdr);
         styleSection.appendChild(styleBody);
         const _updateStyleHdrState = () => {
-          styleHdrToggle.textContent = _styleOpen ? "(click to hide)" : "(click to show)";
+          styleHdrToggle.textContent = "";
           styleHdrState.textContent = _styleOpen ? "" :
             (STYLE_OPTIONS.find(o => o.id === _styleActive)?.label || "Default") +
             (_styleOverride ? " · Override on" : "");
         };
-        styleHdr.onclick = () => {
-          _styleOpen = !_styleOpen;
-          styleBody.style.display = _styleOpen ? "" : "none";
-          styleChev.style.transform = _styleOpen ? "" : "rotate(-90deg)";
-          _updateStyleHdrState();
-          _epePersistUi();
-        };
-        _updateStyleHdrState();   // set the initial show/hide hint
+        // styleBody is always shown; hiding is done by collapsing the whole
+        // tuning block (style tuning + wireless targets) from its divider.
+        styleBody.style.display = "";
+        _updateStyleHdrState();
         // ══ editor toolbar ═══════════════════════════════════
         // Shared popover helpers (scoped to this editor instance)
         let _epeOpenPop = null;
@@ -9560,69 +10264,486 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           })();
           // ═══════════════════════════════════════════════════════════════════
 
-          // ── Instruct-edit row (natural-language targeted edits, neutral) ──
+          // ── Instruct-edit row (natural-language prompt direction) ──────────
+          // The input is a wrapping textarea that grows with the instruction, and
+          // the whole operation runs through the shared review machinery so it
+          // gets Cancel / Discard / the original-prompt strip / follow-up actions
+          // exactly like Enhance, Variations and Inverter.
           const ieRow = document.createElement("div");
           ieRow.style.cssText =
-            "display:flex;gap:6px;align-items:center;flex-shrink:0;margin:-1px -1px 0;" +
+            "display:flex;gap:6px;align-items:flex-end;flex-shrink:0;margin:-1px -1px 0;" +
             "background:rgba(109,184,232,0.07);border:1px solid rgba(109,184,232,0.14);" +
-            "border-radius:8px 8px 0 0;padding:5px 6px 5px 10px;";
+            "border-radius:8px 8px 0 0;padding:6px 6px 6px 10px;";
           const iePen = document.createElement("span");
-          iePen.textContent = "✎"; iePen.style.cssText = "color:#6db8e8;font-size:11px;";
-          const ieInput = document.createElement("input");
-          ieInput.placeholder = 'Describe an edit — "change colors to blues and greens", "change her eye color to", "change the lighting to"…';
+          iePen.textContent = "✎"; iePen.style.cssText = "color:#6db8e8;font-size:11px;padding-bottom:4px;flex-shrink:0;";
+
+          const ieInput = document.createElement("textarea");
+          ieInput.rows = 1;
+          ieInput.spellcheck = false;
+          ieInput.placeholder = 'Describe an edit — "change the lighting to golden hour", "reframe as a war photograph"…  (Enter applies, Shift+Enter new line)';
           ieInput.style.cssText =
-            "flex:1;background:none;border:none;outline:none;color:#dce6f2;font-size:11px;";
+            "flex:1;background:none;border:none;outline:none;color:#dce6f2;font-size:11px;" +
+            "font-family:inherit;resize:none;line-height:1.55;overflow-y:auto;" +
+            "min-height:20px;max-height:118px;padding:3px 0;";
+          // scrollHeight is 0 until the element has been laid out, so an early
+          // _ieGrow() used to set height:0 and the box became impossible to
+          // click into. Floor it so there is always something to hit.
+          const _ieGrow = () => {
+            ieInput.style.height = "auto";
+            const h = ieInput.scrollHeight || 20;
+            ieInput.style.height = Math.max(20, Math.min(h, 118)) + "px";
+          };
+          // Keep the canvas from swallowing the click that should focus the box.
+          // stopPropagation only — no preventDefault, so the browser still focuses.
+          ieInput.addEventListener("pointerdown", (e) => { e.stopPropagation(); });
+          ieInput.addEventListener("mousedown",   (e) => { e.stopPropagation(); });
+          // Clicking into the box is a deliberate "I want to work on instructions",
+          // so surface the panel immediately: open the Library column if it is
+          // collapsed and switch to the Instruct Edit tab. Previously this only
+          // happened on the first keystroke, which was unreachable while the box
+          // could not be focused at all.
+          ieInput.addEventListener("focus", () => {
+            ieInput._epeJumped = true;   // typing shouldn't jump again afterwards
+            try { _libSetCollapsed(false); } catch (_e) {}
+            try { _setRpTab("instruct"); _ieShowPane("live"); } catch (_e) {}
+          });
+
+          // Steps chip — shows the thread depth and jumps to the panel.
+          const ieChip = document.createElement("span");
+          ieChip.style.cssText =
+            "font-size:9px;color:#a8d6f5;background:rgba(109,184,232,0.16);cursor:pointer;" +
+            "border:1px solid rgba(109,184,232,0.35);border-radius:9px;padding:3px 8px;white-space:nowrap;" +
+            "display:none;align-items:center;justify-content:center;line-height:1;";
+          ieChip.title = "Open the Instruct Edit thread";
+          ieChip.onclick = () => { _libSetCollapsed(false); _setRpTab("instruct"); _ieShowPane("live"); };
+          _ieUpdateChip = () => {
+            const n = _ieThreadGet().length;
+            ieChip.textContent = n + (n === 1 ? " step" : " steps");
+            ieChip.style.display = n ? "flex" : "none";
+          };
+
           const ieBtn = document.createElement("button");
           ieBtn.textContent = "Apply Edit";
           ieBtn.style.cssText =
-            "background:rgba(109,184,232,0.2);border:1px solid rgba(140,200,240,0.5);" +
-            "border-radius:6px;color:#c2e2f8;font-size:11px;padding:4px 12px;cursor:pointer;";
-          let _iePrev = null;
-          const _ieReview = document.createElement("div");
-          _ieReview.style.cssText = "display:none;gap:6px;margin:0 0 6px;flex-shrink:0;";
-          const _ieApply = document.createElement("span");
-          _ieApply.textContent = "Apply";
-          _ieApply.style.cssText = "background:rgba(93,208,181,0.18);border:1px solid rgba(93,208,181,0.5);border-radius:6px;color:#8fe0cc;font-size:10px;padding:3px 14px;cursor:pointer;";
-          const _ieUndo = document.createElement("span");
-          _ieUndo.textContent = "Undo";
-          _ieUndo.style.cssText = "color:#8ba5be;font-size:10px;padding:3px 10px;cursor:pointer;";
-          _ieReview.appendChild(_ieApply); _ieReview.appendChild(_ieUndo);
-          _ieApply.onclick = () => { _iePrev = null; _ieReview.style.display = "none"; };
-          _ieUndo.onclick = () => { if (_iePrev !== null) { textEl.value = _iePrev; textEl.dispatchEvent(new Event("input")); _iePrev = null; } _ieReview.style.display = "none"; };
+            "background:rgba(109,184,232,0.2);border:1px solid rgba(140,200,240,0.5);white-space:nowrap;" +
+            "border-radius:6px;color:#c2e2f8;font-size:11px;padding:5px 12px;cursor:pointer;font-family:inherit;" +
+            "display:flex;align-items:center;justify-content:center;line-height:1;";
+
+          const ieStack = document.createElement("span");
+          ieStack.style.cssText = "display:flex;gap:6px;align-items:center;flex-shrink:0;padding-bottom:1px;";
+          ieStack.appendChild(ieChip); ieStack.appendChild(ieBtn);
+
+          // Core: run one instruction through the review machinery.
+          // Returns true when a usable result landed.
+          const _ieApplyOne = async (instr, opts) => {
+            opts = opts || {};
+            const settings = _epeOllama.getSettings ? _epeOllama.getSettings() : {};
+            if (!settings.model) { _toast("No Ollama model selected (AI Setup)."); return false; }
+
+            const sys = settings.instructPrompt || _epeOllama._defaults.instructPrompt;
+            // Prior direction gives relative instructions ("dial that back") a
+            // referent. Excluded when replaying a saved sequence step, which
+            // carries its own preceding steps.
+            const ctx = (opts.context || []).filter(Boolean);
+            const usr =
+              (ctx.length ? "EARLIER DIRECTION (oldest first):\n- " + ctx.join("\n- ") + "\n\n" : "") +
+              "PROMPT:\n" + textEl.value +
+              "\n\nINSTRUCTION: " + instr;
+
+            // Enter review: fresh entry snapshots the prompt; a chained call
+            // (mid-sequence) keeps the original from the first step.
+            if (_reviewMode) {
+              _reviewSetMode("streaming");
+            } else {
+              _reviewEnter("streaming");
+              _ieThreadSnapshot = _ieThreadGet().slice();   // fresh entry — mark the rollback point
+            }
+            _ieReviewIsInstruct = true;
+
+            _aiAbort = new AbortController();
+            let ok = false;
+            try {
+              let tokenCount = 0;
+              const raw = await _epeStreamGenerate(
+                sys, usr,
+                {
+                  signal: _aiAbort.signal,
+                  // Rewrites can be long; without a floor this inherits Ollama's
+                  // default and truncates mid-sentence on sweeping edits.
+                  options: { temperature: 0.4, num_predict: 2048 },
+                },
+                null,
+                (partial) => {
+                  tokenCount++;
+                  textEl.value = partial;
+                  updateTokenBadge(partial);
+                  textEl.scrollTop = textEl.scrollHeight;
+                  reviewLabel.textContent = (opts.label || "Applying edit") + `… ${tokenCount} tokens`;
+                }
+              );
+              const out = _epeOllama.cleanResponse(raw || "").trim();
+              if (out) {
+                textEl.value = out;
+                textEl.dispatchEvent(new Event("input"));
+                updateTokenBadge(out);
+                ok = true;
+              } else {
+                _toast("No edit returned.");
+              }
+            } catch (err) {
+              if (err && err.name === "AbortError") {
+                // Discard/Cancel already restored the original prompt.
+                return false;
+              }
+              _toast((err && err.message) || "Ollama request failed.");
+            } finally {
+              _aiAbort = null;
+            }
+            return ok;
+          };
+
+          const _ieFinish = (ok, label) => {
+            if (ok) {
+              _reviewSetMode("single");
+              reviewLabel.textContent = label || "Reviewing edited prompt";
+            } else if (_reviewMode) {
+              // Restore and leave review; nothing usable came back.
+              if (_originalPrompt !== null) {
+                textEl.value = _originalPrompt;
+                textEl.dispatchEvent(new Event("input"));
+                updateTokenBadge(textEl.value);
+              }
+              _reviewExit();
+            }
+            try { _epeOllama.unloadModel(); } catch (_e) {}
+          };
+
           const _runInstructEdit = async () => {
             const instr = ieInput.value.trim();
             if (!instr) return;
-            const settings = _epeOllama.getSettings ? _epeOllama.getSettings() : {};
-            if (!settings.model) { _toast("No Ollama model selected (AI Setup)."); return; }
             ieBtn.textContent = "…"; ieBtn.disabled = true;
-            const sys = "You edit an image-generation prompt by applying the user's instruction. Apply the requested change AND any dependent details that must change with it for the image to stay coherent, but keep everything unrelated identical. Examples of ripple effects: changing gender also updates pronouns, clothing, hairstyle, body description, and gendered words; changing age updates skin, hair, posture, and age-appropriate clothing; changing species swaps human features for that creature's anatomy; changing material updates texture, transparency, and reflections; changing time of day, season, or weather updates lighting, shadows, sky, and environment. Do not change anything the instruction does not imply. Reply with ONLY the full edited prompt, no preamble, no quotes, no explanation.";
-            const usr = "PROMPT:\n" + textEl.value + "\n\nINSTRUCTION: " + instr;
-            try {
-              if (textEl._epePushUndo) textEl._epePushUndo();
-              _iePrev = textEl.value;
-              const raw = await _epeStreamGenerate(sys, usr, { options: { temperature: 0.4 } }, ieRow,
-                (partial) => { textEl.value = partial; textEl.dispatchEvent(new Event("input")); });
-              const out = (raw || "").trim();
-              if (out) {
-                textEl.value = out; textEl.dispatchEvent(new Event("input"));
-                _ieReview.style.display = "flex";
-                ieInput.value = "";
-              } else { if (_iePrev !== null) { textEl.value = _iePrev; textEl.dispatchEvent(new Event("input")); } _toast("No edit returned."); }
-            } catch (_e) { if (_iePrev !== null) { textEl.value = _iePrev; textEl.dispatchEvent(new Event("input")); } _toast("Ollama request failed."); }
+            const ok = await _ieApplyOne(instr, { context: _ieContext(), label: "Applying edit" });
+            if (ok) _ieThreadPush(instr);   // instruction stays in the box for reuse
+            _ieFinish(ok);
             ieBtn.textContent = "Apply Edit"; ieBtn.disabled = false;
           };
+
+          // Replay a saved sequence: each step sees the result of the last, and
+          // the executed steps land in the live thread so later relative
+          // direction still resolves.
+          _ieRunSequence = async (steps, name) => {
+            if (!steps || !steps.length) return;
+            if (ieBtn.disabled) return;
+            ieBtn.textContent = "…"; ieBtn.disabled = true;
+            _setRpTab("instruct"); _ieShowPane("live");
+            const base = _ieThreadGet().slice();
+            let ok = false;
+            for (let i = 0; i < steps.length; i++) {
+              _ieRunningIdx = base.length + i;
+              _ieThreadSet(base.concat(steps.slice(0, i + 1)));
+              const lbl = 'Running “' + (name || "sequence") + '” — step ' + (i + 1) + " of " + steps.length;
+              ok = await _ieApplyOne(steps[i], { context: base.concat(steps.slice(0, i)), label: lbl });
+              if (!ok) {
+                // Roll the thread back to the steps that actually applied.
+                _ieThreadSet(base.concat(steps.slice(0, i)));
+                break;
+              }
+            }
+            _ieRunningIdx = -1;
+            _ieRefresh();
+            _ieFinish(ok, ok ? 'Reviewing “' + (name || "sequence") + '”' : undefined);
+            ieBtn.textContent = "Apply Edit"; ieBtn.disabled = false;
+          };
+
           ieBtn.onclick = _runInstructEdit;
-          ieInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); _runInstructEdit(); } });
-          ieRow.appendChild(iePen); ieRow.appendChild(ieInput); ieRow.appendChild(ieBtn);
+          ieInput.addEventListener("input", () => {
+            _ieGrow();
+            // First keystroke opens the panel on the thread — once per thread, so
+            // it can't keep yanking you back while you browse another tab.
+            if (!ieInput._epeJumped) {
+              ieInput._epeJumped = true;
+              _libSetCollapsed(false);
+              _setRpTab("instruct");
+              _ieShowPane("live");
+            }
+          });
+          ieInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); _runInstructEdit(); }
+          });
+          ieRow.appendChild(iePen); ieRow.appendChild(ieInput); ieRow.appendChild(ieStack);
           leftPane.insertBefore(ieRow, bar);
-          leftPane.insertBefore(_ieReview, bar);
+          _ieGrow();
+          _ieUpdateChip();
         })();
         // ════════════════════════════════════════════════════════════════════
 
-        leftPane.insertBefore(styleSection, aiSettingsPanel);
+        // ── Tuning block — Style tuning + Wireless targets as ONE unit ──────
+        // Previously these were two independent siblings and only Style tuning
+        // could be hidden, which left the wireless chips stranded on their own.
+        // They now share a wrapper whose height is driven by the divider above
+        // it, so one gesture clears both and the editor takes back the space.
+        const tuneWrap = document.createElement("div");
+        // overflow-y:auto, not hidden — when the block is dragged shorter than
+        // its content the wireless "+ Add target" button would otherwise be
+        // clipped with no way to reach it.
+        tuneWrap.style.cssText =
+          "display:flex;flex-direction:column;flex:0 0 auto;min-height:0;overflow:hidden;";
+        tuneWrap.appendChild(styleSection);
+        tuneWrap.appendChild(btnRow);       // btnRow === the wireless-targets footer
+
+        // The two halves are sized explicitly rather than left to flex, because
+        // flex shrinks every shrinkable child at once and what is wanted here is
+        // strict priority: the sliders give up all of their height first, and
+        // only once they are gone does the wireless section start to close.
+        styleSection.style.boxSizing = "border-box";
+        styleSection.style.overflow  = "hidden";
+        styleSection.style.flex      = "0 0 auto";
+        btnRow.style.boxSizing   = "border-box";
+        btnRow.style.overflowX   = "hidden";
+        btnRow.style.overflowY   = "auto";   // squeezed targets stay reachable
+        btnRow.style.flex        = "0 0 auto";
+
+        const TUNE_DEFAULT_H = 200;
+        // Natural heights of each half. Measuring forces layout, so these are
+        // cached and refreshed at the start of a drag / on expand rather than on
+        // every pointermove.
+        let _tuneNatS = 0, _tuneNatF = 0;
+        const _sectionNatural = (el) => {
+          const _h = el.style.height, _o = el.style.overflow;
+          el.style.height = "auto"; el.style.overflow = "visible";
+          const n = el.scrollHeight;
+          el.style.height = _h; el.style.overflow = _o;
+          return n;
+        };
+        const _tuneMeasure = () => {
+          const _d = tuneWrap.style.display, _wh = tuneWrap.style.height;
+          tuneWrap.style.display = "flex"; tuneWrap.style.height = "auto";
+          _tuneNatS = _sectionNatural(styleSection);
+          _tuneNatF = _sectionNatural(btnRow);
+          tuneWrap.style.display = _d; tuneWrap.style.height = _wh;
+          return _tuneNatS + _tuneNatF;
+        };
+        const _tuneNatural = () => (_tuneNatS + _tuneNatF) || _tuneMeasure() || TUNE_DEFAULT_H;
+        // Never let the block squeeze the editor below a usable height.
+        const _tuneMax = () => Math.max(80, (leftPane.clientHeight || 0) - 160);
+
+        // Declared before tuneGrip: its hover handlers close over these, and the
+        // house rule is that a `let` a handler reads must be declared above the
+        // handler, not merely before the handler fires.
+        let _tuneDragging = false, _tuneStartY = 0, _tuneStartH = 0;
+        const tuneGrip = document.createElement("div");
+        tuneGrip.title = "Drag to resize — click the tab to collapse";
+        tuneGrip.style.cssText =
+          "flex-shrink:0;height:5px;cursor:ns-resize;background:#1c2431;position:relative;" +
+          "margin:2px 0;transition:background .12s;";
+        tuneGrip.onmouseenter = () => { if (!_tuneDragging) tuneGrip.style.background = "#3a4a60"; };
+        tuneGrip.onmouseleave = () => { if (!_tuneDragging) tuneGrip.style.background = "#1c2431"; };
+
+        const tuneHandle = document.createElement("div");
+        tuneHandle.textContent = "⌄";
+        tuneHandle.style.cssText =
+          "position:absolute;left:50%;top:-6px;transform:translateX(-50%);" +
+          "width:46px;height:16px;border-radius:4px;background:#1b2430;border:1px solid #2b3a4e;" +
+          "display:flex;align-items:center;justify-content:center;cursor:pointer;color:#7a8a9c;" +
+          "font-size:12px;line-height:1;z-index:3;transition:color .12s,background .12s,border-color .12s;";
+        tuneHandle.onmouseenter = () => {
+          tuneHandle.style.background = "#26333f"; tuneHandle.style.color = "#c2e2f8";
+          tuneHandle.style.borderColor = "#4e5c6e";
+        };
+        tuneHandle.onmouseleave = () => {
+          tuneHandle.style.background = "#1b2430"; tuneHandle.style.color = "#7a8a9c";
+          tuneHandle.style.borderColor = "#2b3a4e";
+        };
+        tuneGrip.appendChild(tuneHandle);
+
+        // Height 0 IS the collapsed state — there is no separate mode and no
+        // snap threshold, so a drag runs smoothly all the way shut and back.
+        const _tuneApply = (h, silent) => {
+          const open = h > 0;
+          _styleOpen = open;
+          tuneWrap.style.display = open ? "flex" : "none";
+          if (open) {
+            if (!_tuneNatS && !_tuneNatF) _tuneMeasure();
+            // Cap at the content height — dragging taller than the block needs
+            // would only add dead space under the wireless chips.
+            const hh = Math.max(0, Math.min(Math.min(_tuneMax(), _tuneNatural()), h));
+            // Wireless is served first, so it keeps its full height until the
+            // sliders above it have completely closed; only then does it start
+            // to shrink. That is the whole point of the split.
+            const fH = Math.min(_tuneNatF, hh);
+            const sH = Math.max(0, hh - fH);
+            styleSection.style.height = sH + "px";
+            btnRow.style.height       = fH + "px";
+            tuneWrap.style.height     = hh + "px";
+            _tuneH = hh;
+          }
+          tuneHandle.textContent = open ? "⌄" : "⌃";
+          tuneHandle.title = open
+            ? "Collapse Style tuning and Wireless targets"
+            : "Show Style tuning and Wireless targets";
+          _updateStyleHdrState();
+          if (!_tuneDragging && !silent) _epePersistUi();   // see the Library note above
+        };
+        // Reopening by the tab always goes to a size that shows the whole block,
+        // never back to whatever sliver the last drag left behind.
+        const _tuneOpenH = () => {
+          _tuneMeasure();
+          return Math.min(_tuneMax(), Math.max(TUNE_DEFAULT_H, _tuneNatural()));
+        };
+
+        const _tuneOnMove = (e) => {
+          if (!_tuneDragging) return;
+          const h = _tuneStartH + (_tuneStartY - e.clientY);   // drag up → taller
+          _tuneApply(Math.max(0, Math.min(_tuneMax(), h)));
+          e.preventDefault();
+        };
+        const _tuneOnUp = (e) => {
+          if (!_tuneDragging) return;
+          _tuneDragging = false;
+          tuneGrip.style.background = "#1c2431";
+          window.removeEventListener("pointermove", _tuneOnMove, true);
+          window.removeEventListener("pointerup", _tuneOnUp, true);
+          try { tuneGrip.releasePointerCapture(e.pointerId); } catch (_e) {}
+          _epePersistUi();
+        };
+        tuneGrip.addEventListener("pointerdown", (e) => {
+          if (e.target === tuneHandle) return;
+          _tuneDragging = true;
+          _tuneStartY = e.clientY;
+          _tuneMeasure();   // targets may have been added/removed since last time
+          // Round to match what _tuneApply writes, so frame one is a no-op at
+          // zero cursor movement rather than a sub-pixel correction.
+          _tuneStartH = _styleOpen ? Math.round(tuneWrap.getBoundingClientRect().height) : 0;
+          tuneGrip.style.background = "#4e5c6e";
+          try { tuneGrip.setPointerCapture(e.pointerId); } catch (_e) {}
+          window.addEventListener("pointermove", _tuneOnMove, true);
+          window.addEventListener("pointerup", _tuneOnUp, true);
+          // Keep the ComfyUI canvas from starting a node-drag on the grip.
+          e.preventDefault(); e.stopPropagation();
+        });
+        tuneGrip.addEventListener("mousedown", (e) => e.stopPropagation());
+        tuneGrip.addEventListener("dblclick", (e) => {
+          _tuneApply(_tuneOpenH());
+          e.preventDefault(); e.stopPropagation();
+        });
+        tuneHandle.addEventListener("pointerdown", (e) => { e.preventDefault(); e.stopPropagation(); });
+        tuneHandle.addEventListener("mousedown",   (e) => { e.stopPropagation(); });
+        tuneHandle.addEventListener("dblclick",    (e) => { e.preventDefault(); e.stopPropagation(); });
+        tuneHandle.addEventListener("click", (e) => {
+          e.preventDefault(); e.stopPropagation();
+          _tuneApply(_styleOpen ? 0 : _tuneOpenH());
+        });
+
+        leftPane.insertBefore(tuneGrip, aiSettingsPanel);
+        leftPane.insertBefore(tuneWrap, aiSettingsPanel);
+
+        // Normalise the block to an explicit height once the first layout has
+        // happened. Left alone it sits at its content height, which nothing has
+        // checked against _tuneMax — so the first drag frame re-clamped it and
+        // the bar visibly jumped before it started tracking the cursor. Running
+        // the same sizing path up front means the resting height is already the
+        // height a drag would produce, and the first frame moves by exactly the
+        // distance the cursor moved. Silent: this is not a user edit, so it must
+        // not write node.properties or dirty a freshly loaded graph.
+        requestAnimationFrame(() => {
+          try { if (_styleOpen) _tuneApply(_tuneOpenH(), true); } catch (_e) {}
+        });
 
         // Action rail joins the body row, left of the workspace.
         bodyWrap.insertBefore(actionRail, leftPane);
+
+        // ── Draggable divider — resize / collapse the Transform rail ────────
+        // Same contract as the Library divider and the tuning divider: drag runs
+        // smoothly to 0 with no snap, width 0 IS collapsed, and the tab reopens
+        // at a width that shows the whole rail rather than the last drag size.
+        const RAIL_DEFAULT_W = 118, RAIL_MAX_W = 260;
+        const _railNatural = () => {
+          const _w = actionRail.style.width, _d = actionRail.style.display;
+          actionRail.style.display = "flex";
+          actionRail.style.width = "auto";
+          const n = actionRail.scrollWidth;
+          actionRail.style.width = _w; actionRail.style.display = _d;
+          return n || RAIL_DEFAULT_W;
+        };
+        let _railDragging = false, _railStartX = 0, _railStartW = RAIL_DEFAULT_W;
+        const railGrip = document.createElement("div");
+        railGrip.title = "Drag to resize — click the tab to collapse";
+        railGrip.style.cssText =
+          "flex-shrink:0;width:5px;cursor:ew-resize;background:#1c2431;position:relative;" +
+          "align-self:stretch;transition:background .12s;";
+        railGrip.onmouseenter = () => { if (!_railDragging) railGrip.style.background = "#3a4a60"; };
+        railGrip.onmouseleave = () => { if (!_railDragging) railGrip.style.background = "#1c2431"; };
+
+        const railHandle = document.createElement("div");
+        railHandle.textContent = "‹";
+        railHandle.style.cssText =
+          "position:absolute;top:50%;left:-7px;transform:translateY(-50%);" +
+          "width:16px;height:46px;border-radius:4px;background:#1b2430;border:1px solid #2b3a4e;" +
+          "display:flex;align-items:center;justify-content:center;cursor:pointer;color:#7a8a9c;" +
+          "font-size:12px;line-height:1;z-index:3;transition:color .12s,background .12s,border-color .12s;";
+        railHandle.onmouseenter = () => {
+          railHandle.style.background = "#26333f"; railHandle.style.color = "#c2e2f8";
+          railHandle.style.borderColor = "#4e5c6e";
+        };
+        railHandle.onmouseleave = () => {
+          railHandle.style.background = "#1b2430"; railHandle.style.color = "#7a8a9c";
+          railHandle.style.borderColor = "#2b3a4e";
+        };
+        railGrip.appendChild(railHandle);
+
+        const _railApply = (w) => {
+          const open = w > 0;
+          _railCollapsed = !open;
+          actionRail.style.display = open ? "flex" : "none";
+          if (open) { actionRail.style.width = w + "px"; _railW = w; }
+          railHandle.textContent = open ? "‹" : "›";
+          railHandle.title = open ? "Collapse the Transform column" : "Show the Transform column";
+          _publishRailW(open ? w : 0);
+          if (!_railDragging) { _epePersistUi(); if (open) _epeGrowToMin(); }
+        };
+        const _railOpenW = () =>
+          Math.min(RAIL_MAX_W, Math.max(RAIL_DEFAULT_W, _railNatural()));
+
+        const _railOnMove = (e) => {
+          if (!_railDragging) return;
+          const w = _railStartW + (e.clientX - _railStartX);   // drag right → wider
+          _railApply(Math.max(0, Math.min(RAIL_MAX_W, w)));
+          e.preventDefault();
+        };
+        const _railOnUp = (e) => {
+          if (!_railDragging) return;
+          _railDragging = false;
+          railGrip.style.background = "#1c2431";
+          window.removeEventListener("pointermove", _railOnMove, true);
+          window.removeEventListener("pointerup", _railOnUp, true);
+          try { railGrip.releasePointerCapture(e.pointerId); } catch (_e) {}
+          _epePersistUi();
+        };
+        railGrip.addEventListener("pointerdown", (e) => {
+          if (e.target === railHandle) return;
+          _railDragging = true;
+          _railStartX = e.clientX;
+          _railStartW = _railCollapsed ? 0 : actionRail.getBoundingClientRect().width;
+          railGrip.style.background = "#4e5c6e";
+          try { railGrip.setPointerCapture(e.pointerId); } catch (_e) {}
+          window.addEventListener("pointermove", _railOnMove, true);
+          window.addEventListener("pointerup", _railOnUp, true);
+          e.preventDefault(); e.stopPropagation();
+        });
+        railGrip.addEventListener("mousedown", (e) => e.stopPropagation());
+        railGrip.addEventListener("dblclick", (e) => {
+          _railApply(_railOpenW());
+          e.preventDefault(); e.stopPropagation();
+        });
+        railHandle.addEventListener("pointerdown", (e) => { e.preventDefault(); e.stopPropagation(); });
+        railHandle.addEventListener("mousedown",   (e) => { e.stopPropagation(); });
+        railHandle.addEventListener("dblclick",    (e) => { e.preventDefault(); e.stopPropagation(); });
+        railHandle.addEventListener("click", (e) => {
+          e.preventDefault(); e.stopPropagation();
+          _railApply(_railCollapsed ? _railOpenW() : 0);
+        });
+        bodyWrap.insertBefore(railGrip, leftPane);
+        _publishRailW(RAIL_DEFAULT_W);   // rail starts expanded; seed the signal
 
         // AI Setup becomes a gear in the title bar.
         aiSettingsBtn.textContent = "⚙ AI Setup";
@@ -9980,6 +11101,21 @@ app.registerExtension({
 
       const _node = this;
       const _epeFullW = 980;
+      // Floor = the editor's own minimum plus whichever side columns are open.
+      // Collapse both and the node can get down to _EPE_EDITOR_MIN_W.
+      //
+      // A floor that moves used to snap the node: reopening a column raised the
+      // minimum above the node's current width, and the next unrelated drag
+      // yanked the node out to meet it. The fix is not to freeze the floor but
+      // to never let it rise silently — every expand calls _epeGrowToMin below,
+      // so the node widens at the moment you expand, as a visible consequence
+      // of that click, and no later drag has a raised floor to snap against.
+      const _EPE_EDITOR_MIN_W = 320;
+      const _epeMinW = () => {
+        const lw = (epeEl && typeof epeEl._epeLibW  === "number") ? epeEl._epeLibW  : 0;
+        const rw = (epeEl && typeof epeEl._epeRailW === "number") ? epeEl._epeRailW : 0;
+        return _EPE_EDITOR_MIN_W + lw + rw;
+      };
       const _epeFullH = 640;
       const _titleH = LiteGraph.NODE_TITLE_HEIGHT ?? 30;
 
@@ -9989,7 +11125,7 @@ app.registerExtension({
       const _epeMinH = 200; // fixed floor — never tracks current size
       const _epeWidget = this.addDOMWidget("epe_editor", "EPE", epeEl, {
         getMinHeight: () => _epeMinH,
-        getMinWidth:  () => _epeFullW,
+        getMinWidth:  () => _epeMinW(),
       });
       if (_epeWidget) _epeWidget._epeH = _epeFullH;
 
@@ -10002,6 +11138,20 @@ app.registerExtension({
         _node.size[0] = w;
         _node.size[1] = h + _titleH + 8;
         app.graph.setDirtyCanvas(true, true);
+      };
+
+      // Called by the editor immediately after a column expands. Widening here
+      // — right when the user clicks — is what keeps the moving floor honest:
+      // the node is never left narrower than its own minimum, so there is no
+      // stored-up correction for a later drag to apply as a snap.
+      epeEl._epeGrowToMin = () => {
+        try {
+          const min = _epeMinW();
+          if (_node.size[0] < min) {
+            _node.size[0] = min;
+            app.graph.setDirtyCanvas(true, true);
+          }
+        } catch (_e) {}
       };
 
       // Initial size
@@ -10039,7 +11189,7 @@ app.registerExtension({
         let _rgDrag = false, _rgX = 0, _rgY = 0, _rgW = 0, _rgH = 0;
         const _rgMove = (e) => {
           if (!_rgDrag) return;
-          const w = Math.max(_epeFullW, _rgW + (e.clientX - _rgX));
+          const w = Math.max(_epeMinW(), _rgW + (e.clientX - _rgX));
           const h = Math.max(200, _rgH + (e.clientY - _rgY));
           _applySize(w, h);
         };
