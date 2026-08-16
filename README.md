@@ -139,14 +139,6 @@ Three dividers, three panels. Drag one to resize, or click its pull-tab to fold 
 <img src="assets/layout.gif" alt="Collapsible layout: fold the rail, the tuning block or the Library away and the editor takes the space" width="840">
 </div>
 
-## Wireless targets
-
-Select target nodes once — every queue injects the current prompt into all of them automatically. The badge by the title shows how many targets are active. Prefer wiring things yourself? Skip targets and use EPE purely as an editor.
-
-<div align="center">
-<img src="assets/wireless.gif" alt="Wireless targets: prompt injected into CLIP Text Encode at queue time" width="840">
-</div>
-
 ### Adding a target
 
 Click **+ Add target** and a picker opens listing every text widget in your graph — subgraphs included, searchable by node name, widget, or ID. Pick your CLIP Text Encode and its chip joins the bar; the number on the chip is the node's ID, and widgets that are already targets are marked so you can't double-add them.
