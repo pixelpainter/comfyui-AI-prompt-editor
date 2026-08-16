@@ -187,6 +187,12 @@ Bugs and feature requests → [open an issue](https://github.com/pixelpainter/co
 ## Changelog
 
 ### 1.0.17
+- **Instruct edit** — describe a change in plain language and the model rewrites the prompt around it, streaming into the editor with Use this / Discard. Changes ripple coherently: ask for a different season and the light, sky and ground follow.
+- Instructions build a running thread for that prompt, so a relative follow-up like "dial that back" knows what you meant.
+- Save a thread as a reusable sequence and run the whole set against any other prompt.
+- The instruct box could not be clicked until something else resized the node — fixed.
+- The node's minimum width now follows the Library column, so collapsing the Library lets the node get properly narrow.
+- Favorites and Snippets cards now collapse to a single title row with their token count, instead of leaving a shrunken editor and both button rows on show.
 - The Transform rail, style tuning block and Library can each be folded away — drag the divider or click its tab, and the editor takes back the space. Panels keep their place when you switch away.
 - Style sliders remapped so each one moves a single quality instead of several at once.
 - Rewritten prompt construction — layered fidelity with an invention quota, so enhanced prompts stay closer to what you actually asked for.
