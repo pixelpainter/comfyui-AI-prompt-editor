@@ -32,7 +32,7 @@ EPE replaces the humble prompt textbox with a complete writing environment. Writ
 
 **AI transforms** — **Enhance** expands a short idea into a rich prompt. **Variations** writes three distinct aesthetic takes on the same subject. **Inverter** rewrites the prompt into a contrasting aesthetic.
 
-**Instruct edit** — Type a natural-language change and the LLM applies it with coherent ripple effects: changing gender also updates pronouns, clothing, and hair; changing season updates lighting, sky, and environment. Streams live into the editor with apply/undo.
+**Instruct edit** — Type a change in plain language and the LLM rewrites the prompt around it, with coherent ripple effects: changing gender also updates pronouns, clothing and hair; changing season updates lighting, sky and environment. The result streams into a review window with the original kept alongside it — accept the edits with **Use this**, or **Discard** and nothing is lost. Chain Edits together, each one building on the result before it, and the instruction stays in the box so you can tweak a word and run it again. Every instruction applied joins a running **thread** for that prompt, which gives relative follow-ups like *"dial that back"* something to refer to. Save a chain of edits as a reusable **sequence** and run the whole set against any other prompt in one click.
 
 **From media** — **Image to Prompt** captions any image into a usable prompt (vision model required). **Video to Prompt** samples frames from a clip and writes an image prompt. **Extract from Image** pulls an embedded prompt (from embedded workflow) from PNG metadata.
 
