@@ -8413,11 +8413,14 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           } catch (_e) {}
         };
 
-        const _setRpTab = (id) => {
-          // switching library tabs while a review is active
-          // implicitly abandons the result. Auto-discard with a toast that
-          // surfaces the Recall option if the slot is non-empty.
-          if (_reviewMode) {
+        const _setRpTab = (id, opts) => {
+          // Switching library tabs while a review is active implicitly abandons
+          // the result. But "reveal the thread" is not a tab switch: focusing the
+          // ✎ box, the steps chip and the first-keystroke jump all call this to
+          // bring the Instruct pane into view, and discarding there threw away
+          // the edit the user was still working on and rolled the thread back to
+          // one step. Only discard on a genuine move to a different tab.
+          if (_reviewMode && !(opts && opts.keepReview) && id !== _rpActive) {
             _autoDiscardReview("Tab switch — result discarded");
           }
           _rpActive=id;
@@ -10199,6 +10202,12 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               }
             };
             const _switchTo = (i) => {
+              // A review belongs to the tab it started on — _originalPrompt and
+              // the thread snapshot are single, not per-tab — so carrying one
+              // across a switch would leave the review bar pointing at another
+              // tab's text. End it here, before the save below, so the tab keeps
+              // its committed prompt rather than an unaccepted result.
+              if (_reviewMode) _autoDiscardReview("Tab switch — result discarded");
               _tabs[_active] = textEl.value;      // save current
               _active = i;
               textEl.value = _tabs[i] || "";
@@ -10305,7 +10314,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           ieInput.addEventListener("focus", () => {
             ieInput._epeJumped = true;   // typing shouldn't jump again afterwards
             try { _libSetCollapsed(false); } catch (_e) {}
-            try { _setRpTab("instruct"); _ieShowPane("live"); } catch (_e) {}
+            try { _setRpTab("instruct", {keepReview:true}); _ieShowPane("live"); } catch (_e) {}
           });
 
           // Steps chip — shows the thread depth and jumps to the panel.
@@ -10315,7 +10324,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             "border:1px solid rgba(109,184,232,0.35);border-radius:9px;padding:3px 8px;white-space:nowrap;" +
             "display:none;align-items:center;justify-content:center;line-height:1;";
           ieChip.title = "Open the Instruct Edit thread";
-          ieChip.onclick = () => { _libSetCollapsed(false); _setRpTab("instruct"); _ieShowPane("live"); };
+          ieChip.onclick = () => { _libSetCollapsed(false); _setRpTab("instruct", {keepReview:true}); _ieShowPane("live"); };
           _ieUpdateChip = () => {
             const n = _ieThreadGet().length;
             ieChip.textContent = n + (n === 1 ? " step" : " steps");
@@ -10463,7 +10472,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             if (!ieInput._epeJumped) {
               ieInput._epeJumped = true;
               _libSetCollapsed(false);
-              _setRpTab("instruct");
+              _setRpTab("instruct", {keepReview:true});
               _ieShowPane("live");
             }
           });

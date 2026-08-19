@@ -186,6 +186,10 @@ Bugs and feature requests → [open an issue](https://github.com/pixelpainter/co
 
 ## Changelog
 
+### 1.0.18
+- Chained Instruct edits now stay put while you work. Clicking back into the instruction box keeps the current result on screen and the direction thread intact, so you can stack several edits and accept them together at the end.
+- Switching prompt tabs now ends an open review cleanly, so each tab keeps its committed prompt.
+
 ### 1.0.17
 - **Instruct edit** — describe a change in plain language and the model rewrites the prompt around it, streaming into the editor with Use this / Discard. Changes ripple coherently: ask for a different season and the light, sky and ground follow.
 - Instructions build a running thread for that prompt, so a relative follow-up like "dial that back" knows what you meant.
