@@ -1,1 +1,16 @@
-av>=10.0.0
+# EPE has no mandatory Python dependencies.
+#
+# ComfyUI Manager installs this file on install, so anything listed here is
+# forced on every user. PyAV is a large binary media library needed only by the
+# two video-to-prompt routes, and those already detect its absence and answer
+# with a plain "PyAV is not installed" — so requiring it up front made a
+# feature most people never touch into an install-time failure on any platform
+# without a prebuilt wheel.
+#
+# pyproject.toml declares it as an optional extra, and this file now agrees:
+#
+#     pip install "comfyui-ai-prompt-editor[video]"
+#
+# or simply:
+#
+#     pip install "av>=10.0.0,<16"

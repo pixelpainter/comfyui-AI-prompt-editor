@@ -74,9 +74,9 @@ Restart ComfyUI after installation.
 |---|---|
 | **ComfyUI** | Any recent build |
 | **[Ollama](https://ollama.com/download)** | Must be installed and running — **this powers all AI features** |
-| Text model | Any capable instruct model (e.g. `ministral`, `nemotron`, `gpt-oss`) |
+| Text model | Any capable instruct model (e.g. `mistral`, `nemotron`, `gpt-oss`) |
 | Vision model | Needed only for Image/Video to Prompt (e.g. `qwen3.5`, `gemma4`) |
-| Python `av` | Installed automatically via `requirements.txt` (video frame extraction) |
+| Python `av` | **Optional** — only for Video to Prompt. Install with `pip install "av>=10.0.0,<16"` |
 
 > Model quality matters: larger models follow the style system noticeably better.
 
@@ -87,7 +87,7 @@ Restart ComfyUI after installation.
 
 ```bash
 # a text model for Enhance, Variations, Instruct edit, Synonyms…
-ollama pull ministral
+ollama pull mistral
 
 # a vision model for Image to Prompt / Video to Prompt
 ollama pull qwen3-vl
@@ -102,6 +102,8 @@ ollama pull qwen3-vl
 3. Under **Wireless targets**, click **+ Add target** and select your CLIP Text Encode node(s)
 4. Write a rough idea and press **Enhance**
 5. Queue — the prompt is injected into your targets automatically on every run
+
+> In-app help lives in the node's **?** button, and the same reference is available offline in [`HELP.md`](HELP.md).
 
 <div align="center">
 <img src="assets/enhance.gif" alt="Enhance: open a new tab, write a rough idea, and it becomes a diffusion-ready prompt" width="840">
@@ -137,6 +139,16 @@ Three dividers, three panels. Drag one to resize, or click its pull-tab to fold 
 
 <div align="center">
 <img src="assets/layout.gif" alt="Collapsible layout: fold the rail, the tuning block or the Library away and the editor takes the space" width="840">
+</div>
+
+## Wireless targets
+
+Bind as many text widgets as you like and the prompt is injected into every one
+of them on each queue — no wires, no reroutes, nothing on the canvas to redraw
+when you change your mind. Targets are saved with your workflow.
+
+<div align="center">
+<img src="assets/wireless.gif" alt="Queue the graph and the prompt lands in two CLIP Text Encode nodes that have no wires" width="840">
 </div>
 
 ### Adding a target
@@ -185,6 +197,30 @@ Bugs and feature requests → [open an issue](https://github.com/pixelpainter/co
 ⭐ If EPE has earned a place in your workflow, a star helps others find it — and I always love a good cup of [coffee](https://buymeacoffee.com/pixelpainter). ☕
 
 ## Changelog
+
+### 1.0.20
+
+- **Ten prompt tabs**, up from four. Each keeps its own prompt, instruct edit direction thread and undo history. Workflows saved by an older build open with all their tabs visible.
+- **Send to tab.** Every result screen — Enhance, Variations, Instruct edit, img2img, vid2prompt — has a **Send to tab** button beside **Use this**. Pick any open tab or a new one and the result lands there as that tab's prompt, while you stay where you are with the review still open. Keep a promising Enhance in tab 3, run a different style on the same prompt, compare the two before committing to either. It warns before overwriting a tab that already has a prompt, and Ctrl+Z in that tab puts the old one back.
+- **What's in the prompt box is what renders**, in every state. The one exception is Variations, where there's no single prompt in the box — three cards instead — so queueing sends your committed prompt until you pick one.
+- Instruct edit directions stay with their prompt across reloads, tab switches and workflow switches.
+- Undo works per tab and across workflows, and a reopened tab comes back with its direction thread and edit history.
+- Memory holds steady across a session, including nodes inside subgraphs.
+- Startup cleanup removes only files EPE wrote, and clears its own scratch folder afterwards.
+- Ollama checks no longer stall ComfyUI when several nodes ask at once.
+- Library and saved sequences keep your newest entries if you hit the storage limit.
+- Workflow browsing pages through the full result set, and a workflow inside a `.zip` opens as the right one.
+- Workflow files can't reach past EPE's own settings.
+
+### 1.0.19
+- **Embedded workflows load.** Opening a Civitai or Genur result that carries a ComfyUI workflow pulls the graph through. Verified against 759 saved images.
+- **Workflow search works again.** Civitai changed how search results are paged, which left the Workflows tab empty. Search and infinite scroll are back.
+- **Only workflows you can actually load are listed.** Civitai lets creators require a login to download, and those used to fill the results and then fail on open. They are now filtered out, so what you see is what loads.
+- Workflow results stay on screen after you load one. The list used to empty itself when the node redrew.
+- **Undo steps back through Instruct edits.** ↶ (Ctrl+Z) moves back one edit at a time through a chain.
+- Closing a prompt tab during a review now ends the review cleanly, and keeps unsaved text in the tab you were working in.
+- Hardened the server routes that fetch remote images, videos and workflow files, and tightened how the Ollama address is handled. Recommended update for anyone whose ComfyUI is reachable beyond localhost.
+- In-app help (**? Help**) rewritten for Instruct edit — chaining, the steps chip and saved sequences — and now covers the collapsible layout.
 
 ### 1.0.18
 - Chained Instruct edits now stay put while you work. Clicking back into the instruction box keeps the current result on screen and the direction thread intact, so you can stack several edits and accept them together at the end.

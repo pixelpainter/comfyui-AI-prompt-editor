@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+
+# Dev artefacts. None of these are in the tree today; they are the ones this
+# workflow produces next to it — snapshots, review diffs, patch scripts — and
+# a single `git add -A` would publish them.
+backup/
+*.diff
+*.patch
+*.bak
+*.orig
+*.log
+.DS_Store
+.vscode/
+.idea/

@@ -1,4 +1,4 @@
-﻿name: Publish to ComfyUI Registry
+name: Publish to ComfyUI Registry
 
 on:
   workflow_dispatch:
@@ -9,17 +9,126 @@ on:
       - "pyproject.toml"
 
 permissions:
-  issues: write
+  contents: read
 
 jobs:
   publish-node:
     name: Publish Custom Node to registry
     runs-on: ubuntu-latest
+    # Stops a FORK from publishing to the upstream registry with its own
+    # token. One comparison is enough: GitHub Actions' `==` on strings is
+    # documented case-insensitive, so the three enumerated casings a previous
+    # round added were guarding a distinction the runner does not make.
+    #
+    # What this does NOT cover is an account RENAME — `pixelpainter` becoming
+    # anything else silently skips the job behind a green check with nothing
+    # published. There is no expression that can cover that; it is written
+    # down here so the next person reading a green-but-empty run knows where
+    # to look.
     if: ${{ github.repository_owner == 'pixelpainter' }}
     steps:
+      # Pinned to a SHA like the publish action below. A mutable tag means a
+      # compromised or simply changed v4 runs with access to the registry
+      # token, which is the one secret this workflow holds.
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        # SHA verified with: git ls-remote --tags https://github.com/actions/checkout.git
+        # Staying on the v4 major deliberately — this is a pin, not an upgrade.
+        # To move it, re-run that command and take the SHA for the tag you want.
+        with:
+          # Full history. The version check below diffs against the commit the
+          # push STARTED from, which can be any number of commits back — a
+          # shallow clone simply would not contain it.
+          fetch-depth: 0
+
+      # The path filter fires on ANY push touching pyproject.toml — a typo in
+      # the description, a dependency tweak, a comment. Every one of those
+      # attempted a publish of a version already in the registry, which fails
+      # noisily and, on workflow_dispatch, could republish silently. Only
+      # continue when the version field actually changed.
+      - name: Check whether the version changed
+        id: ver
+        env:
+          # Through the environment, not interpolated into the script body:
+          # a branch or ref name is attacker-influenced text and pasting it
+          # straight into shell would be an injection point.
+          PUSH_BASE: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # Reads [project].version with a REAL TOML parser.
+          #
+          # Three shell readers preceded this one and each was wrong in its
+          # own way. `grep -m1 | sed -E 's/.*"([^"]+)".*/\1/'` is greedy, so
+          # `version = "1.0.20"  # was "1.0.19"` read as 1.0.19: the step
+          # concluded "version unchanged", the job went green, and the release
+          # was never published while __init__.py told every user they were on
+          # 1.0.20. An awk reader scoped to [project] fixed that, then needed a
+          # multi-line-basic-string tracker, then the tracker fired on a stray
+          # triple quote inside a COMMENT and failed the step, and it still
+          # could not see multi-line LITERAL strings or a single-quoted
+          # version (which is perfectly legal TOML). Each patch bought one
+          # shape and cost another.
+          #
+          # tomllib is in the standard library from 3.11 and ubuntu-latest
+          # ships 3.12, so the runner can simply parse the file. The BOM is
+          # stripped first — main's copy of this workflow carried one, so the
+          # repo demonstrably attracts them — and a non-string version, a
+          # missing [project], a `dynamic` version or an unparseable file all
+          # yield nothing, which the guard below turns into a loud failure
+          # rather than a guess.
+          read_version() { python3 -c 'import sys,tomllib; b=sys.stdin.buffer.read().lstrip(b"\xef\xbb\xbf"); v=tomllib.loads(b.decode("utf-8")).get("project",{}).get("version",""); print(v if isinstance(v,str) else "")' 2>/dev/null || true; }
+
+          # `|| true`: with `set -e`, a reader that matches nothing would abort
+          # the step before the friendly message below could be printed.
+          current=$(read_version < pyproject.toml || true)
+          if [ -z "$current" ]; then
+            echo "could not read version from pyproject.toml" >&2
+            exit 1
+          fi
+          echo "current=$current"
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "manual run — publishing $current"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Diff against where the push began, NOT HEAD~1. A push of several
+          # commits that bumps the version in the first and then edits the
+          # description in the last looks unchanged from HEAD~1, so the
+          # release was silently skipped and the tag sat unpublished.
+          base="$PUSH_BASE"
+          # All-zeros means the branch did not exist before this push.
+          case "$base" in
+            ""|0000000000000000000000000000000000000000) base="" ;;
+          esac
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "no usable push base — treating as a new branch, publishing $current"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          previous=$(git show "$base:pyproject.toml" 2>/dev/null | read_version || true)
+          echo "previous=${previous:-<none>}"
+          if [ "$current" != "${previous:-}" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version unchanged — nothing to publish"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish Custom Node
-        uses: Comfy-Org/publish-node-action@main
+        if: steps.ver.outputs.changed == 'true'
+        # Pinned to a commit, which fixes WHAT THIS STEP RUNS — but not what
+        # that action runs in turn. At this commit it invokes
+        # actions/checkout@v4, actions/setup-python@v5 and an unpinned
+        # `pip install comfy-cli`, all inside the job that holds
+        # REGISTRY_ACCESS_TOKEN. The pin narrows the supply chain to this
+        # action's own maintainers plus those three; it does not close it.
+        # Re-check with:
+        #   gh api repos/Comfy-Org/publish-node-action/contents/action.yml \
+        #     --jq '.content' | base64 -d
+        uses: Comfy-Org/publish-node-action@d2366e7abb6ab16f3bb03e3520ae25c8cf749bc9  # main as of 2025-05-10
         with:
           personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}

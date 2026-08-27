@@ -34,7 +34,7 @@ Wireless targets send your prompt into text widgets elsewhere in the workflow �
 **Variations** — generates 3 alternative takes on your prompt to pick from.  
 **Inverter** — rewrites your prompt into a contrasting aesthetic.
 
-> Tip: results appear in the editor for review — keep them by clicking **Use**, or press **Undo** (Ctrl+Z) to restore your previous text.
+> Tip: results appear in the editor for review — keep one with **Use this**, add it to what you had with **Append**, or reject it with **Discard**, which puts your prompt back exactly as it was.
 
 ## From media
 
@@ -55,8 +55,13 @@ Pick a **Style** (Midjourney, DALL·E, Anime, Cinematic…) to have the AI creat
 
 ## Instruct edit
 
-- Use the **✎** row above the toolbar to change your prompt in plain language — e.g. "change the lighting to golden hour" or "make her hair red".
-- The edit ripples coherently: changing a subject's age, species, or the season also updates related details. Streams into the editor with **Apply** / **Undo**.
+- Use the **✎** row above the toolbar to change your prompt in plain language — e.g. "change the lighting to golden hour" or "make her hair red". Press **Apply Edit** and the rewrite streams into the editor.
+- The edit ripples coherently: changing a subject's age, species, or the season also updates related details.
+- Chain edits together — each one builds on the last, and nothing is committed until you accept it with **Use this**. **Discard** puts the prompt back the way it was.
+- Later instructions can refer to earlier ones ("dial that back", "warmer than that") because the whole direction thread goes to the model. The **steps** chip beside the ✎ row opens the thread.
+- **☆ Save sequence** keeps a chain of edits as a reusable recipe — replay it on any other prompt and it runs step by step.
+
+> Tip: **↶** (Ctrl+Z) steps back one instruct edit at a time, so you can walk a chain backwards without discarding all of it.
 
 ## Editor tools
 
@@ -64,6 +69,8 @@ Pick a **Style** (Midjourney, DALL·E, Anime, Cinematic…) to have the AI creat
 **File ▾** — save to Favorites/Snippets, clear, import/export text.  
 **Undo/Redo** — Ctrl+Z / Ctrl+Y; also recalls the prompt from before an AI result.  
 **Find**, **Aa** (case/sort), **Clean** (strip markdown/weights), **Synonyms**, **Flag words** (weak words → replacements), **Wrap**.
+
+**Collapsible layout** — the node is three columns and you choose how many are open. Click the tab on **Style tuning** or on the **Library** rail to fold that column away, or drag its grip to resize. The node's minimum width tracks whatever is open, so collapsing both leaves a plain editor that takes almost no room on the canvas.
 
 ## Library
 

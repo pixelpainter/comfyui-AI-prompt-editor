@@ -1,0 +1,30 @@
+# Files kept in the GitHub repo but left OUT of the published registry
+# package. gitignore syntax; the registry starts from the git-tracked file
+# list and removes anything matched here.
+#
+# The demo animations are ~15.5 MB of an 18.6 MB package. They exist for the
+# README, which GitHub renders from the repo — nothing in the running node
+# loads them, so shipping them to every installer is pure download weight.
+# assets/icon.png is NOT excluded: pyproject's Icon field points at it.
+assets/*.gif
+
+# Screenshots, same reasoning — README-only.
+assets/anatomy.png
+assets/style-tuning.png
+# …and the hero shot, which lives at the repo root rather than in assets/ and
+# so was missed by the rule above. 410 KB per install for a picture only the
+# GitHub page renders.
+EPE_Node.png
+
+# Dev-only files that have no business in an installed node.
+*.log
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+*.diff
+*.patch
+*.bak
+backup/
+build_help.py
+test_*.py

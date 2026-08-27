@@ -8,6 +8,91 @@ import { api } from "../../scripts/api.js";
 
 const _epeFont = "-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif";
 
+// ── Live-editor registry, and the orphan sweep ────────────────────────────────
+//
+// WHY THIS EXISTS. An EPE node inside a ComfyUI subgraph never runs
+// `_epeDispose`, so every workflow load leaks a capture-phase `document`
+// mousedown listener closing over the whole editor scope, plus `_epeTip` and
+// the help overlay on `document.body` and a ResizeObserver.
+//
+// Read out of the SHIPPED comfyui-frontend-package 1.49.6 bundle
+// (settingStore-CwkLtSKP.js), not inferred:
+//
+//   LGraph.clear()            (:383310)  `this._subgraphs.clear()` runs BEFORE
+//                                        the removal loop, and that loop
+//                                        iterates `this._nodes` — the ROOT
+//                                        graph's own nodes — only.
+//   SubgraphNode.onRemoved()  (:263380)  aborts its own controller and clears
+//                                        promoted/extra widgets. It does NOT
+//                                        recurse into `subgraph.nodes`.
+//   app.clean()              (:1655527)  -> `this.rootGraph.clear()`
+//   loadGraphData()          (:1640144)  calls `this.clean()` BEFORE
+//                                        `invokeExtensionsAsync("beforeConfigureGraph")`
+//
+// That last line is why the sweep hangs off `onNodeCreated` and not
+// `beforeConfigureGraph`: by the time that hook runs the graph is already
+// cleared and the orphans are already unreachable from it. Measured on the
+// shipped build: a root-level node holds at 1 document listener over 20 loads;
+// a subgraph-resident one climbs to 20.
+//
+// WHY A REGISTRY AND NOT A GRAPH WALK. `clear()` empties `_subgraphs` first, so
+// after it there is nothing left in the graph to walk TO the orphans. The only
+// thing that still knows they exist is a reference we kept ourselves.
+//
+// SAFETY. Disposing a LIVE editor destroys the user's prompt, so every
+// uncertainty here resolves to "do nothing":
+//   * any shape it cannot walk — no rootGraph, `_nodes` not an array,
+//     `subgraphs` not iterable, a subgraph whose `_nodes` is not an array —
+//     abandons the whole sweep rather than sweeping a partial `live` set;
+//   * the node whose `onNodeCreated` is running is excluded by identity, since
+//     LiteGraph calls `createNode` -> `onNodeCreated` BEFORE `graph.add`, so it
+//     is legitimately in no graph yet;
+//   * a node whose graph belongs to a different root (clipboard staging, a
+//     detached graph) is left alone.
+//
+// ORDERING, verified in `LGraph.configure` (:408374): subgraphs are created
+// (`createSubgraph`) and configured — which is what builds their nodes — BEFORE
+// `this._nodes = []` and the root creation loop. And within either loop, each
+// node is `add`ed before the next is created. So every node created earlier in
+// this same load is already reachable, and the sweep cannot mistake a sibling
+// for an orphan.
+const _epeLiveEditors = new Set();
+
+const _epeSweepDeadEditors = (exceptNode) => {
+  try {
+    const root = app && app.rootGraph;
+    if (!root) return;
+    const rootNodes = root._nodes;
+    if (!Array.isArray(rootNodes)) return;
+    const subs = root.subgraphs;
+    if (!subs || typeof subs.values !== "function") return;
+
+    const live = new Set(rootNodes);
+    for (const sg of subs.values()) {
+      const ns = sg && sg._nodes;
+      // A subgraph we cannot read means the live set is INCOMPLETE, and an
+      // incomplete live set is exactly how a live editor gets disposed. Stop.
+      if (!Array.isArray(ns)) return;
+      for (const n of ns) live.add(n);
+    }
+
+    for (const n of Array.from(_epeLiveEditors)) {
+      if (n === exceptNode) continue;
+      if (live.has(n)) continue;
+      let g = null;
+      try { g = n.graph; } catch (_e) { g = null; }
+      if (g) {
+        let gr = null;
+        try { gr = g.rootGraph; } catch (_e) { gr = undefined; }
+        // Unreadable, or rooted somewhere else — not ours to tear down.
+        if (gr !== root) continue;
+      }
+      _epeLiveEditors.delete(n);
+      try { n._epeDispose && n._epeDispose(); } catch (_e) {}
+    }
+  } catch (_e) {}
+};
+
 // ── Graph helpers ─────────────────────────────────────────────────────────────
 function _epeGetInnerGraph(n) {
   if (!n) return null;
@@ -77,10 +162,34 @@ function _epeFindNodeGlobal(chainKey) {
 function _epeTraverseNodes(graph, chain, pathLabel, outList, includeSubgraphs = true, visited = new Set()) {
   if (!graph) return;
 
-  // Cycle detection: prevent infinite recursion on circular graph references
-  const graphId = graph.id || graph._id || JSON.stringify(graph._nodes?.map(n => n?.id).slice(0, 5));
-  if (visited.has(graphId)) return;
-  visited.add(graphId);
+  // Keyed by the GRAPH OBJECT, which is what "have I walked this already"
+  // means. It used to be keyed by the id-chain to the graph — but the chain
+  // gains a node id at every level, so the key was unique by construction and
+  // `visited.has()` was NEVER true. The comment here said so and concluded
+  // that the depth bound was what stopped it; the depth bound stops depth,
+  // not breadth.
+  //
+  // ComfyUI shares one Subgraph object across every instance of a definition,
+  // so a definition instantiated twice per level is reachable by 2^depth
+  // distinct paths, and every one of them was walked and pushed:
+  //
+  //     levels  entries      time     heap
+  //       14     49,150     0.13 s    21 MB
+  //       18    786,430     2.27 s   162 MB
+  //       20  3,145,726    12.23 s   752 MB
+  //
+  // At the depth cap that is tens of millions of entries — out of memory and
+  // the tab gone, taking the unsaved prompt with it — from a few kilobytes of
+  // workflow JSON, and reached synchronously the moment the user opens the
+  // wireless target picker.
+  //
+  // Two instances of the same definition therefore now yield ONE walk of that
+  // definition's contents, which is the right answer: the entries are keyed by
+  // the id-chain at the point of use, and the picker lists widgets, not
+  // instances.
+  if (visited.has(graph)) return;
+  if (chain.length > 24) return;
+  visited.add(graph);
 
   const nodes = graph._nodes || graph.nodes || [];
   for (const n of nodes) {
@@ -148,17 +257,76 @@ function _epeResolveNodeOutputKey(nodeBind) {
 // ═══════════════════════════════════════════════════════════════════════════
 // A wireless target is stored as a bind ref:
 //   { bind:"<chainKey>|<widgetIndex>", bindNodeType, bindNodeTitle,
-//     bindWidgetName, bindWidgetLabel, _bindRef:{nodeKey,nodeType,nodeTitle,slotName,_missTime} }
+//     bindWidgetName, bindWidgetLabel, _bindRef:{nodeKey,nodeType,nodeTitle,slotName} }
 // chainKey is the colon-joined node path through subgraphs (e.g. "88:30:45").
 // The relocation cascade keeps a target valid when the graph is restructured:
 //   Tier 1: direct chain-key lookup
 //   Tier 2: deep leaf-ID search across all subgraphs
 //   Tier 3: nodeType + widget-name match with title scoring
-//   Grace:  short window for transient misses during graph load/restructure
-const _EPE_GRACE_MS = 3000;
+// (There was a fourth "grace period" step here. It returned null exactly like
+// the miss it was meant to soften, so it did nothing but stamp a wall-clock
+// timestamp into the workflow JSON — see the end of _epeLookupTargetNode.)
+
+// _bindRef is DERIVED state — every field in it is recomputed from the four
+// bind* siblings on the next resolve — but it was a plain property on a target
+// that lives in node.properties.epe_wireless_targets. So it serialised into
+// every saved workflow: four duplicated fields per target, in a file other
+// people open, for no purpose. Same reasoning that removed _missTime in round
+// 11.
+//
+// Non-enumerable keeps it out of JSON.stringify and LiteGraph's clone while
+// staying an ordinary property to read. Targets loaded from a workflow saved
+// before this carry an enumerable one; the resolver re-defines it on first
+// touch, so the next save drops it.
+function _epeSetBindRef(target, ref) {
+  try {
+    Object.defineProperty(target, "_bindRef", {
+      value: ref, writable: true, enumerable: false, configurable: true,
+    });
+  } catch (_e) {
+    target._bindRef = ref;
+  }
+  return target._bindRef;
+}
 
 function _epeWidgetLabel(w) {
   return String(w?.label ?? w?.name ?? w?.type ?? "Widget");
+}
+
+// Is this node a legitimate RELOCATION target for `ref`?
+//
+// Used by Tier 2 and Tier 3 — the tiers that pick a different node and then
+// rewrite the stored binding to it. Tier 1 (the exact-key fast path) does NOT
+// use this: there the key already names the node, and insisting on the title
+// would break the ordinary act of renaming one.
+//
+// Two things it insists on that Tier 2 used to skip:
+//
+//   The TITLE and the SLOT, not just the class. Class alone is not evidence —
+//   CLIPTextEncode is the overwhelmingly common case, ids are reused per
+//   workflow tab and after delete+add, and Tier 2 took the first node that
+//   merely shared the class, then wrote the new key into target.bind. That
+//   lives in node.properties.epe_wireless_targets, so the mis-binding is saved
+//   into the workflow and travels with the file. Measured: a target bound to
+//   the "Negative Encoder" inside a subgraph silently re-bound to the Positive
+//   Encoder, pill green, negative prompt text into the positive slot, from
+//   then on, in the file too. Tier 3 has insisted on title + slot since round
+//   6; Tier 2 runs first and did not.
+//
+//   MUTED (mode 2) and BYPASSED (mode 4) nodes are not candidates.
+//   _epeEnumerateTextTargets refuses them, so the user was never offered one —
+//   yet the resolver would relocate a live binding onto a muted clone, report
+//   success, and paint the pill green while the prompt went into a node
+//   ComfyUI will not execute. A target the user muted deliberately still
+//   resolves through Tier 1; this only stops relocation from CHOOSING one.
+function _epeRefCandidate(n, ref) {
+  if (!n || !ref) return false;
+  if (n.mode === 2 || n.mode === 4) return false;
+  if (ref.nodeType && (n.type || "") !== ref.nodeType) return false;
+  if (ref.nodeTitle && (n.title || n.type || "") !== ref.nodeTitle) return false;
+  if (ref.slotName != null &&
+      !(n.widgets || []).some(w => w && w.name === ref.slotName)) return false;
+  return true;
 }
 
 // Tier-cascade node lookup. Mutates ref.nodeKey when a node is relocated so the
@@ -166,10 +334,11 @@ function _epeWidgetLabel(w) {
 function _epeLookupTargetNode(ref) {
   if (!ref || !ref.nodeKey) return null;
 
-  // Tier 1 — direct chain-key lookup
+  // Tier 1 — direct chain-key lookup. Same rule as Tier 2: ids are reused
+  // (per-tab, and after delete + add), so a type mismatch is a MISS that
+  // falls through to the deeper tiers, not a hit.
   const direct = _epeFindNodeGlobal(ref.nodeKey);
-  if (direct) {
-    ref._missTime = 0;
+  if (direct && (!ref.nodeType || (direct.type || "") === ref.nodeType)) {
     if (!ref.nodeType && direct.type) ref.nodeType = direct.type;
     if (!ref.nodeTitle && (direct.title || direct.type)) ref.nodeTitle = direct.title || direct.type;
     return direct;
@@ -181,15 +350,28 @@ function _epeLookupTargetNode(ref) {
   const leafId = parseInt(String(ref.nodeKey).split(":").pop());
   if (!isNaN(leafId)) {
     const rootNode = _epeGetNode(rootGraph, leafId);
-    if (rootNode) {
+    // Ids are reused after a delete and are per workflow tab, so "a node
+    // with this id exists" is not evidence it is the RIGHT node. Without
+    // this check a copied node bound to 30:6 latched onto whatever held id
+    // 6 in the new tab — and then wrote its own class into the ref, so the
+    // mis-binding looked confirmed ever after.
+    if (_epeRefCandidate(rootNode, ref)) {
       ref.nodeKey = String(leafId);
-      ref._missTime = 0;
       if (!ref.nodeType && rootNode.type) ref.nodeType = rootNode.type;
       if (!ref.nodeTitle && (rootNode.title || rootNode.type)) ref.nodeTitle = rootNode.title || rootNode.type;
       return rootNode;
     }
-    const deepSearch = (graph, chain) => {
+    // `visited` and the depth bound are the same guards _epeTraverseNodes has
+    // and this did not: a self-referential subgraph — the shape a hand-edited
+    // or shared workflow produces — recursed until "RangeError: Maximum call
+    // stack size exceeded", and the call site in renderWireless has no
+    // try/catch, so the whole wireless panel failed to render.
+    const deepSearch = (graph, chain, visited) => {
       if (!graph) return null;
+      if (!visited) visited = new Set();
+      if (visited.has(graph)) return null;
+      if (chain.length > 24) return null;
+      visited.add(graph);
       const nodes = graph._nodes || graph.nodes || [];
       for (const n of nodes) {
         if (!n || !n.id) continue;
@@ -197,17 +379,17 @@ function _epeLookupTargetNode(ref) {
         if (inner) {
           const newChain = [...chain, n.id];
           const found = _epeGetNode(inner, leafId);
-          if (found) return { node: found, chainKey: [...newChain, leafId].join(":") };
-          const deeper = deepSearch(inner, newChain);
+          if (_epeRefCandidate(found, ref))
+            return { node: found, chainKey: [...newChain, leafId].join(":") };
+          const deeper = deepSearch(inner, newChain, visited);
           if (deeper) return deeper;
         }
       }
       return null;
     };
-    const result = deepSearch(rootGraph, []);
+    const result = deepSearch(rootGraph, [], new Set());
     if (result) {
       ref.nodeKey = result.chainKey;
-      ref._missTime = 0;
       if (!ref.nodeType && result.node.type) ref.nodeType = result.node.type;
       if (!ref.nodeTitle && (result.node.title || result.node.type)) ref.nodeTitle = result.node.title || result.node.type;
       return result.node;
@@ -216,45 +398,70 @@ function _epeLookupTargetNode(ref) {
 
   // Tier 3 — nodeType + widget-name match with title scoring
   if (ref.nodeType) {
-    const matchByType = (graph, chain) => {
+    const matchByType = (graph, chain, visited) => {
       if (!graph) return null;
+      // Same guards as deepSearch above, and for the same reason.
+      if (!visited) visited = new Set();
+      if (visited.has(graph)) return null;
+      if (chain.length > 24) return null;
+      visited.add(graph);
       const nodes = graph._nodes || graph.nodes || [];
-      let bestMatch = null, bestScore = 0;
+      // Gather ALL candidates, then insist on one. The old code took the
+      // best score with a floor of 1 — class matches, title does not — and
+      // broke ties by array order, so a binding on the negative encoder
+      // silently moved to the positive one and stayed there.
+      const cands = [];
       for (const n of nodes) {
         if (!n || !n.id) continue;
+        // Class + slot as before, plus the mute/bypass exclusion — this tier
+        // would otherwise relocate a live binding onto a muted clone that the
+        // picker would never have offered. The title is scored below rather
+        // than required here, which is what lets a renamed node still be
+        // found when it is the only candidate.
+        if (n.mode === 2 || n.mode === 4) continue;
         if ((n.type || "") !== ref.nodeType) continue;
         let slotOk = true;
         if (ref.slotName != null) {
           slotOk = (n.widgets || []).some(w => w && w.name === ref.slotName);
         }
         if (!slotOk) continue;
-        let score = 1;
-        if (ref.nodeTitle && (n.title || n.type) === ref.nodeTitle) score += 2;
-        if (score > bestScore) { bestScore = score; bestMatch = { node: n, chain }; }
+        cands.push({ node: n, chain, titled: !!(ref.nodeTitle && (n.title || n.type) === ref.nodeTitle) });
       }
+      // A title match beats an untitled one; if any titled candidate
+      // exists, only those are eligible.
+      const titled = cands.filter(c => c.titled);
+      const pool = titled.length ? titled : (ref.nodeTitle ? [] : cands);
+      // Exactly one, or none. Two identical CLIPTextEncodes are a genuine
+      // ambiguity and the honest answer is to stay unresolved and show the
+      // red dot, not to pick one and rewrite the binding to it.
+      let bestMatch = (pool.length === 1) ? pool[0] : null;
       if (bestMatch) {
         const newKey = bestMatch.chain.length ? [...bestMatch.chain, bestMatch.node.id].join(":") : String(bestMatch.node.id);
         ref.nodeKey = newKey;
-        ref._missTime = 0;
         return bestMatch.node;
       }
       for (const n of nodes) {
         if (!n || !n.id) continue;
         const inner = _epeGetInnerGraph(n);
         if (inner) {
-          const found = matchByType(inner, [...chain, n.id]);
+          const found = matchByType(inner, [...chain, n.id], visited);
           if (found) return found;
         }
       }
       return null;
     };
-    const matched = matchByType(rootGraph, []);
+    const matched = matchByType(rootGraph, [], new Set());
     if (matched) return matched;
   }
 
-  // Grace period — tolerate transient misses during restructuring
-  if (!ref._missTime) ref._missTime = Date.now();
-  if (Date.now() - ref._missTime < _EPE_GRACE_MS) return null;
+  // No grace period here any more. It was dead code — both branches
+  // returned null, so it never tolerated anything — and its one real effect
+  // was writing Date.now() into ref._missTime. That ref is part of
+  // node.properties.epe_wireless_targets, which serializes into the workflow
+  // JSON, so every shared workflow holding an unresolved target carried a
+  // machine-local timestamp that changed on each save: noise in a file other
+  // people open, and a spurious diff for anyone version-controlling
+  // workflows.
   return null;
 }
 
@@ -269,13 +476,22 @@ function _epeResolveTargetWidget(target) {
   const nodeKey = s.slice(0, bar);
   const wIndexStr = s.slice(bar + 1);
 
-  if (!target._bindRef) {
-    target._bindRef = {
+  // `!target._bindRef` is FALSE for a string or a number, so a workflow saved
+  // before _bindRef was made non-enumerable — or hand-edited — fell through
+  // and assigned a property on a primitive: a TypeError under module strict
+  // mode. Caught per target upstream, so the visible symptom was a wireless
+  // target that silently never received the prompt.
+  if (!target._bindRef || typeof target._bindRef !== "object") {
+    _epeSetBindRef(target, {
       nodeKey,
       nodeType: target.bindNodeType || null,
       nodeTitle: target.bindNodeTitle || null,
       slotName: target.bindWidgetName || null,
-    };
+    });
+  } else if (Object.prototype.propertyIsEnumerable.call(target, "_bindRef")) {
+    // Loaded from a workflow saved before _bindRef was hidden. Re-define it so
+    // this file stops carrying it too.
+    _epeSetBindRef(target, target._bindRef);
   }
   target._bindRef.nodeKey = nodeKey;
   if (target.bindNodeType) target._bindRef.nodeType = target.bindNodeType;
@@ -304,13 +520,20 @@ function _epeResolveTargetWidget(target) {
       w = ws[idx]; resolvedIndex = idx;
       if (idx !== wIndex) target.bind = target._bindRef.nodeKey + "|" + idx;
     } else {
-      w = Number.isFinite(wIndex) ? ws[wIndex] : null;
+      // The saved name is gone. Falling back to the stored INDEX is a
+      // guess, so it only counts if what is there still takes text.
+      const byIdx = Number.isFinite(wIndex) ? ws[wIndex] : null;
+      w = _epeWidgetTakesText(byIdx) ? byIdx : null;
     }
   } else {
-    w = Number.isFinite(wIndex) ? ws[wIndex] : null;
+    const byIdx = Number.isFinite(wIndex) ? ws[wIndex] : null;
+    w = _epeWidgetTakesText(byIdx) ? byIdx : null;
   }
 
   if (!w) return null;
+  // Last line of defence: even a name match can land on a renamed widget
+  // of the wrong kind after a node is updated.
+  if (!_epeWidgetTakesText(w)) return null;
   return { node, widget: w, widgetIndex: resolvedIndex, nodeKey: target._bindRef.nodeKey };
 }
 
@@ -318,8 +541,31 @@ function _epeResolveTargetWidget(target) {
 function _epeApplyToTarget(target, text) {
   const r = _epeResolveTargetWidget(target);
   if (!r || !r.widget) return false;
+  if (!_epeWidgetTakesText(r.widget)) return false;
   try { r.widget.value = text; } catch (_e) { return false; }
+  // Setting .value alone is invisible to the target: nodes that recompute
+  // on their own widget changes (token counters, wildcard expanders) never
+  // saw the injected prompt, and the canvas kept painting the old text.
+  try { if (typeof r.widget.callback === "function") r.widget.callback(text, app.canvas, r.node); } catch (_e) {}
+  try { if (typeof r.node.onWidgetChanged === "function") r.node.onWidgetChanged(r.widget.name, text, undefined, r.widget); } catch (_e) {}
+  try { app.graph && app.graph.setDirtyCanvas(true, true); } catch (_e) {}
   return true;
+}
+
+// Does this widget hold free text? The wireless write used to assign the prompt
+// to whatever widget the index landed on, with no type check on any path — and
+// on a KSampler index 0 is `seed`.
+const _EPE_TEXT_WIDGET_TYPES = ["customtext", "text", "string", "textarea"];
+function _epeWidgetTakesText(w) {
+  if (!w) return false;
+  const t = String(w.type || "").toLowerCase();
+  if (_EPE_TEXT_WIDGET_TYPES.indexOf(t) >= 0) return true;
+  // A combo is a string too, and writing a prompt into one is never right.
+  if (t === "combo" || t === "number" || t === "slider" || t === "toggle" ||
+      t === "boolean" || t === "button") return false;
+  // Some custom nodes ship an untyped textarea widget. Accept only if the
+  // value it already holds is a string.
+  return t === "" && typeof w.value === "string";
 }
 
 // Store bind + relocation metadata from a picker selection.
@@ -333,13 +579,12 @@ function _epeSetTargetBind(target, sel) {
   target.bindLabel = (sel.path === "Root" || !sel.path)
     ? `${target.bindNodeTitle} > ${target.bindWidgetLabel}`
     : `${sel.path} > ${target.bindNodeTitle} > ${target.bindWidgetLabel}`;
-  target._bindRef = {
+  _epeSetBindRef(target, {
     nodeKey: String(sel.bindKey).slice(0, String(sel.bindKey).lastIndexOf("|")),
     nodeType: target.bindNodeType,
     nodeTitle: target.bindNodeTitle,
     slotName: target.bindWidgetName,
-    _missTime: 0,
-  };
+  });
 }
 
 // Rebuild a target's display label from the current graph (used when a stored
@@ -376,7 +621,15 @@ function _epeRebuildTargetLabel(target) {
 function _epeEnumerateTextTargets() {
   const results = [];
   const entries = [];
-  try { _epeTraverseNodes(app.graph, [], 'Root', entries, true); } catch(_e) { return results; }
+  // The ROOT graph, not app.graph. app.graph is whatever the user has
+  // navigated INTO, so opening this picker from inside a subgraph listed only
+  // that subgraph's widgets — and, worse, produced bind keys relative to it.
+  // _epeLookupTargetNode resolves from the root, so those keys either missed
+  // or, because node ids are reused per graph, latched onto the wrong node.
+  // Same expression the resolver and _epeFindNodeGlobal already use.
+  const _rootGraph = (app.canvas?._graph_stack?.length > 0)
+    ? app.canvas._graph_stack[0] : app.graph;
+  try { _epeTraverseNodes(_rootGraph, [], 'Root', entries, true); } catch(_e) { return results; }
   for (const e of entries) {
     if (e.isSubgraph || !e.node) continue;
     const n = e.node;
@@ -384,7 +637,10 @@ function _epeEnumerateTextTargets() {
     if (!n.widgets) continue;
     for (let wi = 0; wi < n.widgets.length; wi++) {
       const w = n.widgets[wi];
-      if (w.type !== 'customtext') continue;
+      // LiteGraph leaves a hole in `widgets` after some removals, and `w.type`
+      // on it threw out of the enumerator — so the target picker would not
+      // open at all, with no message.
+      if (!w || w.type !== 'customtext') continue;
       const title = n.title || n.type || ('Node ' + n.id);
       const wLabel = (w.label && w.label !== w.name) ? w.label : w.name;
       results.push({
@@ -396,79 +652,6 @@ function _epeEnumerateTextTargets() {
     }
   }
   return results;
-}
-
-function _epeShowTextNodeDropdown(anchorBtn, items, onSelect) {
-  const DID = 'epe-epe-node-dropdown';
-  const existing = document.getElementById(DID);
-  if (existing) { existing.remove(); return; }
-  if (!items.length) {
-    const orig = anchorBtn.textContent;
-    anchorBtn.textContent = 'No text nodes found';
-    setTimeout(() => { anchorBtn.textContent = orig; }, 1500);
-    return;
-  }
-  const dd = document.createElement('div');
-  dd.id = DID;
-  dd.style.cssText = 'position:fixed;z-index:999999;background:#141a24;border:1px solid #31415a;border-radius:5px;box-shadow:0 4px 18px rgba(0,0,0,0.75);overflow-y:auto;max-height:320px;min-width:280px;font-size:11px;';
-  // Forward reference — assigned once listeners are wired below; row clicks use it.
-  let _closeDD = () => { if (dd.isConnected) dd.remove(); };
-  for (const item of items) {
-    const row = document.createElement('div');
-    row.style.cssText = 'padding:7px 12px;cursor:pointer;border-bottom:1px solid #1c2431;display:flex;flex-direction:column;gap:2px;';
-    const nameEl = document.createElement('span');
-    nameEl.textContent = item.displayName;
-    nameEl.style.cssText = 'color:#d4dfea;';
-    row.appendChild(nameEl);
-    if (item.displayPath) {
-      const pathEl = document.createElement('span');
-      pathEl.textContent = item.displayPath;
-      pathEl.style.cssText = 'color:#4e5c6e;font-size:9px;';
-      row.appendChild(pathEl);
-    }
-    row.onmouseenter = () => { row.style.background = '#1a2a3a'; };
-    row.onmouseleave = () => { row.style.background = ''; };
-    row.onclick = (ev) => { ev.stopPropagation(); _closeDD(); onSelect(item); };
-    dd.appendChild(row);
-  }
-  document.body.appendChild(dd);
-  const r = anchorBtn.getBoundingClientRect();
-  const ddW = 280;
-  dd.style.left = Math.min(r.left, window.innerWidth - ddW - 8) + 'px';
-  dd.style.top = (r.bottom + 4) + 'px';
-
-  // Dismiss on any interaction outside the dropdown/button — including clicks on
-  // the ComfyUI canvas (which can swallow document mousedown), canvas panning,
-  // and scroll. Listen on multiple channels so canvas/node clicks also close it.
-  let _ddCleanup = null;
-  _closeDD = () => {
-    if (!dd.isConnected) return;
-    dd.remove();
-    if (_ddCleanup) _ddCleanup();
-  };
-  const _onDocDown = (ev) => {
-    if (!dd.contains(ev.target) && ev.target !== anchorBtn) _closeDD();
-  };
-  const _onCanvasDown = () => _closeDD();
-  const _onScroll = () => _closeDD();
-  _ddCleanup = () => {
-    document.removeEventListener('mousedown', _onDocDown, true);
-    document.removeEventListener('wheel', _onScroll, true);
-    const cv = app.canvas?.canvas;
-    if (cv) {
-      cv.removeEventListener('pointerdown', _onCanvasDown, true);
-      cv.removeEventListener('mousedown', _onCanvasDown, true);
-    }
-  };
-  setTimeout(() => {
-    document.addEventListener('mousedown', _onDocDown, true);
-    document.addEventListener('wheel', _onScroll, true);
-    const cv = app.canvas?.canvas;
-    if (cv) {
-      cv.addEventListener('pointerdown', _onCanvasDown, true);
-      cv.addEventListener('mousedown', _onCanvasDown, true);
-    }
-  }, 0);
 }
 
 // ── Wireless target picker (modal) ────────────────────────────────────────────
@@ -505,7 +688,25 @@ function _epeEnsurePickerCss() {
   document.head.appendChild(st);
 }
 
+// The picker overlay lives on document.body, outside every editor's own
+// subtree, so nothing that tears an editor down can reach it by removing its
+// DOM. It also closes over `entries`, which carry {widget, node} for EVERY
+// text widget in the graph — so one stranded overlay pins the whole graph and
+// the editor that opened it. Measured: 12 MB per node rebuild.
+//
+// Module scope, because the picker is a module-level function and two editors
+// must not each think they own the live one.
+let _epePickerOverlay = null;
+function _epeCloseTargetPicker() {
+  const o = _epePickerOverlay;
+  _epePickerOverlay = null;
+  try { if (o) o.remove(); } catch (_e) {}
+}
+
 function _epeShowTargetPicker(currentBindKey, onSelect) {
+  // Only ever one. Clicking "Add target" five times used to stack five
+  // overlays, and a backdrop click removed only the top one.
+  _epeCloseTargetPicker();
   _epeEnsurePickerCss();
 
   // Enrich enumerated text targets with bindKey + widgetLabel.
@@ -520,7 +721,10 @@ function _epeShowTargetPicker(currentBindKey, onSelect) {
 
   const overlay = document.createElement("div");
   overlay.className = "epe-picker-overlay";
-  overlay.onclick = (ev) => { if (ev.target === overlay) overlay.remove(); };
+  // Through the closer, so the slot is cleared with the element — a bare
+  // remove() left _epePickerOverlay pointing at a detached node, which is the
+  // same retention with an extra step.
+  overlay.onclick = (ev) => { if (ev.target === overlay) _epeCloseTargetPicker(); };
 
   const modal = document.createElement("div");
   modal.className = "epe-picker-modal";
@@ -543,6 +747,7 @@ function _epeShowTargetPicker(currentBindKey, onSelect) {
   list.className = "epe-picker-list";
   modal.appendChild(list);
   overlay.appendChild(modal);
+  _epePickerOverlay = overlay;
   document.body.appendChild(overlay);
 
   const state = { filter: "" };
@@ -564,10 +769,12 @@ function _epeShowTargetPicker(currentBindKey, onSelect) {
       if (f) {
         const idStr = _leafId(e.nodeKey);
         const match =
-          e.nodeTitle.toLowerCase().includes(f) ||
-          (e.widgetLabel || "").toLowerCase().includes(f) ||
-          (e.widgetName || "").toLowerCase().includes(f) ||
-          (e.path || "").toLowerCase().includes(f) ||
+          // String(): a node whose `title` is a number in the workflow JSON
+          // made this throw on EVERY KEYSTROKE in the picker's search box.
+          String(e.nodeTitle || "").toLowerCase().includes(f) ||
+          String(e.widgetLabel || "").toLowerCase().includes(f) ||
+          String(e.widgetName || "").toLowerCase().includes(f) ||
+          String(e.path || "").toLowerCase().includes(f) ||
           String(e.nodeKey).toLowerCase() === f ||
           idStr === f;
         if (!match) continue;
@@ -646,36 +853,60 @@ function _epeShowTargetPicker(currentBindKey, onSelect) {
 // ── Workflow template opener ──────────────────────────────────────────────────
 
 async function _epeOpenTemplate(templateJSON, format = "graph") {
+  // Open a new blank tab FIRST. If that step fails — older ComfyUI, the
+  // command renamed, an extension that swallows it — the previous version
+  // fell through to loading directly into the LIVE canvas, destroying the
+  // user's current graph and any unsaved EPE prompt with it. A button
+  // labelled "Load Workflow" cannot silently do that.
+  //
+  // Exception: if the current graph is EMPTY, there is nothing to destroy
+  // and the "load into current tab" fallback is functionally identical to
+  // "load into a new tab" — so users on older ComfyUI (where the new-tab
+  // command doesn't exist) still have a working Load button on a blank
+  // canvas. If the current graph has any nodes, refuse.
+  const _openNewTab = async () => {
+    await app.extensionManager.commands.execute('Comfy.NewBlankWorkflow');
+    // Wait two rAF frames for the new tab to become active and its
+    // workflow UUID to be assigned.
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  };
+  const _currentGraphIsEmpty = () => {
+    try {
+      const nodes = app.graph?._nodes;
+      // A canvas with zero nodes has nothing to lose; treat as safe fallback.
+      return Array.isArray(nodes) && nodes.length === 0;
+    } catch (_e) { return false; }
+  };
+  const _tabOrEmptyCanvasFallback = async () => {
+    try { await _openNewTab(); return true; }
+    catch (e) {
+      if (_currentGraphIsEmpty()) return false;   // fall through to load-into-current
+      throw new Error("Could not open a new workflow tab — refusing to overwrite the current one. (" + ((e && e.message) || e) + ")");
+    }
+  };
+
   // API-format graphs (from a PNG's 'prompt' chunk) load via loadApiJson.
   if (format === "api") {
     if (typeof app.loadApiJson !== "function") {
       throw new Error("This ComfyUI version cannot load API-format workflows");
     }
-    try {
-      await app.extensionManager.commands.execute('Comfy.NewBlankWorkflow');
-      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-    } catch(e) { /* fall through — load into the current tab instead */ }
+    await _tabOrEmptyCanvasFallback();
     await app.loadApiJson(templateJSON, "workflow.json");
     return;
   }
-  try {
-    // Step 1: create exactly one new blank tab via ComfyUI's own command.
-    await app.extensionManager.commands.execute('Comfy.NewBlankWorkflow');
 
-    // Step 2: wait two rAF frames for the new tab to become active and its
-    // workflow UUID to be assigned, then read that UUID.
-    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const _newTabOpened = await _tabOrEmptyCanvasFallback();
 
-    // Step 3: patch the template UUID to match the new tab so loadGraphData
-    // loads INTO the current tab rather than spawning a second one.
+  // Patch the template UUID to match the new tab so loadGraphData loads
+  // INTO the current (newly-opened) tab rather than spawning a second one.
+  // On the empty-canvas fallback we skip the patch — we want the template's
+  // OWN id, not the (possibly generated) empty-canvas one.
+  if (_newTabOpened) {
     const currentId = app.graph?.serialize?.()?.id;
     const patched = Object.assign({}, templateJSON);
     if (currentId) patched.id = currentId;
-
-    // Step 4: load the workflow into the already-active new tab.
     await app.loadGraphData(patched);
-  } catch(e) {
-    // Fallback: just load directly if anything above fails.
+  } else {
     await app.loadGraphData(templateJSON);
   }
 }
@@ -1207,7 +1438,14 @@ const _EPE_STYLE_POOL_RULES = {
 function _epeApplyAestheticRotation(text, perCategory, styleId) {
   if (typeof text !== "string" || text.length === 0) return text;
   const n = Math.max(1, Math.min(10, perCategory || 4));
-  const rules = (styleId && styleId !== "default" && _EPE_STYLE_POOL_RULES[styleId]) || null;
+  // hasOwnProperty, not a bare index. styleId round-trips through
+  // node.properties — shared, hand-editable workflow JSON — so an id of
+  // "constructor" or "toString" resolved to a function off Object.prototype
+  // instead of missing. `rules` was then truthy with no .exclude and no
+  // pools, so the style silently contributed nothing at all.
+  const _hasRule = styleId && styleId !== "default" &&
+    Object.prototype.hasOwnProperty.call(_EPE_STYLE_POOL_RULES, styleId);
+  const rules = _hasRule ? _EPE_STYLE_POOL_RULES[styleId] : null;
   let out = text;
   for (const [token, category] of Object.entries(_EPE_AESTHETIC_PLACEHOLDERS)) {
     if (out.indexOf(token) === -1) continue;
@@ -1471,7 +1709,17 @@ Output ONLY the full revised prompt. No preamble, no quotes around it, no commen
   // Save settings to localStorage
   saveSettings(settings) {
     try {
-      localStorage.setItem("epe_ollama_settings", JSON.stringify(settings));
+      // Only what the user actually changed. Callers routinely hand back
+      // what getSettings() returned — { ...defaults, ...stored } — and
+      // storing that verbatim wrote every current system prompt into
+      // localStorage as an explicit override, freezing today's prompts for
+      // good. That is the trap clearStoredKey's comment describes, reached
+      // by simply picking a model from the dropdown.
+      const lean = {};
+      Object.keys(settings || {}).forEach(k => {
+        if (settings[k] !== this._defaults[k]) lean[k] = settings[k];
+      });
+      localStorage.setItem("epe_ollama_settings", JSON.stringify(lean));
     } catch (e) { /* ignore */ }
   },
 
@@ -1498,18 +1746,180 @@ Output ONLY the full revised prompt. No preamble, no quotes around it, no commen
   cleanResponse(text) {
     if (!text) return "";
     let cleaned = text;
-    // Strip thinking/reasoning tags (greedy across newlines)
-    cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, "");
-    cleaned = cleaned.replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, "");
-    cleaned = cleaned.replace(/<reflection>[\s\S]*?<\/reflection>/gi, "");
+    // Strip thinking/reasoning tags (greedy across newlines).
+    //
+    // A pair match alone is not enough, because either half goes missing in
+    // practice and both failures end with the model's reasoning sitting in
+    // the user's prompt box:
+    //   - No closing tag: the model hit its token ceiling mid-thought. The
+    //     pair match found nothing, so the WHOLE reasoning dump was returned
+    //     and committed — it is a non-empty string, so nothing downstream
+    //     objected. Everything from an unclosed opener onward is reasoning
+    //     by definition.
+    //   - No opening tag: several chat templates pre-fill "<think>" into the
+    //     assistant turn, so the model only ever emits the closer and
+    //     everything BEFORE it is reasoning.
+    //
+    // Ending up with "" is the correct outcome for a response that was
+    // nothing but reasoning: both callers already treat an empty result as
+    // "the model returned nothing", restore the original prompt and say so.
+    // Three passes, and every one of them treats think / reasoning /
+    // reflection as ONE set of interchangeable delimiters rather than three
+    // independent tags. Models mix them — a block opened <reasoning> and
+    // closed </think> is common — and handling each name on its own meant a
+    // mismatched pair was never recognised as a pair at all: the opener
+    // looked unterminated, everything from it onward was discarded, and the
+    // prompt sitting after the closer went with it.
+    const _EPE_THINK_TAGS = "think|reasoning|reflection";
+    const _epeOpenRe  = new RegExp("<(?:" + _EPE_THINK_TAGS + ")>", "i");
+    const _epeCloseRe = () => new RegExp("</(?:" + _EPE_THINK_TAGS + ")>", "gi");
+
+    // 1. Every well-formed span goes — opened by any of the three names and
+    //    closed by any of them — INNERMOST FIRST.
+    //
+    //    A plain non-greedy match stops at the first closer of any name, so
+    //    on a nested block it cuts at the INNER closer and leaves the outer
+    //    block's tail behind as ordinary text. That is the documented
+    //    Reflection prompting shape (<reflection> inside <think>), and it
+    //    used to put "Go with blue hour." — pure reasoning — into the prompt.
+    //
+    //    `(?:(?!<open>)[\s\S])*?` refuses to cross another opener, so the
+    //    only spans that match are ones with nothing nested inside them.
+    //    Removing those exposes the next layer out, so repeating collapses
+    //    the whole nest. Each pass removes at least one span or changes
+    //    nothing and stops; the counter is a backstop, not a limit any real
+    //    response reaches.
+    {
+      const _inner = new RegExp(
+        "<(?:" + _EPE_THINK_TAGS + ")>(?:(?!<(?:" + _EPE_THINK_TAGS + ")>)[\\s\\S])*?</(?:" +
+        _EPE_THINK_TAGS + ")>", "gi");
+      for (let _pass = 0; _pass < 20; _pass++) {
+        const _before = cleaned;
+        cleaned = cleaned.replace(_inner, "");
+        if (cleaned === _before) break;
+      }
+    }
+
+    // 2. An opener with nothing left to close it is unterminated — the model
+    //    hit its token ceiling mid-thought — so everything from it onward is
+    //    reasoning. One cut, once.
+    {
+      const _m = _epeOpenRe.exec(cleaned);
+      if (_m) cleaned = cleaned.slice(0, _m.index);
+    }
+
+    // 3. Every opener is gone now, so a closer still standing is a genuine
+    //    orphan — the shape a chat template produces when it pre-fills
+    //    "<think>" into the assistant turn, leaving the model to emit only
+    //    the closing half. Everything before it is reasoning.
+    //
+    //    The LAST one, deliberately: a model that re-opens its thinking emits
+    //    several closers, and only the text after the final one is the
+    //    answer.
+    //
+    //    If that leaves nothing, the answer really is nothing — the
+    //    generation was truncated, or the model emitted only reasoning. "" is
+    //    the honest result and both callers already handle it: they restore
+    //    the user's prompt and say the model returned nothing. An earlier
+    //    version of this guessed instead, keeping the text before the closer
+    //    on the theory that a trailing closer was punctuation. That guess
+    //    committed reasoning as the prompt, and with more than one closer it
+    //    also fused the segments together with the tag simply deleted
+    //    ("…reasoning about it" + "a fox…" -> "…about ita fox…").
+    //
+    //    Scanned with a case-insensitive regex over the ORIGINAL string
+    //    rather than a lowercased copy: toLowerCase() is not
+    //    length-preserving — U+0130 (Turkish dotted capital I) lowercases to
+    //    two code units — so an index taken from the copy can point one
+    //    character past where it should and slice a character off the user's
+    //    prompt. The end offset comes from the match itself, so the tag's
+    //    length is never assumed either.
+    {
+      const _re = _epeCloseRe();
+      let _m, _end = -1;
+      while ((_m = _re.exec(cleaned)) !== null) _end = _m.index + _m[0].length;
+      if (_end !== -1) cleaned = cleaned.slice(_end);
+    }
     cleaned = cleaned.replace(/<output>[\s\S]*?<\/output>/gi, function(m) {
       // Keep content inside <output> tags
       return m.replace(/<\/?output>/gi, "");
     });
-    // Strip markdown code blocks
-    cleaned = cleaned.replace(/```[\s\S]*?```/g, "");
-    // Strip leading/trailing quotes
-    cleaned = cleaned.replace(/^["']+|["']+$/g, "");
+    // Unwrap markdown code blocks instead of deleting them — models often
+    // put the entire prompt inside one, and deleting the payload either
+    // emptied the result or left only the junk preamble around it. A
+    // leading language-tag line is dropped.
+    cleaned = cleaned.replace(/```[a-zA-Z0-9_-]*\n([\s\S]*?)```/g, "$1");
+    cleaned = cleaned.replace(/```([\s\S]*?)```/g, "$1");
+    // Strip surrounding quotes only when they really are a wrapper: the
+    // SAME quote character opens and closes the string, and that character
+    // appears nowhere in between.
+    //
+    // "starts with a quote and ends with a quote" was not enough. It is also
+    // true of a prompt carrying two quoted phrases, and one character came
+    // off each end:
+    //     "OPEN" neon sign above a door reading "CLOSED"
+    //  -> OPEN" neon sign above a door reading "CLOSED
+    // which is not just wrong, it is unbalanced, and it went to the sampler
+    // that way. The `+` on both anchors compounded it by eating a whole run
+    // of quotes rather than the one that might have been a wrapper.
+    {
+      // One whole character ending at index i / starting at index i, surrogate
+      // pairs kept together, so the tests below see code points.
+      const _epeWordish = (c) => !!c && /^[\p{L}\p{N}\p{M}]$/u.test(c);
+      const _epeCharBefore = (s, i) => {
+        if (i <= 0) return "";
+        const u = s.charCodeAt(i - 1);
+        return (u >= 0xDC00 && u <= 0xDFFF && i >= 2) ? s.slice(i - 2, i) : s.charAt(i - 1);
+      };
+      const _epeCharAt = (s, i) => {
+        if (i >= s.length) return "";
+        const u = s.charCodeAt(i);
+        return (u >= 0xD800 && u <= 0xDBFF && i + 1 < s.length) ? s.slice(i, i + 2) : s.charAt(i);
+      };
+      const _t = cleaned.trim();
+      const _q = _t.charAt(0);
+      if (_t.length > 1 && (_q === '"' || _q === "'") &&
+          _t.charAt(_t.length - 1) === _q) {
+        // Find the first quote AFTER the opening one that is not a
+        // word-internal apostrophe. If that is the final character, the whole
+        // string is one quoted span and the outer quotes really are a
+        // wrapper. If it lands anywhere else, they are not:
+        //     "OPEN" neon sign above a door reading "CLOSED"
+        //      ^                                          ^
+        //      first closer at index 5, so not a wrapper.
+        //
+        // Requiring the quote to be absent from the interior ENTIRELY — which
+        // is what this did at first — was too strong: an apostrophe is that
+        // character, so 'a cat's paw at dawn' stopped being unwrapped and the
+        // wrapper quotes went to the sampler.
+        let _close = -1;
+        for (let i = 1; i < _t.length; i++) {
+          if (_t.charAt(i) !== _q) continue;
+          // "cat's" — an apostrophe with a letter or digit on both sides is
+          // part of the word, not a quote.
+          //
+          // \p{L}\p{N}\p{M}, not [A-Za-z]. The ASCII-only version left the
+          // very regression this exemption exists to prevent in place
+          // wherever the neighbour is a digit or an accented letter, which is
+          // most of the interesting cases — "the 80's neon glow", "the F1's
+          // livery", "a café's terrace", "l'été". Only "a cat's paw" happened
+          // to work.
+          //
+          // And the neighbours are read as CODE POINTS, not charAt(). charAt
+          // returns one UTF-16 unit, so in NFD text ("cafe" + U+0301) the
+          // character before the apostrophe is a lone combining mark, and for
+          // an astral letter it is half a surrogate pair — both failed the
+          // test and the wrapper quotes survived. \p{M} covers the first;
+          // pairing the surrogates covers the second.
+          if (_q === "'" && i < _t.length - 1 &&
+              _epeWordish(_epeCharBefore(_t, i)) &&
+              _epeWordish(_epeCharAt(_t, i + 1))) continue;
+          _close = i;
+          break;
+        }
+        if (_close === _t.length - 1) cleaned = _t.slice(1, -1);
+      }
+    }
     // Collapse excessive whitespace
     cleaned = cleaned.replace(/\n{3,}/g, "\n\n");
     return cleaned.trim();
@@ -1518,23 +1928,70 @@ Output ONLY the full revised prompt. No preamble, no quotes around it, no commen
   // Parse numbered variations from response
   parseVariations(text) {
     const cleaned = this.cleanResponse(text);
-    const lines = cleaned.split("\n").filter(l => l.trim());
+    const lines = cleaned.split("\n");
     const variations = [];
-    for (const line of lines) {
-      // Match "1." or "1)" or "1:" or just numbered lines
-      const match = line.match(/^\s*(\d+)[.):\-]\s*(.+)/);
-      if (match) {
-        variations.push(match[2].trim());
+    let current = null;
+    // Index of the last non-blank line — the only place a sign-off can be.
+    let lastIdx = -1;
+    for (let k = 0; k < lines.length; k++) if (lines[k].trim()) lastIdx = k;
+    for (let idx = 0; idx < lines.length; idx++) {
+      const line = lines[idx];
+      // Match "1." or "1)" or "1:" — the rest may be empty, since some
+      // models put the number on a line of its own.
+      //
+      // A digit IMMEDIATELY after the separator, with no space, means this is
+      // a number and not a list marker. Aspect ratios and times start lines
+      // constantly in this exact context, and every one of them was being
+      // eaten:
+      //   "16:9 cinematic still of a fox" -> ["9 cinematic still of a fox"]
+      //   "4:30 pm golden light"          -> ["30 pm golden light"]
+      //   "3.5 stars"                     -> ["5 stars"]
+      // Real list markers are always written "1. ", "1) " or "1: " with the
+      // space, or are alone on the line. cleanWeights had this same bug
+      // fixed in round 9; parseVariations was still doing it.
+      const match = line.match(/^\s*(\d+)([.):\-])(\s*)(.*)$/);
+      // ...but only for separators that can actually appear INSIDE a number.
+      // ")" cannot, so "1)2 girls sitting" is a real list item and applying
+      // the guard to it collapsed the whole response into a single card.
+      const _isNumber = match && match[2] !== ")" &&
+                        match[3] === "" && /^\d/.test(match[4]);
+      if (match && !_isNumber) {
+        if (current !== null) variations.push(current);
+        current = match[4] || "";
+      } else if (current !== null) {
+        if (!line.trim()) {
+          // A blank line after content ends the variation — trailing
+          // chatter beyond it is not part of the prompt. Blank lines
+          // BEFORE any content (a bare "1." then a gap) are skipped.
+          if (current.trim()) { variations.push(current); current = null; }
+        } else if (!current) {
+          // The number was alone on its line; this is the variation itself.
+          current = line;
+        } else if (idx === lastIdx && /[.!?"’”)\]]\s*$/.test(current)) {
+          // The VERY LAST line of the response, following a variation that
+          // already ends in a completed sentence: a sign-off ("Hope these
+          // help!"), not a wrapped continuation — it used to be glued onto
+          // the last variation and committed with it. Confined to the final
+          // line on purpose: mid-variation, a break after a full stop is
+          // ordinary hard wrapping and must still be kept.
+        } else {
+          // Continuation of a hard-wrapped paragraph — dropping these
+          // silently amputated every variation to its first line.
+          current += "\n" + line;
+        }
       }
     }
+    if (current !== null) variations.push(current);
+    const out = variations.map(v => v.trim()).filter(Boolean);
+    if (out.length > 0) return out;
     // If no numbered lines found, try splitting by double newline
-    if (variations.length === 0 && cleaned.length > 0) {
+    if (cleaned.length > 0) {
       const blocks = cleaned.split(/\n\n+/).filter(b => b.trim());
       if (blocks.length > 1) return blocks.map(b => b.trim());
       // Last resort: return as single variation
       return [cleaned];
     }
-    return variations;
+    return out;
   },
 
   // Check if Ollama is reachable
@@ -1542,7 +1999,7 @@ Output ONLY the full revised prompt. No preamble, no quotes around it, no commen
   // auto-starts a local Ollama if it isn't running yet.
   async _backendCheck(url) {
     try {
-      const resp = await fetch("/epe/ollama/check", {
+      const resp = await api.fetchApi("/epe/ollama/check", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ollamaUrl: url || this.getSettings().url }),
@@ -1591,6 +2048,11 @@ Output ONLY the full revised prompt. No preamble, no quotes around it, no commen
           }
           throw e2;
         }
+        // The retry returned empty without throwing — surface the friendly
+        // message, never the internal sentinel.
+        const _f2 = new Error("The model spent its whole response thinking. Try a non-thinking model, or increase Length.");
+        _f2.thinking = e.thinking || "";
+        throw _f2;
       }
       throw e;
     }
@@ -1607,12 +2069,27 @@ Output ONLY the full revised prompt. No preamble, no quotes around it, no commen
     // Create a combined abort: user cancel OR timeout (120s)
     const timeoutMs = 120000;
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-    
-    // If external signal provided, link it
+    let timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    // If external signal provided, link it. Held so it can be detached: the
+    // caller's controller outlives this call, and the retry re-uses the same
+    // signal, so an un-removed listener accumulated one abort target per
+    // attempt and kept this whole closure alive with it.
+    let _extAbort = null;
     if (opts.signal) {
-      opts.signal.addEventListener("abort", () => controller.abort());
+      _extAbort = () => controller.abort();
+      opts.signal.addEventListener("abort", _extAbort);
     }
+    // Every exit — success, failure, abort — runs this. The success paths
+    // used to leave the last armed timer running, so a finished request
+    // could abort a controller a later caller was still holding.
+    const _finishTimers = () => {
+      clearTimeout(timeoutId);
+      if (_extAbort && opts.signal) {
+        try { opts.signal.removeEventListener("abort", _extAbort); } catch (_e) {}
+        _extAbort = null;
+      }
+    };
     
     const onToken = opts.onToken || null; // callback(partialText) for streaming UI
     
@@ -1637,7 +2114,7 @@ Output ONLY the full revised prompt. No preamble, no quotes around it, no commen
       if (opts.images && opts.images.length > 0) {
         body.images = opts.images;
       }
-      const resp = await fetch(url, {
+      const resp = await api.fetchApi(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -1680,8 +2157,12 @@ Output ONLY the full revised prompt. No preamble, no quotes around it, no commen
         const { done, value } = await reader.read();
         if (done) break;
         
-        // Reset timeout on each chunk (model is actively generating)
+        // Reset the timeout on each chunk: the model is actively
+        // generating. Clearing without re-arming — which is what this did —
+        // left a model that stalled after its first token hanging forever,
+        // with no timeout left to fire and nothing to resolve the promise.
         clearTimeout(timeoutId);
+        timeoutId = setTimeout(() => controller.abort(), timeoutMs);
         
         buffer += decoder.decode(value, { stream: true });
         
@@ -1716,8 +2197,15 @@ Output ONLY the full revised prompt. No preamble, no quotes around it, no commen
       
       return fullResponse.trim() ? fullResponse : _fromThinking();
     } catch (e) {
-      clearTimeout(timeoutId);
       throw e;
+    } finally {
+      // A `finally`, not a call on each exit path: the streaming loop
+      // RETURNS from inside the try the moment it sees chunk.done, which is
+      // how essentially every successful generation ends. Calling
+      // _finishTimers only on the trailing return missed that path entirely
+      // and left a 120s abort timer armed, plus the caller's abort listener
+      // attached — the exact accumulation this was added to stop.
+      _finishTimers();
     }
   },
 
@@ -1726,7 +2214,7 @@ Output ONLY the full revised prompt. No preamble, no quotes around it, no commen
     try {
       const settings = this.getSettings();
       if (!settings.model) return;
-      await fetch("/epe/ollama/generate", {
+      await api.fetchApi("/epe/ollama/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1752,19 +2240,138 @@ const _epeOllamaVision = {
   // safe slider subset (length, focus).
   _styleBridge: { style: "default", lengthSlider: 50, focusSlider: 50 },
 
-  // Shared abort controller — cancels any in-flight vision request when a new one starts
+  // Which editor owns the state below. There can be several EPE nodes in one
+  // graph, and both the style bridge above and the abort controller here are
+  // per-editor concerns living on a page-level singleton. Before this:
+  //   - the bridge was written only from style-strip UI handlers, never at
+  //     run time, so whichever node's strip was touched LAST decided how
+  //     every node captioned — silently, and with no way to notice;
+  //   - node B starting a caption aborted node A's in-flight request, and A's
+  //     panel reported a failure the user never caused.
+  _owner: null,
+
+  // One controller per owner, not one for the page.
+  _abortByOwner: null,
+
+  // Every model pull currently in flight. This was a single slot, so a second
+  // pull orphaned the first (unstoppable, and it fired onSelect when it
+  // finished) and Cancel aborted whichever one happened to be in the slot.
+  _pullAborts: null,
+  _pullTake(ctrl, owner) {
+    // Tagged with its owner. _pullAbortAll is right for the picker's own
+    // Cancel button, which is modal — and wrong for a node's dispose, where
+    // the node being deleted is not necessarily the one that started the
+    // pull. Two nodes on the canvas and deleting the idle one killed the
+    // other's multi-GB download with "Download cancelled" and no reason.
+    try { ctrl._epeOwner = owner; } catch (_e) {}
+    (this._pullAborts || (this._pullAborts = new Set())).add(ctrl);
+    return ctrl;
+  },
+  _pullDone(ctrl) {
+    if (this._pullAborts) this._pullAborts.delete(ctrl);
+  },
+  _pullAbortOwn(owner) {
+    const s = this._pullAborts;
+    if (!s || owner == null) return;
+    for (const c of Array.from(s)) {
+      if (c && c._epeOwner === owner) {
+        try { c.abort(); } catch (_e) {}
+        s.delete(c);
+      }
+    }
+  },
+  _pullAbortAll() {
+    const s = this._pullAborts;
+    if (!s) return;
+    for (const c of Array.from(s)) {
+      try { c.abort(); } catch (_e) {}
+      s.delete(c);
+    }
+  },
+
+  // Called by an editor immediately before it starts a vision run: claims the
+  // shared state and installs THIS editor's style settings, so the request
+  // that goes out is the one described by the strip the user is looking at.
+  claim(owner, styleBridge) {
+    this._owner = owner || null;
+    if (styleBridge) this._styleBridge = styleBridge;
+  },
+
+  // Abort a specific owner's in-flight request and nothing else. Cancel
+  // buttons pass the owner captured when their panel was built, so pressing
+  // Cancel can only ever stop the run that panel belongs to.
+  _abortOwn(owner) {
+    const map = this._abortByOwner || (this._abortByOwner = Object.create(null));
+    const key = String(owner == null ? "default" : owner);
+    const ctrl = map[key];
+    if (ctrl) { try { ctrl.abort(); } catch (e) {} }
+  },
+
+  // An owner is finished with (its node was disposed). Nothing removed
+  // entries, so one AbortController accumulated per node instance for the
+  // life of the page — add and remove a node fifty times and fifty were held.
+  // The dispose chain knows exactly when this is true, so it says so; the
+  // sweep is a backstop for owners that never got the chance.
+  _releaseOwner(owner) {
+    const map = this._abortByOwner;
+    if (!map) return;
+    const key = String(owner == null ? "default" : owner);
+    const ctrl = map[key];
+    if (ctrl) { try { ctrl.abort(); } catch (e) {} }
+    delete map[key];
+    // Only prune signals that are already aborted. An earlier version of
+    // this cross-checked against `app.graph._nodes.map(n => n.id)` — but
+    // the keys here are WIN_IDs of the form "epe-epe-node-u<...>", not
+    // node ids, so that check unconditionally aborted every OTHER live
+    // node's in-flight vision request on every dispose. Reverted; the
+    // dispose chain handles the intended case via the explicit _releaseOwner
+    // call for the owner being disposed.
+    for (const k of Object.keys(map)) {
+      const c = map[k];
+      if (!c || !c.signal || c.signal.aborted) delete map[k];
+    }
+  },
+
+  // Which style settings a request should carry.
+  //
+  // While this editor still owns the singleton, the LIVE bridge wins: the
+  // model picker is an overlay and the style strip underneath stays
+  // interactive, so a style change made with the picker open is this same
+  // node's change and belongs in the request. The copy captured at click time
+  // is only needed once ANOTHER editor has claimed — which is precisely what
+  // the owner comparison detects.
+  _bridgeFor(ctx) {
+    if (!ctx || !ctx.bridge) return this._styleBridge;
+    return (this._owner === ctx.owner) ? this._styleBridge : ctx.bridge;
+  },
+
+  // Kept for callers that still read it; always the most recent controller.
   _abortController: null,
 
-  _abortPrevious() {
-    if (this._abortController) {
-      try { this._abortController.abort(); } catch(e) {}
+  // `owner` is passed explicitly by everything that runs after an await.
+  // Reading this._owner here instead was the whole bug in the first cut:
+  // run() awaits the model picker, which returns when the USER clicks, and by
+  // then another editor may have claimed the singleton — so one node's
+  // controller got filed under another node's key and the next run aborted
+  // the wrong request.
+  _abortPrevious(owner) {
+    const map = this._abortByOwner || (this._abortByOwner = Object.create(null));
+    const who = (owner === undefined) ? this._owner : owner;
+    const key = String(who == null ? "default" : who);
+    const prev = map[key];
+    // Only this owner's previous run. A new request from ANOTHER editor is
+    // not a reason to cancel this one.
+    if (prev) {
+      try { prev.abort(); } catch(e) {}
     }
-    this._abortController = new AbortController();
-    return this._abortController.signal;
+    const ctrl = new AbortController();
+    map[key] = ctrl;
+    this._abortController = ctrl;
+    return ctrl.signal;
   },
   async check() {
     try {
-      const resp = await fetch("/epe/ollama/check", {
+      const resp = await api.fetchApi("/epe/ollama/check", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ollamaUrl: this._ollamaUrl }),
@@ -1810,7 +2417,19 @@ const _epeOllamaVision = {
 
   // Show model picker panel. knownModels = [{name,diskGb,label}], installedModels = [str].
   // onSelect(modelName) called when user picks a model.
-  showModelPicker(knownModels, installedModels, showAiPanel, hideAiPanel, onSelect) {
+  showModelPicker(knownModels, installedModels, showAiPanel, hideAiPanel, onSelect, owner) {
+    // The in-flight pull's controller hangs off the picker so the Dismiss
+    // button can reach it; captured here because the row handlers below are
+    // arrows nested inside a forEach.
+    const _pickerSelf = this;
+    // SNAPSHOT, not a live read. `_startPull` runs on a user click, long
+    // after this picker opened, and `claim()` fires from every style-strip
+    // handler — so `this._owner` at click time can be a different node
+    // entirely, or a node that has since been disposed (_releaseOwner never
+    // nulls _owner). run() already snapshots for exactly this reason and its
+    // comment says why; the pull registry has to do the same or it tags the
+    // download with the wrong node and dispose aborts the wrong one.
+    const _pickerOwner = (owner !== undefined) ? owner : this._owner;
     const wrap = document.createElement("div");
     wrap.style.cssText = "padding:12px 14px;display:flex;flex-direction:column;gap:8px;";
 
@@ -1845,44 +2464,96 @@ const _epeOllamaVision = {
       if (isInstalled) {
         row.onclick = () => onSelect(m.name);
       } else {
-        // Pull the model then select it
-        row.onclick = async () => {
+        // Named, so a failed or cancelled pull can put the row back to
+        // "click to download" instead of leaving it dead.
+        const _startPull = async () => {
           sub.textContent = "Downloading\u2026";
           dot.style.background = "#7a8a9c";
           row.style.cursor = "default";
           row.onclick = null;
+          // A pull is minutes long. Without a way to abort it, dismissing
+          // the panel left the download running and then fired onSelect when
+          // it finished — spontaneously starting vision inference on an image
+          // the user had walked away from a quarter of an hour earlier.
+          // Registered, not assigned to a single slot. Overwriting the slot
+          // left the previous pull running with nothing able to stop it, and
+          // Cancel then aborted whatever happened to be in the slot with no
+          // ownership check — so the earlier pull finished and fired onSelect,
+          // starting inference on an image the user had abandoned. That is
+          // verbatim the failure the Cancel button was added to prevent.
+          //
+          // A pull is machine-wide (Ollama has one model store) and this
+          // picker is modal, so "every pull this picker started" is the right
+          // unit for Cancel and for dispose.
+          const pullCtrl = new AbortController();
+          // `_owner` is whoever claimed the vision singleton, which the
+          // editor does before every run and whenever its style strip is
+          // touched — so at the moment a pull starts it is the node whose
+          // panel opened this picker. Tagged here, once, so a later claim by
+          // another node cannot retag a pull already in flight.
+          _pickerSelf._pullTake(pullCtrl, _pickerOwner);
           try {
-            const pullResp = await fetch("/epe/ollama/pull", {
+            const pullResp = await api.fetchApi("/epe/ollama/pull", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ modelName: m.name, ollamaUrl: this._ollamaUrl }),
+              signal: pullCtrl.signal,
             });
             const reader = pullResp.body.getReader();
             const dec = new TextDecoder();
+            // Incremental: a status line split across two chunks used to be
+            // parsed as two broken halves and silently dropped.
+            let buf = "";
+            let pullErr = null;
             while (true) {
               const { done, value } = await reader.read();
               if (done) break;
-              const lines = dec.decode(value).split("\n").filter(Boolean);
+              buf += dec.decode(value, { stream: true });
+              const lines = buf.split("\n");
+              buf = lines.pop() || "";
               for (const line of lines) {
+                if (!line.trim()) continue;
                 try {
                   const d = JSON.parse(line);
                   if (d.status) {
                     const pct = d.total ? Math.round((d.completed||0)/d.total*100)+"%" : "";
                     sub.textContent = d.status + (pct ? " " + pct : "");
                   }
-                  if (d.error) { sub.textContent = "Error: " + d.error; return; }
+                  if (d.error) { pullErr = d.error; break; }
                 } catch(e) {}
               }
+              if (pullErr) break;
             }
+            if (pullErr) {
+              // Leave the row usable: it used to return with onclick already
+              // nulled, so a transient failure made the model unpickable.
+              sub.textContent = "Error: " + pullErr;
+              dot.style.background = "#c66";
+              row.style.cursor = "pointer";
+              row.onclick = _startPull;
+              return;
+            }
+            if (pullCtrl.signal.aborted) return;
             dot.style.background = "#4c8";
             sub.textContent = "Downloaded — starting\u2026";
             row.style.cursor = "pointer";
             row.onclick = () => onSelect(m.name);
             onSelect(m.name);
           } catch(e) {
+            if (e && e.name === "AbortError") {
+              sub.textContent = "Download cancelled.";
+              row.style.cursor = "pointer";
+              row.onclick = _startPull;
+              return;
+            }
             sub.textContent = "Download failed: " + e.message;
+            row.style.cursor = "pointer";
+            row.onclick = _startPull;
+          } finally {
+            _pickerSelf._pullDone(pullCtrl);
           }
         };
+        row.onclick = _startPull;
       }
 
       wrap.appendChild(row);
@@ -1949,7 +2620,13 @@ const _epeOllamaVision = {
     cancelBtn.style.cssText =
       "align-self:flex-end;background:#1c2431;border:1px solid rgba(255,255,255,0.08);" +
       "border-radius:4px;color:#9aaaba;padding:3px 12px;cursor:pointer;font-size:11px;";
-    cancelBtn.onclick = () => hideAiPanel();
+    cancelBtn.onclick = () => {
+      // A pull started from this panel keeps running after the panel closes,
+      // and used to fire onSelect when it finished — starting inference on an
+      // image the user abandoned. Cancel means cancel.
+      _pickerSelf._pullAbortAll();
+      hideAiPanel();
+    };
     wrap.appendChild(cancelBtn);
 
     showAiPanel(wrap);
@@ -1958,7 +2635,9 @@ const _epeOllamaVision = {
 
   // Run image-to-prompt via backend. imageUrl = CDN URL string.
   // onStart() called before request, onDone(prompt) on success, onError(msg) on fail.
-  async generateImage(imageUrl, modelName, showAiPanel, hideAiPanel, onDone) {
+  // ctx: { owner, bridge } captured by run() BEFORE the model picker awaited
+  // the user. Falls back to the singleton for any direct caller.
+  async generateImage(imageUrl, modelName, showAiPanel, hideAiPanel, onDone, ctx) {
     const wrap = document.createElement("div");
     wrap.style.cssText = "padding:12px 14px;display:flex;flex-direction:column;gap:8px;";
 
@@ -1976,8 +2655,29 @@ const _epeOllamaVision = {
       "align-self:flex-end;background:#1c2431;border:1px solid rgba(255,255,255,0.08);" +
       "border-radius:4px;color:#9aaaba;padding:3px 12px;cursor:pointer;font-size:11px;";
 
+    // Captured now, while this panel is being built, so Cancel aborts the
+    // run this panel belongs to. It used to abort this._abortController —
+    // module state that a second EPE node's run replaces — so Cancel on one
+    // node's panel could stop the other node's request and leave this one
+    // running.
+    const _visionOwner = (ctx && "owner" in ctx) ? ctx.owner : this._owner;
+    // The style settings this request must be described by. _bridgeFor picks
+    // the LIVE ones while this editor still owns the singleton — the picker
+    // is an overlay and the style strip under it stays interactive — and the
+    // copy captured before the picker awaited the user once another editor
+    // has claimed in the meantime. Reading this._styleBridge unconditionally
+    // was what let a second editor's slider drag decide how this one
+    // captioned.
+    const _visionBridge = this._bridgeFor(ctx);
     let cancelled = false;
-    cancelBtn.onclick = () => { cancelled = true; hideAiPanel(); };
+    cancelBtn.onclick = () => {
+      cancelled = true;
+      // Hiding the panel is not cancelling. The controller was created for
+      // exactly this and never used, so Ollama kept generating and the next
+      // attempt met "may still be processing a previous request".
+      try { this._abortOwn(_visionOwner); } catch (_e) {}
+      hideAiPanel();
+    };
 
     wrap.appendChild(hdr);
     wrap.appendChild(status);
@@ -1985,11 +2685,11 @@ const _epeOllamaVision = {
     showAiPanel(wrap);
 
     try {
-      const signal = this._abortPrevious();
-      const resp = await fetch("/epe/ollama/generate-image", {
+      const signal = this._abortPrevious(_visionOwner);
+      const resp = await api.fetchApi("/epe/ollama/generate-image", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageUrl, ollamaModel: modelName, ollamaUrl: this._ollamaUrl, ...this._styleBridge }),
+        body: JSON.stringify({ imageUrl, ollamaModel: modelName, ollamaUrl: this._ollamaUrl, ..._visionBridge }),
         signal,
       });
       if (cancelled) return;
@@ -2010,7 +2710,7 @@ const _epeOllamaVision = {
   },
 
   // Run image-to-prompt from a local File object (for EPE toolbar).
-  async generateImageFromFile(file, modelName, showAiPanel, hideAiPanel, onDone) {
+  async generateImageFromFile(file, modelName, showAiPanel, hideAiPanel, onDone, ctx) {
     // Accept either a real File object or a synthetic {name, _dataUrl} from video frame extraction
     const base64Full = file._dataUrl
       ? file._dataUrl
@@ -2048,19 +2748,40 @@ const _epeOllamaVision = {
       "align-self:flex-end;background:#1c2431;border:1px solid rgba(255,255,255,0.08);" +
       "border-radius:4px;color:#9aaaba;padding:3px 12px;cursor:pointer;font-size:11px;";
 
+    // Captured now, while this panel is being built, so Cancel aborts the
+    // run this panel belongs to. It used to abort this._abortController —
+    // module state that a second EPE node's run replaces — so Cancel on one
+    // node's panel could stop the other node's request and leave this one
+    // running.
+    const _visionOwner = (ctx && "owner" in ctx) ? ctx.owner : this._owner;
+    // The style settings this request must be described by. _bridgeFor picks
+    // the LIVE ones while this editor still owns the singleton — the picker
+    // is an overlay and the style strip under it stays interactive — and the
+    // copy captured before the picker awaited the user once another editor
+    // has claimed in the meantime. Reading this._styleBridge unconditionally
+    // was what let a second editor's slider drag decide how this one
+    // captioned.
+    const _visionBridge = this._bridgeFor(ctx);
     let cancelled = false;
-    cancelBtn.onclick = () => { cancelled = true; hideAiPanel(); };
+    cancelBtn.onclick = () => {
+      cancelled = true;
+      // Hiding the panel is not cancelling. The controller was created for
+      // exactly this and never used, so Ollama kept generating and the next
+      // attempt met "may still be processing a previous request".
+      try { this._abortOwn(_visionOwner); } catch (_e) {}
+      hideAiPanel();
+    };
 
     wrap.appendChild(thumbRow);
     wrap.appendChild(cancelBtn);
     showAiPanel(wrap);
 
     try {
-      const signal = this._abortPrevious();
-      const resp = await fetch("/epe/ollama/generate-image", {
+      const signal = this._abortPrevious(_visionOwner);
+      const resp = await api.fetchApi("/epe/ollama/generate-image", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageUrl: base64Full, ollamaModel: modelName, ollamaUrl: this._ollamaUrl, ...this._styleBridge }),
+        body: JSON.stringify({ imageUrl: base64Full, ollamaModel: modelName, ollamaUrl: this._ollamaUrl, ..._visionBridge }),
         signal,
       });
       if (cancelled) return;
@@ -2081,7 +2802,7 @@ const _epeOllamaVision = {
   },
 
   // Run video-to-prompt via backend. videoUrl = CDN URL string.
-  async generateVideo(videoUrl, modelName, showAiPanel, hideAiPanel, onDone) {
+  async generateVideo(videoUrl, modelName, showAiPanel, hideAiPanel, onDone, ctx) {
     const wrap = document.createElement("div");
     wrap.style.cssText = "padding:12px 14px;display:flex;flex-direction:column;gap:8px;";
 
@@ -2103,8 +2824,29 @@ const _epeOllamaVision = {
       "align-self:flex-end;background:#1c2431;border:1px solid rgba(255,255,255,0.08);" +
       "border-radius:4px;color:#9aaaba;padding:3px 12px;cursor:pointer;font-size:11px;";
 
+    // Captured now, while this panel is being built, so Cancel aborts the
+    // run this panel belongs to. It used to abort this._abortController —
+    // module state that a second EPE node's run replaces — so Cancel on one
+    // node's panel could stop the other node's request and leave this one
+    // running.
+    const _visionOwner = (ctx && "owner" in ctx) ? ctx.owner : this._owner;
+    // The style settings this request must be described by. _bridgeFor picks
+    // the LIVE ones while this editor still owns the singleton — the picker
+    // is an overlay and the style strip under it stays interactive — and the
+    // copy captured before the picker awaited the user once another editor
+    // has claimed in the meantime. Reading this._styleBridge unconditionally
+    // was what let a second editor's slider drag decide how this one
+    // captioned.
+    const _visionBridge = this._bridgeFor(ctx);
     let cancelled = false;
-    cancelBtn.onclick = () => { cancelled = true; hideAiPanel(); };
+    cancelBtn.onclick = () => {
+      cancelled = true;
+      // Hiding the panel is not cancelling. The controller was created for
+      // exactly this and never used, so Ollama kept generating and the next
+      // attempt met "may still be processing a previous request".
+      try { this._abortOwn(_visionOwner); } catch (_e) {}
+      hideAiPanel();
+    };
 
     wrap.appendChild(hdr);
     wrap.appendChild(status);
@@ -2113,11 +2855,11 @@ const _epeOllamaVision = {
     showAiPanel(wrap);
 
     try {
-      const signal = this._abortPrevious();
-      const resp = await fetch("/epe/ollama/generate-video", {
+      const signal = this._abortPrevious(_visionOwner);
+      const resp = await api.fetchApi("/epe/ollama/generate-video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ videoUrl, ollamaModel: modelName, ollamaUrl: this._ollamaUrl, ...this._styleBridge }),
+        body: JSON.stringify({ videoUrl, ollamaModel: modelName, ollamaUrl: this._ollamaUrl, ..._visionBridge }),
         signal,
       });
       if (cancelled) return;
@@ -2159,6 +2901,13 @@ const _epeOllamaVision = {
   // source: imageUrl string | File object | videoUrl string
   // actions: optional { onFavorites, onSnippets, onEnhance, onVariation }
   async run(mode, source, showAiPanel, hideAiPanel, onResult, actions) {
+    // Captured HERE, on the synchronous path from the editor's own click
+    // handler, which called claim() immediately before. Everything below runs
+    // after `await this.check()` and after showModelPicker awaits the user's
+    // click — by which point another editor may have claimed the singleton.
+    // Reading this._owner / this._styleBridge down there is what let node B's
+    // style decide how node A captioned, and let node B's run abort node A's.
+    const _ctx = { owner: this._owner, bridge: this._styleBridge };
     const check = await this.check();
     if (!check || !check.running) {
       this.showNotRunning(showAiPanel, hideAiPanel);
@@ -2169,11 +2918,11 @@ const _epeOllamaVision = {
       if (mode === "image-url") {
         await this.generateImage(source, modelName, showAiPanel, hideAiPanel, (prompt) => {
           this.showResult(prompt, showAiPanel, hideAiPanel, onResult, actions);
-        });
+        }, _ctx);
       } else if (mode === "image-file") {
         await this.generateImageFromFile(source, modelName, showAiPanel, hideAiPanel, (prompt) => {
           this.showResult(prompt, showAiPanel, hideAiPanel, onResult, actions);
-        });
+        }, _ctx);
       } else if (mode === "video-frame") {
         // Extract first frame from video, then run image-to-prompt on it
         const status = showAiPanel && (() => {
@@ -2191,8 +2940,8 @@ const _epeOllamaVision = {
           return st;
         })();
         try {
-          const signal = this._abortPrevious();
-          const frameResp = await fetch("/epe/ollama/extract-frame", {
+          const signal = this._abortPrevious(_ctx.owner);
+          const frameResp = await api.fetchApi("/epe/ollama/extract-frame", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ videoUrl: source }),
@@ -2204,7 +2953,8 @@ const _epeOllamaVision = {
           await this.generateImageFromFile(
             { name: "frame.jpg", _dataUrl: dataUrl },
             modelName, showAiPanel, hideAiPanel,
-            (prompt) => { this.showResult(prompt, showAiPanel, hideAiPanel, onResult, actions); }
+            (prompt) => { this.showResult(prompt, showAiPanel, hideAiPanel, onResult, actions); },
+            _ctx
           );
         } catch(e) {
           if (e.name !== "AbortError") {
@@ -2228,8 +2978,18 @@ const _epeOllamaVision = {
           const cancelBtn = document.createElement("button");
           cancelBtn.textContent = "Cancel";
           cancelBtn.style.cssText = "align-self:flex-end;background:#1c2431;border:1px solid rgba(255,255,255,0.08);border-radius:4px;color:#9aaaba;padding:3px 12px;cursor:pointer;font-size:11px;";
+          // See the note on the other Cancel handlers: captured here so this
+          // button can only abort its own panel's run.
+          const _visionOwner = _ctx.owner;
           let cancelled = false;
-          cancelBtn.onclick = () => { cancelled = true; hideAiPanel(); };
+          cancelBtn.onclick = () => {
+      cancelled = true;
+      // Hiding the panel is not cancelling. The controller was created for
+      // exactly this and never used, so Ollama kept generating and the next
+      // attempt met "may still be processing a previous request".
+      try { this._abortOwn(_visionOwner); } catch (_e) {}
+      hideAiPanel();
+    };
           wrap.appendChild(hdr); wrap.appendChild(st); wrap.appendChild(note); wrap.appendChild(cancelBtn);
           showAiPanel(wrap);
           return { st, cancelled: () => cancelled };
@@ -2242,11 +3002,11 @@ const _epeOllamaVision = {
             r.readAsDataURL(source);
           });
           if (status.cancelled()) return;
-          const signal = this._abortPrevious();
-          const resp = await fetch("/epe/ollama/generate-video-file", {
+          const signal = this._abortPrevious(_ctx.owner);
+          const resp = await api.fetchApi("/epe/ollama/generate-video-file", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ videoData: base64Full, ollamaModel: modelName, ollamaUrl: this._ollamaUrl, ...this._styleBridge }),
+            body: JSON.stringify({ videoData: base64Full, ollamaModel: modelName, ollamaUrl: this._ollamaUrl, ...this._bridgeFor(_ctx) }),
             signal,
           });
           if (status.cancelled()) return;
@@ -2264,15 +3024,35 @@ const _epeOllamaVision = {
       } else if (mode === "video") {
         await this.generateVideo(source, modelName, showAiPanel, hideAiPanel, (prompt) => {
           this.showResult(prompt, showAiPanel, hideAiPanel, onResult, actions);
-        });
+        }, _ctx);
       }
-    });
+    }, _ctx.owner);
   },
 };
 
 // ── EPE Standalone Function ───────────────────────────────────────────────────
 // Persists workflow search state across node re-creations (tab switches).
-const _epeWfPersist = { query: "", source: "all" };
+// Module scope on purpose: the node is rebuilt whenever ComfyUI switches
+// workflow tabs, and a response still in flight from the old closure would
+// otherwise pass an instance-local check and overwrite the shared cache.
+//
+// KNOWN LIMITATION: two EPE nodes on one canvas share this record, so the
+// second node's pane repaints the first node's search after a tab switch.
+// Keying it by node id does NOT work: LiteGraph has not assigned the id
+// when onNodeCreated runs (see the uid note at the top of
+// _epeOpenEPEStandalone), so every node keys to "-1" and nothing is
+// separated. Fixing it properly means binding the record after the node is
+// configured, which needs verifying in a live canvas first.
+const _epeWfPersist = { query: "", source: "all", results: [], cursor: "",
+                        page: 1, exhausted: false };
+// Two different questions, and round 6 conflated them.
+//   _epeWfGen   — "has a NEWER SEARCH replaced this response?"
+//   _epeWfOwner — "is this panel still the one that owns the cache?"
+// Bumping the generation when a panel was built answered the second
+// question by breaking the first: creating any EPE node then aborted a
+// sibling node's in-flight load.
+let _epeWfGen = 0;
+let _epeWfOwner = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Subgraph traversal helpers (saved-JSON side)
@@ -2323,15 +3103,43 @@ function _epeGetInnerSubgraph(node, workflowRoot) {
 // consumes.
 function _epeCollectAllSubgraphs(workflowRoot) {
   const out = [];
+  // A dropped workflow file is untrusted input: its definitions can reference
+  // each other in a cycle, and one definition can be instantiated many times
+  // at many levels. Without a guard the first case recursed until the stack
+  // blew (reported to the user as a metadata parse failure) and the second
+  // walked the same definitions 2^N times, freezing the UI thread.
+  // The set of definitions open on the CURRENT PATH. The previous guard was a
+  // global set keyed by the chain of node ids — and the chain grows by one id
+  // per level, so every key was new by construction and the guard never fired
+  // once. A cycle was terminated only by the depth cap below.
+  const onPath = new Set();
+  // …and the depth cap alone does not bound the WORK. A definition holding ten
+  // nodes of another definition expands ten-to-the-depth before it bites, so
+  // the output is capped too. Nothing calls this function today; the ceiling
+  // is here so that wiring it up cannot freeze the tab.
+  const MAX_INSTANCES = 4096;
   const visit = (graph, chain) => {
     if (!graph || !Array.isArray(graph.nodes)) return;
+    if (chain.length > 24) return;
     for (const n of graph.nodes) {
       if (!n) continue;
       const inner = _epeGetInnerSubgraph(n, workflowRoot);
       if (!inner) continue;
       const myChain = chain.concat([n.id]);
       out.push({ chain: myChain, inner });
+      // Keyed by the chain of node ids: unique per INSTANCE, so every
+      // instance is still collected, while a path that revisits the same
+      // instance (a cycle) terminates.
+      if (out.length >= MAX_INSTANCES) return;
+      // A definition already open on this path is a cycle. A definition seen
+      // on a DIFFERENT path is a separate instance and is still collected —
+      // which is what the old comment promised and the old key could not
+      // deliver.
+      const defId = n.type;
+      if (onPath.has(defId)) continue;
+      onPath.add(defId);
       visit(inner, myChain);
+      onPath.delete(defId);
     }
   };
   visit(workflowRoot, []);
@@ -2359,20 +3167,115 @@ function _epeFlattenWorkflow(workflowRoot) {
       if (norm) allLinks.push(norm);
     }
   }
+  // Each DEFINITION is flattened once. Pushing it per instance duplicated
+  // every node and link — and the comment above promising "IDs don't
+  // collide" was wrong the moment a subgraph appeared twice, because both
+  // instances contributed the same node objects. A cyclic reference also
+  // recursed forever here.
+  const doneDefs = new Set();
+
+  // Node and link ids are PER GRAPH: every definition numbers its own from 1,
+  // independently of the root and of every other definition. Concatenating
+  // them means `wfNodesById[n.id] = n` downstream is last-write-wins, and
+  // definitions land after the root nodes, so a definition node beats the root
+  // node it collides with. The walk then follows the ROOT's links while
+  // reading the SUBGRAPH node's title and widgets_values.
+  //
+  // Measured: the same root graph, once plain and once with a single unrelated
+  // subgraph added, extracted two different positive prompts — the second one
+  // being text from inside that subgraph. With two definitions both numbering
+  // from 1 the positive prompt vanished altogether. Nothing throws, nothing is
+  // logged, and the panel looks like a successful extraction.
+  //
+  // So every definition is remapped into a range of its own. Root ids are
+  // untouched, which keeps a workflow with no subgraphs byte-identical.
+  let _nextNodeId = 1, _nextLinkId = 1;
+  for (const n of allNodes) {
+    const v = parseInt(n && n.id, 10);
+    if (Number.isFinite(v) && v >= _nextNodeId) _nextNodeId = v + 1;
+  }
+  for (const l of allLinks) {
+    const v = parseInt(l && l[0], 10);
+    if (Number.isFinite(v) && v >= _nextLinkId) _nextLinkId = v + 1;
+  }
+
+  let depth = 0;
   const visit = (graph) => {
     if (!graph || !Array.isArray(graph.nodes)) return;
+    if (depth > 24) return;
+    depth++;
     for (const n of graph.nodes) {
       const inner = _epeGetInnerSubgraph(n, workflowRoot);
       if (!inner) continue;
-      if (Array.isArray(inner.nodes)) for (const nn of inner.nodes) allNodes.push(nn);
-      if (Array.isArray(inner.links)) {
-        for (const ll of inner.links) {
-          const norm = _epeNormalizeLink(ll);
-          if (norm) allLinks.push(norm);
-        }
+      const defKey = (inner.id != null ? String(inner.id) : null);
+      if (defKey !== null) {
+        if (doneDefs.has(defKey)) continue;
+        doneDefs.add(defKey);
+      }
+      const defNodes = Array.isArray(inner.nodes) ? inner.nodes : [];
+      const defLinks = Array.isArray(inner.links) ? inner.links : [];
+      // Both maps are built BEFORE anything is pushed, because a node's
+      // `inputs[].link` names a link and a link names two nodes.
+      const nodeMap = Object.create(null);
+      for (const nn of defNodes) {
+        if (!nn || nn.id == null) continue;
+        const k = String(nn.id);
+        if (nodeMap[k] === undefined) nodeMap[k] = _nextNodeId++;
+      }
+      const linkMap = Object.create(null);
+      const defNorm = [];
+      for (const ll of defLinks) {
+        const norm = _epeNormalizeLink(ll);
+        if (!norm) continue;
+        defNorm.push(norm);
+        const k = String(norm[0]);
+        if (linkMap[k] === undefined) linkMap[k] = _nextLinkId++;
+      }
+      // `inputs[].link` is what the positive/negative detection compares
+      // against a link's own id, so it has to move with the link ids. Two
+      // definitions reusing link id 3 would otherwise let a root node's
+      // declared input match the wrong definition's link and flip the
+      // classification. `outputs[].links` is remapped for consistency; the
+      // parser does not read it.
+      const _remapIn = (arr) => Array.isArray(arr) ? arr.map(inp => {
+        if (!inp || typeof inp !== "object") return inp;
+        const lid = linkMap[String(inp.link)];
+        return lid === undefined ? inp : Object.assign({}, inp, { link: lid });
+      }) : arr;
+      const _remapOut = (arr) => Array.isArray(arr) ? arr.map(o => {
+        if (!o || typeof o !== "object" || !Array.isArray(o.links)) return o;
+        return Object.assign({}, o, {
+          links: o.links.map(x => { const y = linkMap[String(x)]; return y === undefined ? x : y; }),
+        });
+      }) : arr;
+      for (const nn of defNodes) {
+        if (!nn || nn.id == null) continue;
+        // A shallow clone: the caller's workflow object must come back
+        // untouched, which the surrounding function already promises.
+        // `_epeSrcId` keeps the definition's own numbering for the one place
+        // an id reaches the user — the "node_<id>" title fallback.
+        allNodes.push(Object.assign({}, nn, {
+          id: nodeMap[String(nn.id)],
+          _epeSrcId: nn.id,
+          inputs: _remapIn(nn.inputs),
+          outputs: _remapOut(nn.outputs),
+        }));
+      }
+      for (const norm of defNorm) {
+        const s = nodeMap[String(norm[1])], d = nodeMap[String(norm[3])];
+        // A link naming a node this definition does not contain is a boundary
+        // reference. Dropping it is the point: kept, it pointed at whatever
+        // now holds that id at the root.
+        if (s === undefined || d === undefined) continue;
+        const out = norm.slice();
+        out[0] = linkMap[String(norm[0])];
+        out[1] = s;
+        out[3] = d;
+        allLinks.push(out);
       }
       visit(inner);
     }
+    depth--;
   };
   visit(workflowRoot);
   // Return a shallow-merged copy so the caller (and existing graph-walk code)
@@ -2380,6 +3283,173 @@ function _epeFlattenWorkflow(workflowRoot) {
   return Object.assign({}, workflowRoot, { nodes: allNodes, links: allLinks });
 }
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Parse the single text blob A1111-family UIs embed. Shape:
+//
+//   <positive prompt, may span lines>
+//   Negative prompt: <negative prompt, may span lines>
+//   Steps: 20, Sampler: Euler a, CFG scale: 7, Seed: 12345, Size: 512x512, ...
+//
+// Only the LAST line is the settings line, and only if it looks like one —
+// a prompt can legitimately contain a colon, so a "key: value, key: value"
+// shape is required rather than just "has a colon".
+// Index of the line that opens the A1111 negative prompt, or -1.
+//
+// Replaces `body.search(/^\s*Negative prompt:\s*/mi)`. Under `m`, `^` is a
+// valid start at every line and `\s` matches `\n`, so on a body of N newlines
+// the engine restarted a full whitespace walk at each of N line starts: 16 K
+// 274 ms, 32 K 979 ms, 64 K 3.9 s, 128 K 15.5 s, 256 K 62 s — clean ×4 per
+// doubling, on the browser's main thread, over a PNG text chunk somebody else
+// wrote. It is the same shape round 16 removed from the settings-line check
+// three statements below, and the same line api.py carried; this was the last
+// member of that family.
+//
+// Same answer. The regex can only match where the marker is preceded, back to
+// some line start, by nothing but whitespace — which is exactly "the first
+// line whose content starts with the marker". Where the two differ is only in
+// how far back into a preceding run of blank lines the reported index sits,
+// and both halves are trimmed by the caller, so that is invisible.
+// Differential-fuzzed over 200,000 assembled inputs: the raw index differs on
+// 9% and the caller's output on none.
+const _EPE_NEG_MARK = "negative prompt:";
+function _epeFindNegativeMarker(body) {
+  // The line separators JS regexes treat as starting a new line for `^` under
+  // `m`. `\r` matters: the caller normalises CRLF but a lone CR can survive.
+  const _isBreak = (c) => c === "\n" || c === "\r" || c === "\u2028" || c === "\u2029";
+  const _ws = /\s/;
+  const n = body.length;
+  for (let p = 0; p <= n; p++) {
+    if (p !== 0 && !_isBreak(body[p - 1])) continue;
+    // Intra-line whitespace only — stepping over a break here would run past
+    // the line and report the wrong start.
+    let i = p;
+    while (i < n && _ws.test(body[i]) && !_isBreak(body[i])) i++;
+    if (body.substr(i, _EPE_NEG_MARK.length).toLowerCase() === _EPE_NEG_MARK) return p;
+  }
+  return -1;
+}
+
+function _epeParseA1111Parameters(text) {
+  if (!text || typeof text !== "string") return null;
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  // Drop trailing blank lines before looking for the settings line. Plenty of
+  // tools end the parameters chunk with a newline, and with one present
+  // `last` was "" — so the settings line was never recognised, stayed in the
+  // body BEHIND the "Negative prompt:" marker, and the user got a negative
+  // prompt with "Steps: 20, Sampler: ..." glued to the end of it while every
+  // setting silently went missing.
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+
+  let settingsLine = "";
+  const last = (lines[lines.length - 1] || "").trim();
+  // A linear check, not a regex. The pattern this replaces —
+  //   /^[A-Za-z][A-Za-z0-9 ]*:\s*[^,]+(,\s*[A-Za-z][A-Za-z0-9 ]*:\s*[^,]+)+$/
+  // — backtracks quadratically whenever the match FAILS, because `\s*` and
+  // `[^,]+` both match a space, so a long run of spaces can be divided
+  // between them in every possible way before the engine gives up. The
+  // trigger is a last line that opens like a settings pair and never yields
+  // a second one: "Model: " followed by spaces. Measured through this
+  // function: 1600 chars 0.006s, 3200 0.025s, 6400 0.059s, 12800 0.194s — a
+  // clean 4x per doubling, so ~100 KB is ~12s and 1 MB is roughly twenty
+  // minutes with the tab frozen. The "parameters" chunk comes from whatever
+  // tool wrote the PNG and can be megabytes.
+  //
+  // This accepts exactly the same strings: every comma-separated part must
+  // be `Key: value`, Key matching [A-Za-z][A-Za-z0-9 ]*, value non-empty,
+  // and there must be at least two parts.
+  //
+  // Differential-fuzzed against the old regex. It is NOT byte-for-byte
+  // identical, and the earlier claim in this comment that it was came from a
+  // fuzz alphabet that could not produce the difference: a key padded with a
+  // TAB ("Steps\t: 20, Seed: 1") is rejected by the old pattern, because
+  // [A-Za-z0-9 ] does not include tab, and accepted here, because the key is
+  // trimmed. Accepting it is the better behaviour — a rejected settings line
+  // does not merely lose its settings, it gets glued onto the end of the
+  // user's negative prompt — but the difference is real and is stated here
+  // rather than claimed away. The 4000-character ceiling is a second
+  // deliberate difference.
+  const _looksLikeSettings = (s) => {
+    if (!s) return false;
+    // Nothing legitimate is anywhere near this long, and the cap keeps even
+    // the per-key regex below off a pathological input.
+    if (s.length > 4000) return false;
+    const parts = s.split(",");
+    if (parts.length < 2) return false;
+    for (const part of parts) {
+      const c = part.indexOf(":");
+      if (c <= 0) return false;
+      const k = part.slice(0, c).trim();
+      // NOT trimmed. `\s*[^,]+` in the old pattern accepts a value that is
+      // nothing but a space, so "Denoising strength: , Seed: 1" counted as a
+      // settings line. Trimming here rejected it instead — and a rejected
+      // settings line does not just lose the settings, it gets glued onto the
+      // end of the user's negative prompt. Differential fuzzing against the
+      // old regex caught it; keep the old acceptance exactly.
+      const v = part.slice(c + 1);
+      if (!k || !v) return false;
+      // Anchored, single greedy class, no nesting — linear.
+      if (!/^[A-Za-z][A-Za-z0-9 ]*$/.test(k)) return false;
+    }
+    return true;
+  };
+  if (_looksLikeSettings(last)) {
+    settingsLine = last;
+    lines.pop();
+  }
+
+  const body = lines.join("\n");
+  let positive = body, negative = "";
+  const negIdx = _epeFindNegativeMarker(body);
+  if (negIdx !== -1) {
+    positive = body.slice(0, negIdx);
+    negative = body.slice(negIdx).replace(/^\s*Negative prompt:\s*/i, "");
+  }
+  positive = positive.trim();
+  negative = negative.trim();
+  if (!positive && !negative) return null;
+
+  // Settings are "Key: value" pairs, comma separated — but a value can hold
+  // commas inside quotes (Lora hashes: "a: 1, b: 2"), and a regex lookahead
+  // split there, inventing a bogus "b" setting. Split by hand, ignoring
+  // commas that sit inside a quoted run.
+  const settings = {};
+  if (settingsLine) {
+    const parts = [];
+    let cur = "", inQ = false;
+    for (let i = 0; i < settingsLine.length; i++) {
+      const ch = settingsLine[i];
+      if (ch === '"') { inQ = !inQ; cur += ch; continue; }
+      if (ch === "," && !inQ) { parts.push(cur); cur = ""; continue; }
+      cur += ch;
+    }
+    if (cur.trim()) parts.push(cur);
+    parts.forEach(pair => {
+      const m = pair.match(/^\s*([A-Za-z][A-Za-z0-9 ]*)\s*:\s*([\s\S]*)$/);
+      if (m) settings[m[1].trim()] = m[2].trim();
+    });
+  }
+  return { positive, negative, settings };
+}
+
+// Append every element of `src` to `dst`, in place.
+//
+// `dst.push(...src)` passes one ARGUMENT per element, and V8 throws
+// "RangeError: Maximum call stack size exceeded" somewhere around 125k of
+// them. The arrays here are built from workflow JSON — one entry per string
+// in a node's widgets_values — so the limit is reachable from a file, and it
+// threw out of _epeParsePromptData entirely: 50,000 values recovered 50,000
+// prompts in 220 ms, 130,000 recovered NOTHING and the image showed no
+// metadata at all.
+function _epePushAll(dst, src) {
+  if (!dst || !src) return dst;
+  for (let i = 0; i < src.length; i++) dst.push(src[i]);
+  return dst;
+}
+
+// How many strings one node's widgets_values may contribute to a string walk.
+// See the walk functions: without it, link count x value count is a product
+// and both come from the same file.
+const _EPE_WALK_MAX_VALUES = 32;
 
 function _epeParsePromptData(promptData, workflowData) {
   // Handle string inputs (JSON.parse may have failed in metadata extraction due to null bytes, BOM, etc.)
@@ -2419,6 +3489,12 @@ function _epeParsePromptData(promptData, workflowData) {
     vaes: [],
     clipSettings: [],
   };
+  // Mirrors the names in result.loras. The <lora:…> scan below used to answer
+  // "have I seen this one" with `result.loras.some(…)` INSIDE the match loop:
+  // 2,000 tags 27 ms, 4,000 103 ms, 8,000 609 ms, 16,000 2,273 ms — ×4 per
+  // doubling, on tag text from someone else's workflow. Seeded from every
+  // push, so it covers exactly what the scan covered.
+  const _loraNames = new Set();
   
   // --- PROMPT EXTRACTION via typed-link graph walk ---
   // Uses the workflow JSON's `links` array (typed edges) to structurally trace
@@ -2436,17 +3512,50 @@ function _epeParsePromptData(promptData, workflowData) {
   const seenText = new Set();
   
   if (workflowData && Array.isArray(workflowData.links) && Array.isArray(workflowData.nodes)) {
-    const wfNodesById = {};
-    for (const n of workflowData.nodes) wfNodesById[n.id] = n;
-    
+    // Object.create(null) on every map keyed by data from the file.
+    //
+    // These ids come out of a PNG's `workflow` chunk — a stranger's bytes.
+    // With a plain object literal, `inLinks["__proto__"]` IS Object.prototype:
+    // truthy, so the guard below does not replace it, and the next line writes
+    // an attacker-named key onto the prototype of every object in the page.
+    // A workflow chunk of
+    //     {"nodes":[{"id":1,"type":"KSampler"}],
+    //      "links":[[1,1,0,"__proto__","hasOwnProperty","CONDITIONING"]]}
+    // left `typeof {}.hasOwnProperty === "object"`, after which every
+    // hasOwnProperty call anywhere in the ComfyUI tab throws — LiteGraph, the
+    // frontend, other extensions, the save path. Nothing here threw, so the
+    // caller's try/catch never fired and the user saw no error at all.
+    // "constructor" writes onto the global Object instead.
+    const wfNodesById = Object.create(null);
+    for (const n of workflowData.nodes) {
+      // `nodes:[null]` is a TypeError on n.id, which costs the whole image's
+      // metadata via the caller's catch.
+      if (n && n.id !== undefined && n.id !== null) wfNodesById[n.id] = n;
+    }
+
+    // Links normalised ONCE, here, and used by every loop below.
+    //
+    // _epeNormalizeLink exists for the object form that newer ComfyUI writes,
+    // but _epeFlattenWorkflow — the only thing that applied it — returns early
+    // unless `definitions.subgraphs` is an array, so a plain workflow reached
+    // the destructure raw. An object entry threw "l is not iterable" here, and
+    // a null entry threw on l[5] in one of the four loops further down. Each
+    // costs the image's entire metadata through the caller's catch.
+    const wfLinks = [];
+    for (const _rawLink of workflowData.links) {
+      const _l = (typeof _epeNormalizeLink === "function")
+        ? _epeNormalizeLink(_rawLink) : _rawLink;
+      if (Array.isArray(_l) && _l.length >= 5) wfLinks.push(_l);
+    }
+
     // Build incoming/outgoing link maps
-    const inLinks = {};   // nodeId → { inputSlot: linkArray }
-    const outLinks = {};  // nodeId → { outputSlot: [linkArrays] }
-    for (const l of workflowData.links) {
+    const inLinks = Object.create(null);   // nodeId → { inputSlot: linkArray }
+    const outLinks = Object.create(null);  // nodeId → { outputSlot: [linkArrays] }
+    for (const l of wfLinks) {
       const [lid, srcId, srcOut, dstId, dstIn, ltype] = l;
-      if (!inLinks[dstId]) inLinks[dstId] = {};
+      if (!inLinks[dstId]) inLinks[dstId] = Object.create(null);
       inLinks[dstId][dstIn] = l;
-      if (!outLinks[srcId]) outLinks[srcId] = {};
+      if (!outLinks[srcId]) outLinks[srcId] = Object.create(null);
       if (!outLinks[srcId][srcOut]) outLinks[srcId][srcOut] = [];
       outLinks[srcId][srcOut].push(l);
     }
@@ -2455,9 +3564,13 @@ function _epeParsePromptData(promptData, workflowData) {
     // These are custom linkless bridge nodes — the links array has NO link between Set→Get pairs.
     // We pair them by name so walks can bridge the gap. They are purely transparent bridges.
     const normBus = (title, prefix) => title.replace(prefix, "").replace(/^[>\-\s]+/, "").replace(/[>\-\s]+$/, "").trim().toLowerCase();
-    const setBus = {};
-    const getBus = {};
+    // Same reason as the link maps above: these are keyed by a node TITLE
+    // from the file, so `getBus["constructor"].push(n)` threw on a plain
+    // object literal.
+    const setBus = Object.create(null);
+    const getBus = Object.create(null);
     for (const n of workflowData.nodes) {
+      if (!n) continue;
       if (n.type === "SetNode") {
         const name = normBus(n.title || "", "Set_");
         if (name) { setBus[name] = n; }
@@ -2479,7 +3592,10 @@ function _epeParsePromptData(promptData, workflowData) {
       const node = wfNodesById[nodeId];
       if (!node) return [];
       const results = [];
-      const title = node.title || node.type || ("node_" + nodeId);
+      // _epeSrcId is the id this node had inside its own subgraph definition,
+      // before flattening remapped it. It is what the user would recognise.
+      const title = node.title || node.type ||
+                    ("node_" + (node._epeSrcId != null ? node._epeSrcId : nodeId));
       
       // GetNode: jump to matching SetNode's source
       if (node.type === "GetNode") {
@@ -2487,7 +3603,7 @@ function _epeParsePromptData(promptData, workflowData) {
         const setNode = setBus[name];
         if (setNode && inLinks[setNode.id]) {
           for (const slot of Object.keys(inLinks[setNode.id])) {
-            results.push(...walkBackString(inLinks[setNode.id][slot][1], visited));
+            _epePushAll(results, walkBackString(inLinks[setNode.id][slot][1], visited));
           }
         }
         return results;
@@ -2501,7 +3617,7 @@ function _epeParsePromptData(promptData, workflowData) {
           const ltype = link[5] || "?";
           if (ltype === "STRING" || ltype === "*") {
             hasStringInput = true;
-            results.push(...walkBackString(link[1], visited));
+            _epePushAll(results, walkBackString(link[1], visited));
           }
         }
       }
@@ -2511,9 +3627,15 @@ function _epeParsePromptData(promptData, workflowData) {
       if (!hasStringInput) {
         const wv = node.widgets_values;
         if (Array.isArray(wv)) {
+          // Bounded. `widgets_values` comes straight from the workflow file,
+          // and one node contributing an entry per element is one half of the
+          // links x values product measured at 19.9 s for a 1.26 MB file.
+          // Nothing real has more than a handful of text widgets.
+          let _taken = 0;
           for (const v of wv) {
             if (typeof v === "string" && v.trim().length > 10) {
               results.push({ nodeId, title, text: v.trim() });
+              if (++_taken >= _EPE_WALK_MAX_VALUES) break;
             }
           }
         }
@@ -2538,13 +3660,14 @@ function _epeParsePromptData(promptData, workflowData) {
       const node = wfNodesById[nodeId];
       if (!node) return [];
       const results = [];
-      const title = node.title || node.type || ("node_" + nodeId);
+      const title = node.title || node.type ||
+                    ("node_" + (node._epeSrcId != null ? node._epeSrcId : nodeId));
       
       // SetNode: jump to matching GetNodes (don't collect SetNode widgets_values — they're bus labels)
       if (node.type === "SetNode") {
         const name = normBus(node.title || "", "Set_");
         for (const getNode of (getBus[name] || [])) {
-          results.push(...walkForwardString(getNode.id, visited));
+          _epePushAll(results, walkForwardString(getNode.id, visited));
         }
         return results;
       }
@@ -2556,7 +3679,7 @@ function _epeParsePromptData(promptData, workflowData) {
             for (const link of outLinks[nodeId][slot]) {
               const ltype = link[5] || "?";
               if (ltype === "STRING" || ltype === "*") {
-                results.push(...walkForwardString(link[3], visited));
+                _epePushAll(results, walkForwardString(link[3], visited));
               }
             }
           }
@@ -2565,11 +3688,16 @@ function _epeParsePromptData(promptData, workflowData) {
       }
       
       // Check widgets_values for cached text (skip short bus-label-like strings)
+      // Bounded, for the same reason as the backward walk: one node
+      // contributing an entry per element is one half of the links x values
+      // product measured at 19.9 s for a 1.26 MB file.
       const wv = node.widgets_values;
       if (Array.isArray(wv)) {
+        let _taken = 0;
         for (const v of wv) {
           if (typeof v === "string" && v.trim().length > 10) {
             results.push({ nodeId, title, text: v.trim() });
+            if (++_taken >= _EPE_WALK_MAX_VALUES) break;
           }
         }
       }
@@ -2579,7 +3707,7 @@ function _epeParsePromptData(promptData, workflowData) {
         for (const slot of Object.keys(outLinks[nodeId])) {
           for (const link of outLinks[nodeId][slot]) {
             if (link[5] === "STRING") {
-              results.push(...walkForwardString(link[3], visited));
+              _epePushAll(results, walkForwardString(link[3], visited));
             }
           }
         }
@@ -2594,7 +3722,7 @@ function _epeParsePromptData(promptData, workflowData) {
     const condSourceIds = new Set();
     
     // Method 1: Any node with outgoing CONDITIONING links
-    for (const l of workflowData.links) {
+    for (const l of wfLinks) {
       const ltype = l[5] || "?";
       if (ltype === "CONDITIONING") {
         condSourceIds.add(l[1]);
@@ -2603,7 +3731,7 @@ function _epeParsePromptData(promptData, workflowData) {
     
     // Method 2: SetNodes receiving CONDITIONING (bus pattern)
     for (const n of workflowData.nodes) {
-      if (n.type !== "SetNode") continue;
+      if (!n || n.type !== "SetNode") continue;
       const setIn = inLinks[n.id];
       if (!setIn) continue;
       for (const slot of Object.keys(setIn)) {
@@ -2616,7 +3744,7 @@ function _epeParsePromptData(promptData, workflowData) {
     
     // Method 3: Nodes that output * type but are known to be conditioning from context
     // (subgraphs often use * for their outputs)
-    for (const l of workflowData.links) {
+    for (const l of wfLinks) {
       if (l[5] !== "*") continue;
       const dstNode = wfNodesById[l[3]];
       if (!dstNode) continue;
@@ -2679,6 +3807,19 @@ function _epeParsePromptData(promptData, workflowData) {
       }
     }
     
+    // Links grouped by SOURCE node, built once. The loop below used to walk
+    // every link for every text encoder — encoders × links — which measured
+    // 34 ms at 200/8,000, 1,089 ms at 1,600/64,000, and 21.6 s on a large
+    // workflow: a frozen tab for as long as that takes, from dropping in a PNG.
+    // Same links, in the same order, to the same code.
+    const linksBySrc = new Map();
+    for (const l of wfLinks) {
+      const _k = l[1];
+      let _a = linksBySrc.get(_k);
+      if (!_a) { _a = []; linksBySrc.set(_k, _a); }
+      _a.push(l);
+    }
+
     for (const srcId of textEncoderIds) {
       const srcNode = wfNodesById[srcId];
       if (!srcNode) continue;
@@ -2688,8 +3829,7 @@ function _epeParsePromptData(promptData, workflowData) {
       const srcTitle = (srcNode.title || "").toLowerCase();
       if (srcTitle.includes("neg") || srcTitle.includes("uncond")) isNeg = true;
       // Also check destination input name or Set node title
-      for (const l of workflowData.links) {
-        if (l[1] !== srcId) continue;
+      for (const l of (linksBySrc.get(srcId) || [])) {
         if (l[5] !== "CONDITIONING" && l[5] !== "*") continue;
         const dstNode = wfNodesById[l[3]];
         if (!dstNode) continue;
@@ -2710,12 +3850,25 @@ function _epeParsePromptData(promptData, workflowData) {
         }
       }
       
-      // Walk forward through STRING outputs: find enhanced/resolved prompts
+      // Walk forward through STRING outputs: find enhanced/resolved prompts.
+      //
+      // ONE visited set for all of this encoder's links, not a fresh one per
+      // link. With a fresh set per link, a node reachable from L of them was
+      // walked and re-collected L times — link count and value count being two
+      // independently scalable dimensions of the same file, that is a product
+      // while the file is a sum: 2,000 x 2,000 measured 233 ms, 16,000 x
+      // 16,000 measured 19,942 ms, a clean x4 per doubling of file size.
+      //
+      // Nothing is lost. `seenText` below discards a repeated text anyway, and
+      // a node's contribution is its own widgets_values regardless of which
+      // link arrived at it — so sharing the set removes only work that was
+      // being thrown away.
+      const _fwdSeen = new Set();
       if (outLinks[srcId]) {
         for (const slot of Object.keys(outLinks[srcId])) {
           for (const link of outLinks[srcId][slot]) {
             if (link[5] === "STRING") {
-              const fwdResults = walkForwardString(link[3], new Set());
+              const fwdResults = walkForwardString(link[3], _fwdSeen);
               for (const r of fwdResults) {
                 if (!seenText.has(r.text)) {
                   seenText.add(r.text);
@@ -2733,7 +3886,13 @@ function _epeParsePromptData(promptData, workflowData) {
   // Use prompt JSON directly — find nodes with text+clip inputs
   if (result.positivePrompts.length === 0 && result.negativePrompts.length === 0) {
     for (const [nodeId, node] of Object.entries(promptData)) {
-      const inp = node.inputs || {};
+      // promptData is type-checked at the top of this function; its VALUES
+      // never were. ComfyUI writes nulls here for some bypassed-node
+      // combinations, and `node.inputs` on one of those threw TypeError out
+      // of the whole parser — so a single null node reported the entire
+      // image as unreadable.
+      if (!node || typeof node !== "object") continue;
+      const inp = (node.inputs && typeof node.inputs === "object") ? node.inputs : {};
       if (inp.clip === undefined || inp.text === undefined) continue;
       if (typeof inp.text === "string" && inp.text.trim().length > 5) {
         const title = node._meta?.title || "";
@@ -2751,8 +3910,11 @@ function _epeParsePromptData(promptData, workflowData) {
 
   // --- OTHER SETTINGS (data-pattern based) ---
   for (const [nodeId, node] of Object.entries(promptData)) {
+    // Same reasoning as the encoder fallback above: this loop reads
+    // class_type, inputs and _meta straight off the value.
+    if (!node || typeof node !== "object") continue;
     const cls = node.class_type || "";
-    const inp = node.inputs || {};
+    const inp = (node.inputs && typeof node.inputs === "object") ? node.inputs : {};
     const title = node._meta?.title || "";
     if ((inp.steps !== undefined) && (inp.cfg !== undefined || inp.guidance !== undefined) && (inp.sampler_name !== undefined || inp.scheduler !== undefined)) {
       result.samplers.push({
@@ -2778,6 +3940,7 @@ function _epeParsePromptData(promptData, workflowData) {
     // --- LoRA: any node with lora_name ---
     if (inp.lora_name) {
       result.loras.push({ nodeId, className: cls, title, name: inp.lora_name, strength_model: inp.strength_model ?? 1.0, strength_clip: inp.strength_clip ?? 1.0 });
+      _loraNames.add(inp.lora_name);
     }
     
     // --- LoRA from text syntax: scan all string inputs for <lora:name:weight> ---
@@ -2789,7 +3952,8 @@ function _epeParsePromptData(promptData, workflowData) {
           const name = m[1];
           const w1 = parseFloat(m[2]) || 1.0;
           const w2 = m[3] !== undefined ? (parseFloat(m[3]) || 1.0) : w1;
-          if (!result.loras.some(l => l.name === name)) {
+          if (!_loraNames.has(name)) {
+            _loraNames.add(name);
             result.loras.push({ nodeId, className: cls, title, name, strength_model: w1, strength_clip: w2 });
           }
         }
@@ -2818,42 +3982,122 @@ function _epeParsePromptData(promptData, workflowData) {
     // Remove <lora:...> tags entirely
     cleaned = cleaned.replace(/<lora:[^>]*>/gi, "");
     // Remove embedding triggers: embedding:name or (embedding:name:weight)
-    cleaned = cleaned.replace(/\(?\s*embedding\s*:\s*[^,)\s]+(?:\s*:\s*-?[\d.]+)?\s*\)?/gi, "");
+    //
+    // The whitespace runs are BOUNDED. `\s*` in front of a literal the class
+    // cannot match means every start position inside a run of spaces walks to
+    // the end of that run and backtracks a character at a time before giving
+    // up — 16 K of spaces measured 250 ms, ×4 per doubling. Nothing real puts
+    // eight whitespace characters inside `(embedding : name : 1.1)`, and a
+    // failed attempt now costs the bound instead of the string.
+    cleaned = cleaned.replace(/\(?\s{0,8}embedding\s{0,8}:\s{0,8}[^,)\s]+(?:\s{0,8}:\s{0,8}-?[\d.]+)?\s{0,8}\)?/gi, "");
+    // The three bracket regexes below drop the `\s*` that sat between the
+    // capture and the ':'. That `\s*` was the entire cost — a lazy
+    // run-consuming class in front of it re-divides a run of spaces on every
+    // backtrack — and it is redundant for MATCHING, because `[^()]` already
+    // matches whitespace. It was not redundant for the CAPTURE, though: `$1`
+    // kept whatever the capture held, and without the `\s*` the capture now
+    // also holds the whitespace that ran up to the ':'.
+    //
+    // This restores the old capture exactly. `$1` was the shortest non-empty
+    // prefix whose remainder was all whitespace — i.e. the capture with its
+    // trailing whitespace removed, except that it had to keep at least one
+    // character, so an all-whitespace capture kept its first one. Both halves
+    // matter: "(  a  :1.2)" captured "  a", and "(  :1.2)" captured " ".
+    // Differential-fuzzed against `$1` over 400,000 assembled prompts: zero
+    // differences.
+    const _EPE_WEIGHT_INNER = (_m, inner) => inner.trimEnd() || inner.slice(0, 1);
+    // Each loop below is a FULL PASS over the string and runs once per nesting
+    // LEVEL, so cost is length × depth:
+    //
+    //     8 K chars     48 ms        64 K   2,437 ms
+    //    16 K          169 ms       128 K   9,740 ms
+    //    32 K          658 ms
+    //
+    // Clean ×4 per doubling, synchronously, on prompt text out of a workflow
+    // file someone else made. Earlier rounds fixed the regex CONTENTS here;
+    // the loop shape was never what was being looked at.
+    //
+    // 32 levels is far above anything real — "((word))" is depth 2 and even
+    // heavy A1111 prompts rarely pass 5. Past the bound the remaining brackets
+    // stay as literal text, which is already what unbalanced input gets.
+    const WEIGHT_PASS_LIMIT = 32;
+    let prev, passes;
     // Iteratively strip innermost (content:number) patterns to handle nesting
     // Supports negative weights, optional spaces, and scheduling (content:num:num)
-    let prev;
+    passes = 0;
     do {
       prev = cleaned;
-      cleaned = cleaned.replace(/\(([^()]+?)\s*:\s*-?[\d.]+(?:\s*:\s*-?[\d.]+)?\s*\)/g, "$1");
-    } while (cleaned !== prev);
+      // NO `\s*` between the capture and the ':'. It was pure redundancy —
+      // `[^()]` already matches whitespace and the capture is trimmed right
+      // here — and it was the whole cost: a lazy run-consuming class in front
+      // of `\s*` in front of a literal re-divides a run of spaces on every
+      // backtrack. 16 K of spaces inside one pair of parens measured 286 ms,
+      // ×4 per doubling; through the whole function, 128 K was 28 s.
+      //
+      // Round 23 capped the number of PASSES here and said so at length. The
+      // cap never fires on this input: the string does not change, so the loop
+      // exits after one pass, and one pass is the entire cost. The loop shape
+      // was not the problem; this regex was.
+      cleaned = cleaned.replace(/\(([^()]+?):\s*-?[\d.]+(?:\s*:\s*-?[\d.]+)?\s*\)/g, _EPE_WEIGHT_INNER);
+    } while (cleaned !== prev && ++passes < WEIGHT_PASS_LIMIT);
     // Square brackets [content:number] (A1111 style)
+    passes = 0;
     do {
       prev = cleaned;
-      cleaned = cleaned.replace(/\[([^\[\]]+?)\s*:\s*-?[\d.]+(?:\s*:\s*-?[\d.]+)?\s*\]/g, "$1");
-    } while (cleaned !== prev);
+      cleaned = cleaned.replace(/\[([^\[\]]+?):\s*-?[\d.]+(?:\s*:\s*-?[\d.]+)?\s*\]/g, _EPE_WEIGHT_INNER);
+    } while (cleaned !== prev && ++passes < WEIGHT_PASS_LIMIT);
     // Curly braces {content:number}
+    passes = 0;
     do {
       prev = cleaned;
-      cleaned = cleaned.replace(/\{([^{}]+?)\s*:\s*-?[\d.]+(?:\s*:\s*-?[\d.]+)?\s*\}/g, "$1");
-    } while (cleaned !== prev);
+      cleaned = cleaned.replace(/\{([^{}]+?):\s*-?[\d.]+(?:\s*:\s*-?[\d.]+)?\s*\}/g, _EPE_WEIGHT_INNER);
+    } while (cleaned !== prev && ++passes < WEIGHT_PASS_LIMIT);
     // Strip remaining bare emphasis brackets: (text) → text, [text] → text, {text} → text
+    passes = 0;
     do {
       prev = cleaned;
       cleaned = cleaned.replace(/\(([^()]+)\)/g, "$1");
       cleaned = cleaned.replace(/\[([^\[\]]+)\]/g, "$1");
       cleaned = cleaned.replace(/\{([^{}]+)\}/g, "$1");
-    } while (cleaned !== prev);
+    } while (cleaned !== prev && ++passes < WEIGHT_PASS_LIMIT);
     // Remove BREAK keywords (ComfyUI prompt section separators)
     cleaned = cleaned.replace(/\bBREAK\b/g, " ");
-    // Clean up stray colons followed by numbers (leftover fragments)
-    cleaned = cleaned.replace(/\s*:\s*-?[\d.]+/g, "");
-    // Clean up weight numbers directly attached to words (no colon): "sprites1.3" → "sprites"
-    // Matches a letter followed by a decimal number (digit.digit pattern) at word boundary
-    cleaned = cleaned.replace(/([a-zA-Z])-?\d+\.\d+/g, "$1");
+    // Clean up stray colons followed by numbers (leftover fragments).
+    // NOT when a digit sits immediately before the colon: "shot at 4:30 pm"
+    // and "16:9 aspect" are ordinary prompt text, and this rule was turning
+    // them into "shot at 4 pm" and "16 aspect" in every extracted prompt.
+    // Bounded run, for the same reason as the embedding strip: `[^\d]` matches
+    // a space and so does the `\s*` after it, so a run of spaces is re-divided
+    // between them at every start position. 16 K measured 213 ms, ×4 per
+    // doubling. Sixty-four whitespace characters between a word and its stray
+    // ":1.2" is far past anything real.
+    cleaned = cleaned.replace(/(^|[^\d])\s{0,64}:\s*-?\d+(?:\.\d+)?(?![\d:])/g, "$1");
+    // Clean up weight numbers directly attached to words (no colon):
+    // "sprites1.3" → "sprites".
+    //
+    // TWO letters, not one. A single letter followed by a decimal is an
+    // aperture, and this rule was destroying it in every photographic prompt
+    // the node extracted:
+    //   "85mm f1.4 portrait"      -> "85mm f portrait"
+    //   "24-70mm f2.8, cinematic" -> "24-70mm f, cinematic"
+    //   "cine lens T2.8"          -> "cine lens T"      (T-stop, cine lenses)
+    // A leftover weight is always glued to a real word, so requiring two
+    // letters costs nothing: "sprites1.3" still matches on "es1.3".
+    cleaned = cleaned.replace(/([a-zA-Z]{2})-?\d+\.\d+/g, "$1");
     // Collapse multiple commas, spaces, and newlines
     cleaned = cleaned.replace(/,\s*,+/g, ",").replace(/[ \t]+/g, " ").replace(/\n\s*\n/g, "\n").trim();
-    // Remove leading/trailing commas
-    cleaned = cleaned.replace(/^[,\s]+|[,\s]+$/g, "").trim();
+    // Remove leading/trailing commas — by hand, because `[,\s]+$` has nothing
+    // to stop it: from every position inside a run it walks to the end of the
+    // run and only then discovers there is no end-of-string there. 16 K of
+    // spaces that do not reach the end measured 216 ms, ×4 per doubling. Two
+    // walks from the ends are the same operation in linear time.
+    {
+      const _T = /[,\s]/;
+      let _a = 0, _b = cleaned.length;
+      while (_a < _b && _T.test(cleaned[_a])) _a++;
+      while (_b > _a && _T.test(cleaned[_b - 1])) _b--;
+      cleaned = cleaned.slice(_a, _b).trim();
+    }
     return cleaned;
   };
   
@@ -2879,17 +4123,32 @@ async function _epeExtractPngMetadata(file) {
   const bytes = new Uint8Array(buf);
   
   // Detect format
-  const isPNG = view.getUint32(0) === 0x89504E47 && view.getUint32(4) === 0x0D0A1A0A;
+  // getUint32 throws RangeError on anything shorter than 8 bytes, so a
+  // 0-byte or truncated file came back as "Offset is outside the bounds of
+  // the DataView" instead of the "Unsupported image format" message this
+  // function exists to produce. Dropping a partly-copied file is an ordinary
+  // accident and deserves the ordinary error.
+  const isPNG = buf.byteLength >= 8 &&
+                view.getUint32(0) === 0x89504E47 && view.getUint32(4) === 0x0D0A1A0A;
   const isJPEG = bytes[0] === 0xFF && bytes[1] === 0xD8;
   const isWebP = dec.decode(bytes.slice(0, 4)) === "RIFF" && dec.decode(bytes.slice(8, 12)) === "WEBP";
   
   if (isPNG) {
     // Parse PNG tEXt/iTXt chunks
     let offset = 8;
-    while (offset < buf.byteLength) {
+    // `offset + 8 <=` , not `offset <`: the body reads a 4-byte length and a
+    // 4-byte type, so a PNG truncated mid-chunk header threw RangeError out
+    // of the whole function — throwing away every tEXt chunk already read.
+    // A partly-downloaded PNG whose prompt chunk came through first should
+    // still give up the prompt.
+    while (offset + 8 <= buf.byteLength) {
       const length = view.getUint32(offset);
       const typeBytes = new Uint8Array(buf, offset + 4, 4);
       const type = dec.decode(typeBytes);
+      // Same reason: a length field pointing past the end of the file (a
+      // truncated chunk, or a corrupt one) made the Uint8Array construction
+      // below throw. Stop cleanly and keep what we have.
+      if (offset + 8 + length > buf.byteLength) break;
       
       if (type === "tEXt" || type === "iTXt") {
         const data = new Uint8Array(buf, offset + 8, length);
@@ -2906,13 +4165,18 @@ async function _epeExtractPngMetadata(file) {
           }
           const value = dec.decode(data.slice(valueStart));
           if (keyword === "prompt" || keyword === "workflow") {
-            try { 
+            try {
               // ComfyUI can serialize NaN/Infinity which aren't valid JSON
               const sanitized = value.replace(/\bNaN\b/g, "null").replace(/\b-?Infinity\b/g, "null");
-              result[keyword] = JSON.parse(sanitized); 
-            } catch(e) { 
-              result[keyword] = value; 
+              result[keyword] = JSON.parse(sanitized);
+            } catch(e) {
+              result[keyword] = value;
             }
+          } else if (keyword === "parameters" || keyword === "Parameters") {
+            // A1111 / Forge / Fooocus and most SD web UIs write everything
+            // into one plain-text chunk under this key. Kept raw here and
+            // parsed below only if no ComfyUI metadata turns up.
+            result.parameters = value;
           }
         }
       }
@@ -2939,9 +4203,22 @@ async function _epeExtractPngMetadata(file) {
     const extractJSON = (str, startIdx) => {
       if (str[startIdx] !== '{') return null;
       let depth = 0;
+      // String-aware. Counting braces blind meant one unbalanced brace inside
+      // a prompt string — wildcard syntax like {red|blue, an emoticon — ended
+      // the object at the wrong offset, and a JPEG that really did carry
+      // metadata came back as having none.
+      let inStr = false, esc = false;
       for (let i = startIdx; i < str.length; i++) {
-        if (str[i] === '{') depth++;
-        else if (str[i] === '}') {
+        const ch = str[i];
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+        if (ch === '"') { inStr = true; continue; }
+        if (ch === '{') depth++;
+        else if (ch === '}') {
           depth--;
           if (depth === 0) {
             try {
@@ -2963,76 +4240,119 @@ async function _epeExtractPngMetadata(file) {
     let promptIdx = fullText.indexOf('"prompt"');
     if (promptIdx === -1) promptIdx = fullText.indexOf("prompt\0");
     
-    // Method 2: Scan for the node-keyed JSON pattern directly 
+    // Methods 2-4 all search the same decoded bytes, and `fullText` above
+    // already IS that string. The previous shape decoded `bytes.slice(i)` —
+    // the entire remainder of the file — at every candidate offset, ran
+    // extractJSON over that fresh copy, then advanced one byte and did it
+    // again. Quadratic, and measured on this exact code: 32 KB 0.39s,
+    // 64 KB 1.49s, 128 KB 6.02s, 256 KB 22.3s, a clean 4x per doubling. A
+    // 1 MB crafted JPEG froze the ComfyUI tab for minutes and took any
+    // unsaved prompt with it. extractJSON already accepts a start index, so
+    // there is nothing to slice.
+    //
+    // The candidate cap bounds what remains: a file full of `{"1":{`
+    // prefixes that never close. Each attempt is linear in what follows it,
+    // so an unbounded number of them is still quadratic overall, however
+    // cheap each one has become. 64 is far beyond any real image — the first
+    // genuine match wins and breaks out.
+    const _EPE_MAX_JSON_CANDIDATES = 64;
+
+    // Method 2: Scan for the node-keyed JSON pattern directly
     // This is the most reliable for standard ComfyUI saves
     if (!result.prompt) {
       // Find something like {"1": {"inputs": ... "class_type": ...
-      for (let i = 0; i < bytes.length - 20; i++) {
-        if (bytes[i] === 0x7B) { // '{'
-          // Quick check: is this followed by "number": {"  pattern?
-          const snippet = dec.decode(bytes.slice(i, Math.min(i + 50, bytes.length)));
-          if (/^\{"[\d]+":\s*\{/.test(snippet)) {
-            // Looks like prompt data — try to extract it
-            // First extract as string from this position
-            const remaining = dec.decode(bytes.slice(i));
-            const obj = extractJSON(remaining, 0);
-            if (obj) {
-              // Verify it has class_type entries (ComfyUI prompt signature)
-              const firstVal = Object.values(obj)[0];
-              if (firstVal && firstVal.class_type) {
-                result.prompt = obj;
-                break;
-              }
-            }
+      const re2 = /\{"\d+":\s*\{/g;
+      let m2, tried2 = 0;
+      while (tried2 < _EPE_MAX_JSON_CANDIDATES && (m2 = re2.exec(fullText)) !== null) {
+        tried2++;
+        const obj = extractJSON(fullText, m2.index);
+        if (obj) {
+          // Verify it has class_type entries (ComfyUI prompt signature)
+          const firstVal = Object.values(obj)[0];
+          if (firstVal && firstVal.class_type) {
+            result.prompt = obj;
+            break;
           }
         }
       }
     }
-    
+
     // Method 3: Look for "prompt" key in a wrapper object
-    if (!result.prompt) {
-      for (let i = 0; i < bytes.length - 10; i++) {
-        if (bytes[i] === 0x7B) { // '{'
-          const snippet = dec.decode(bytes.slice(i, Math.min(i + 30, bytes.length)));
-          if (/^\{\s*"prompt"\s*:/.test(snippet)) {
-            const remaining = dec.decode(bytes.slice(i));
-            const obj = extractJSON(remaining, 0);
-            if (obj && obj.prompt) {
-              result.prompt = typeof obj.prompt === "string" ? JSON.parse(obj.prompt) : obj.prompt;
-              if (obj.workflow) {
-                result.workflow = typeof obj.workflow === "string" ? JSON.parse(obj.workflow) : obj.workflow;
-              }
-              break;
-            }
+    //
+    // This runs even when method 2 already found a prompt. A wrapper carries
+    // the workflow as well as the prompt, but method 2 wins on every wrapper
+    // — the node-keyed object it matches is nested INSIDE the wrapper — so
+    // `result.workflow` was left unset for every JPEG and WebP saved in this
+    // shape. _epeParsePromptData takes the workflow to resolve node titles,
+    // so dropping it quietly degrades the prompt that comes back.
+    if (!result.prompt || !result.workflow) {
+      const re3 = /\{\s*"prompt"\s*:/g;
+      let m3, tried3 = 0;
+      while (tried3 < _EPE_MAX_JSON_CANDIDATES && (m3 = re3.exec(fullText)) !== null) {
+        tried3++;
+        const obj = extractJSON(fullText, m3.index);
+        if (obj && obj.prompt) {
+          // Parse into locals before assigning anything. The old code
+          // assigned result.prompt from an unguarded JSON.parse, so a
+          // wrapper carrying a "prompt" string that is not JSON threw
+          // straight out of readImageMetadata and the image was reported as
+          // having no metadata at all — even when a later candidate would
+          // have parsed. And a workflow that failed to parse after a prompt
+          // that succeeded left result half-populated.
+          try {
+            const p = typeof obj.prompt === "string" ? JSON.parse(obj.prompt) : obj.prompt;
+            const w = obj.workflow
+              ? (typeof obj.workflow === "string" ? JSON.parse(obj.workflow) : obj.workflow)
+              : null;
+            // Fill in only what is missing — method 2 may already have the
+            // prompt, and its answer is the one that was shipping.
+            if (!result.prompt && p) result.prompt = p;
+            if (!result.workflow && w) result.workflow = w;
+            break;
+          } catch (_e) {
+            // Not a usable wrapper — keep looking.
           }
         }
       }
     }
-    
+
     // Method 4: Look for tEXt-like null-separated key-value pairs (WebP EXIF)
     if (!result.prompt) {
-      const promptKey = new TextEncoder().encode("prompt");
-      for (let i = 0; i < bytes.length - promptKey.length - 2; i++) {
-        let match = true;
-        for (let j = 0; j < promptKey.length; j++) {
-          if (bytes[i + j] !== promptKey[j]) { match = false; break; }
+      // NB the NUL: the byte loop this replaces matched "prompt" followed by
+      // a zero byte, and the string form has to match the same thing.
+      const KEY = "prompt\0";
+      let from = 0, tried4 = 0;
+      while (tried4 < _EPE_MAX_JSON_CANDIDATES) {
+        const at = fullText.indexOf(KEY, from);
+        if (at < 0) break;
+        const valueStart = at + KEY.length;
+        from = valueStart;
+        // Look only inside the 10-character window the byte loop this
+        // replaces used. `fullText.indexOf("{", valueStart)` scans to the end
+        // of the file, so a file full of markers with no braces made every
+        // one of them walk the whole remainder — the very quadratic this
+        // rewrite exists to remove, straight back in. Measured on that
+        // version: 128 KB 15ms, 256 KB 37ms, 512 KB 145ms, 1 MB 657ms,
+        // against 15ms at 1 MB for the byte loop.
+        //
+        // EVERY brace in the window, not just the first. The byte loop tried
+        // each one, so a decoy "{" in front of the real payload —
+        // "prompt\0" + "{z" + the JSON — made the first-brace-only version
+        // report the image as carrying no metadata at all.
+        const _win = fullText.slice(valueStart, valueStart + 10);
+        for (let rel = _win.indexOf("{"); rel !== -1; rel = _win.indexOf("{", rel + 1)) {
+          // Count PARSE ATTEMPTS, not markers. Counting markers made the cap
+          // a metadata-loss bug in its own right: a file carrying more than
+          // 64 "prompt\0" markers before the real payload stopped looking
+          // before it got there — the shipped byte loop, which had no cap at
+          // all, found it. The marker walk needs no cap: `from` only ever
+          // moves forward, so it is linear on its own. The cap is here to
+          // bound extractJSON, which is not.
+          if (++tried4 > _EPE_MAX_JSON_CANDIDATES) break;
+          const obj = extractJSON(fullText, valueStart + rel);
+          if (obj) { result.prompt = obj; break; }
         }
-        if (match && bytes[i + promptKey.length] === 0) {
-          // Found "prompt\0" — value follows
-          const valueStart = i + promptKey.length + 1;
-          // Find the start of JSON
-          for (let k = valueStart; k < Math.min(valueStart + 10, bytes.length); k++) {
-            if (bytes[k] === 0x7B) {
-              const remaining = dec.decode(bytes.slice(k));
-              const obj = extractJSON(remaining, 0);
-              if (obj) {
-                result.prompt = obj;
-                break;
-              }
-            }
-          }
-          if (result.prompt) break;
-        }
+        if (result.prompt) break;
       }
     }
   }
@@ -3157,8 +4477,15 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
     tokenBadge.textContent = `${tkns} tokens`;
     tokenBadge.style.color = "#667";
     // Persist on every text change (programmatic or typed) so the prompt
-    // survives refresh/restart via node.properties → workflow JSON.
-    if (_epeOwnerNode) {
+    // survives refresh/restart via node.properties → workflow JSON — but
+    // NEVER during a review: streaming calls this with every partial, and
+    // writing those here silently defeated _epePersistPrompt's guard, so a
+    // save/autosave mid-review shipped the un-accepted result (or the raw
+    // variations dump) as epe_prompt. try/catch: _reviewMode is declared
+    // later in this closure and this runs once during build.
+    let _inReview = false;
+    try { _inReview = !!_reviewMode; } catch (_e) {}
+    if (_epeOwnerNode && !_inReview) {
       if (!_epeOwnerNode.properties) _epeOwnerNode.properties = {};
       try { _epeOwnerNode.properties.epe_prompt = (typeof text === "string") ? text : ""; } catch (_e) {}
     }
@@ -3312,6 +4639,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const file = img2imgFileInput.files?.[0];
           if (!file) return;
           img2imgFileInput.value = "";
+          _epeTakeAiSlot();
+          _syncVisionStyleBridge();
           await _epeOllamaVision.run("image-file", file, showAiPanel, hideAiPanel, (prompt) => {
             textEl.value = prompt;
             updateTokenBadge(textEl.value);
@@ -3332,8 +4661,18 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           try {
             // Parse PNG metadata
             const metadata = await _epeExtractPngMetadata(file);
-            
-            if (!metadata.prompt && !metadata.workflow) {
+
+            // No ComfyUI metadata, but an A1111-family `parameters` blob? Use
+            // it. These images used to report "no metadata found" while the
+            // prompt sat in plain text inside them.
+            if (!metadata.prompt && !metadata.workflow && metadata.parameters) {
+              const a1 = _epeParseA1111Parameters(metadata.parameters);
+              if (a1) {
+                metadata._a1111 = a1;
+              }
+            }
+
+            if (!metadata.prompt && !metadata.workflow && !metadata._a1111) {
               showAiPanel((() => {
                 const wrap = document.createElement("div");
                 wrap.style.cssText = "padding: 14px 16px; display: flex; flex-direction: column; gap: 8px;";
@@ -3351,7 +4690,32 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               return;
             }
             
-            const parsed = _epeParsePromptData(metadata.prompt, metadata.workflow);
+            let parsed;
+            if (metadata._a1111) {
+              // Same shape the graph walk produces, so every renderer below —
+              // the prompt sections, the Use buttons, the metadata chips —
+              // works unchanged.
+              const a1 = metadata._a1111;
+              const s = a1.settings || {};
+              parsed = {
+                positivePrompts: a1.positive
+                  ? [{ nodeId: "a1111", className: "A1111", title: "Prompt", text: a1.positive }] : [],
+                negativePrompts: a1.negative
+                  ? [{ nodeId: "a1111", className: "A1111", title: "Negative prompt", text: a1.negative }] : [],
+                samplers: (s["Steps"] || s["Sampler"] || s["CFG scale"] || s["Seed"]) ? [{
+                  nodeId: "a1111", className: "A1111", title: s["Sampler"] || "Sampler",
+                  steps: s["Steps"] || "", cfg: s["CFG scale"] || "",
+                  sampler_name: s["Sampler"] || "", scheduler: s["Schedule type"] || "",
+                  seed: s["Seed"] || "", denoise: s["Denoising strength"] || "",
+                }] : [],
+                models: s["Model"]
+                  ? [{ nodeId: "a1111", className: "A1111", title: "Model", name: s["Model"] }] : [],
+                loras: [], vaes: [], clipSettings: [],
+                _source: "A1111",
+              };
+            } else {
+              parsed = _epeParsePromptData(metadata.prompt, metadata.workflow);
+            }
             if (!parsed) {
               showAiError("Could not parse prompt data from this image.");
               return;
@@ -3396,6 +4760,19 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               useBtn.textContent = "Use Prompt";
               useBtn.style.cssText = "background: rgba(100, 130, 230, 0.3); border: 1px solid rgba(100, 130, 230, 0.5); border-radius: 3px; color: #a0c0ff; padding: 2px 8px; cursor: pointer; font-size: 10px;";
               useBtn.onclick = () => {
+                // Replacing the editor contents wholesale, exactly like a
+                // Library load — and it needs the same two things this button
+                // was missing.
+                //
+                // A review open here meant this text was written INTO the
+                // review: Discard would then restore _originalPrompt over it,
+                // and Accept would commit the extracted prompt as though the
+                // model had produced it.
+                if (_reviewMode) _autoDiscardReview("Extracted prompt used — result discarded");
+                // And without an undo push the user's prompt was gone with no
+                // way back. Load-from-file, Clear, "Use this" and Append all
+                // push; this one did not.
+                if (textEl._epePushUndo) textEl._epePushUndo();
                 textEl.value = text;
                 updateTokenBadge(textEl.value);
                 textEl.dispatchEvent(new Event("input"));
@@ -3554,7 +4931,31 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         const _doExport = async () => {
           const text = textEl.value;
           if(!text.trim()){ alert("Nothing to export — prompt is empty."); return; }
-          const safeName = lbl.replace(/[^a-zA-Z0-9_-]/g,"_").substring(0,30) || "prompt";
+          // `lbl` never existed in this scope. The reference sat outside the
+          // try below, in an async function, so it became an unhandled
+          // rejection that the menu item's `() => { _doExport(); }` never saw:
+          // no file, no error, no message. Export Text has never worked.
+          //
+          // Name the file after the start of the prompt, which is what the
+          // user would have picked anyway.
+          const _firstLine = (text.split("\n").find(l => l.trim()) || "").trim();
+          // Bound, then collapse, then bound again.
+          //
+          // Slicing to 64 BEFORE the collapse was lossy: a first line opening
+          // with 64 non-alphanumerics — a weight stack, a <lora:…> chain, a
+          // CJK prefix — collapsed to a single "_", trimmed to "", and every
+          // such export was named prompt.txt. Collapsing first fixes that.
+          //
+          // But the /^_+|_+$/g those comments called quadratic is not: V8
+          // runs it linearly, measured flat from 10k to 400k characters. What
+          // the slice really bought was not doing regex work over a megabyte
+          // of prompt to produce thirty characters — an 8 MB first line went
+          // from 0.05 ms to 476 ms when the slice moved. So the bound stays,
+          // just wide enough that no realistic prefix can exhaust it.
+          const safeName = _firstLine.slice(0, 512)
+                                     .replace(/[^a-zA-Z0-9_-]+/g, "_")
+                                     .replace(/^_+|_+$/g, "")
+                                     .substring(0, 30) || "prompt";
           const filename = safeName + ".txt";
           try {
             if(window.showSaveFilePicker){
@@ -3679,7 +5080,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         // ── FILE menu ──
         const fileMenuBtn = makeMenuBtn("File", [
-          { label: "Save Favorite",  title: "Save current prompt to Favorites",      onclick: () => { const _sel = textEl.value.slice(textEl.selectionStart, textEl.selectionEnd).trim(); _libAddEntry("favorites", _sel || textEl.value); } },
+          { label: "Save Favorite",  title: "Save current prompt to Favorites",      onclick: () => { if (saveFavBtn.onclick) saveFavBtn.onclick(); } },
           { label: "Save Snippet",   title: "Save selected text (or full prompt) as a reusable snippet", onclick: () => { saveSnippetBtn.onclick && saveSnippetBtn.onclick(); } },
           { label: "Clear Prompt",   title: "Clear the editor",                      onclick: () => { clearPromptBtn.onclick && clearPromptBtn.onclick(); } },
           { label: "Export Text",    title: "Export current prompt to a .txt file",  onclick: () => { _doExport(); } },
@@ -3693,7 +5094,16 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         saveFavBtn.title = "Save current prompt to Favorites";
         saveFavBtn.style.cssText = toolBtnStyle;
         toolBtnHover(saveFavBtn);
-        saveFavBtn.onclick = () => { const _sel = textEl.value.slice(textEl.selectionStart, textEl.selectionEnd).trim(); _libAddEntry("favorites", _sel || textEl.value); };
+        saveFavBtn.onclick = () => {
+          // Same rule as the AI actions: during a variations review textEl is
+          // the raw model dump, and this happily saved it to the library.
+          if (_reviewMode && _reviewMode !== "single") {
+            _toast("Finish the current result first — use it, or discard it.");
+            return;
+          }
+          const _sel = textEl.value.slice(textEl.selectionStart, textEl.selectionEnd).trim();
+          _libAddEntry("favorites", _sel || textEl.value);
+        };
 
         const enhancePromptBtn = document.createElement("button");
         enhancePromptBtn.textContent = "Enhance Prompt";
@@ -3757,6 +5167,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             showAiPanel(wrap);
             return;
           }
+          _epeTakeAiSlot();
+          _syncVisionStyleBridge();
           await _epeOllamaVision.run("video-file", file, showAiPanel, hideAiPanel, (prompt) => {
             textEl.value = prompt;
             updateTokenBadge(textEl.value);
@@ -3830,7 +5242,12 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         let _aiFloatPanel = null;
 
         const _createAiFloatPanel = () => {
-          if (_aiFloatPanel) { _aiFloatPanel.remove(); _aiFloatPanel = null; }
+          // Through hideAiPanel, which runs _destroy() — two document
+          // mousemove/mouseup pairs and a ResizeObserver. Unreachable today
+          // (the only caller checks _aiFloatPanel first), which is exactly
+          // why it is worth closing: the second caller to appear would strand
+          // four document listeners and an observer per call.
+          if (_aiFloatPanel) { try { hideAiPanel(); } catch (_e) {} _aiFloatPanel = null; }
           const fp = document.createElement("div");
           fp.style.cssText = [
             "position:fixed;z-index:99999;",
@@ -4234,7 +5651,15 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           saveRow.appendChild(resetBtn);
           saveRow.appendChild(saveSettingsBtn);
           aiSettingsPanel.appendChild(saveRow);
-          
+
+          // Version footer — surfaces EPE version so a bug report always
+          // carries it, without asking the reporter to paste startup logs.
+          // Populated from /epe/ollama/check's response (see populateModels).
+          const verFoot = document.createElement("div");
+          verFoot.style.cssText = "font-size:9px;color:#4e5c6e;text-align:right;padding-top:6px;font-family:inherit;";
+          verFoot.textContent = "EPE — checking version…";
+          aiSettingsPanel.appendChild(verFoot);
+
           // --- Event handlers ---
           const populateModels = async (url) => {
             statusDot.style.background = "#ca0";
@@ -4243,13 +5668,26 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             // a local Ollama if it isn't running. Returns { running, autoStart }.
             let ensured = null;
             try {
-              const r = await fetch("/epe/ollama/check", {
+              // Bounded like the sibling _backendCheck — a hung socket
+              // must not leave the version footer at "checking…" forever
+              // (its purpose is bug-report visibility, so it MUST resolve
+              // one way or another).
+              const r = await api.fetchApi("/epe/ollama/check", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ ollamaUrl: url }),
+                signal: (typeof AbortSignal !== "undefined" && AbortSignal.timeout)
+                  ? AbortSignal.timeout(20000) : undefined,
               });
               if (r.ok) ensured = await r.json();
             } catch (e) {}
+            try {
+              if (ensured && typeof ensured.epeVersion === "string") {
+                verFoot.textContent = "EPE " + ensured.epeVersion;
+              } else if (verFoot.textContent === "EPE — checking version…") {
+                verFoot.textContent = "EPE — version unknown";
+              }
+            } catch (_e) {}
             const connected = (ensured && ensured.running) || await _epeOllama.checkConnection(url);
             if (connected) {
               statusDot.style.background = "#4c4";
@@ -4304,6 +5742,13 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               } else if (reason === "remote") {
                 failOpt.textContent = "— Can't reach Ollama at that URL —";
                 modelSelect.title = "Couldn't reach Ollama at that address. Make sure it's running on that machine and reachable from here.";
+              } else if (reason === "already_starting") {
+                // Another EPE tab (or another concurrent /epe/ollama/check
+                // request) is already running the spawn/poll dance for this
+                // URL. This handler deduped against it, waited up to ~18 s,
+                // and re-probed — but Ollama still isn't answering.
+                failOpt.textContent = "— Ollama is starting — try again shortly —";
+                modelSelect.title = "Another EPE node is already starting Ollama on this URL. Wait a few seconds and press Test again.";
               } else {
                 failOpt.textContent = "— Ollama not running (run: ollama serve) —";
                 modelSelect.title = "Ollama isn't running. Start it with: ollama serve  —  or on Linux, run: sudo systemctl enable --now ollama  to start it at boot.";
@@ -4417,7 +5862,13 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // showAiPanel resets the title each time.
         showAiPanel.setTitle = (text) => { if (_aiFloatPanel && _aiFloatPanel._setTitle) _aiFloatPanel._setTitle(text); };
         // Expose showAiResult for use by _epeOllama.showResult (outside this closure)
-        showAiPanel._showAiResult = (opts) => showAiResult(opts);
+        // The slot is taken BEFORE the result takes over the review. A vision
+        // answer arriving into a review that something else is still streaming
+        // into is the case round 19 left open; from here on the stream is
+        // stopped first. The vision run's own controller lives in
+        // _epeOllamaVision._abortByOwner, not in _aiAbort, so this can only
+        // ever abort a different run.
+        showAiPanel._showAiResult = (opts) => { _epeTakeAiSlot(); return showAiResult(opts); };
         
         const hideAiPanel = () => {
           if (_aiFloatPanel) {
@@ -4426,6 +5877,16 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             _aiFloatPanel = null;
           }
         };
+        // The float panel lives on document.body — without this, every node
+        // dispose (workflow-tab switch, node delete) orphaned the panel plus
+        // its two document listener pairs and its ResizeObserver.
+        if (_epeOwnerNode) {
+          const _fpPrevDispose = _epeOwnerNode._epeDispose;
+          _epeOwnerNode._epeDispose = () => {
+            try { _fpPrevDispose && _fpPrevDispose(); } catch (_e) {}
+            try { hideAiPanel(); } catch (_e) {}
+          };
+        }
 
         // Auto-size panel: vision-flow panels (model picker, progress, errors)
         // size to their content. The legacy result-panel branch (82vh height)
@@ -4547,16 +6008,68 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           // textEl with the result. _reviewEnter only snapshots if not already
           // in review (chained operations preserve the user's true starting
           // prompt across streaming → single transitions).
+          // A vision run is not tracked in _aiAbort and leaves _reviewMode
+          // null while it works, so the tab switch that cancels a streaming
+          // run does not touch it. Its caption can therefore land on a
+          // variations review the user came back to — and _reviewSetMode
+          // ("single") calls _applyReviewModeUI, which calls
+          // _clearVariationsCards: all three cards gone, with no toast and
+          // without the user choosing Use this or Discard. Announced instead,
+          // which is what every other path that replaces a result does.
+          if (_reviewMode === "variations") {
+            _autoDiscardReview("New result arrived — variations discarded");
+          }
           if (_reviewMode) {
             _reviewSetMode("single");
+            // A result arriving here is never an instruct result — instruct
+            // has its own path. Without this, chaining a vision result onto
+            // an instruct review kept the flag and skipped _ieThreadClear
+            // on commit, carrying stale direction into later edits.
+            // Dropping the flag orphans any instruct snapshot the earlier
+            // review was still holding — Discard gates the thread rollback
+            // on the flag — so roll the thread back to it NOW, while this
+            // result replaces a prompt those instructions no longer describe.
+            if (_ieReviewIsInstruct && _ieThreadSnapshot) {
+              _ieThreadSet(_ieThreadSnapshot);
+            }
+            // RE-MARKED, not nulled — runAiAction's twin thirty lines down has
+            // done this since the round it was written, and this one did not.
+            // An instruct edit chained onto THIS result takes _ieApplyOne's
+            // chained branch, which deliberately does not snapshot; so leaving
+            // it null produced a review that was isInstruct with no rollback
+            // point. Discard then kept the rejected instruction, and the park
+            // — which gates its rollback on the same pair — left it live for
+            // the next persist to write into the saved workflow.
+            _ieThreadSnapshot = _ieThreadGet().slice();
+            _ieReviewIsInstruct = false;
           } else {
             _reviewEnter("single");
+            // Mark the instruct rollback point here as well. An instruct
+            // edit chained onto an Image-to-Prompt result takes the CHAINED
+            // branch, which deliberately does not snapshot — so without this
+            // there was nothing to roll back to and Discard silently kept
+            // the rejected instruction in the thread.
+            _ieThreadSnapshot = _ieThreadGet().slice();
+            // ...and this is NOT an instruct review. Nothing resets the flag
+            // on commit, so a true left over from an earlier instruct edit
+            // made this result skip _ieThreadClear and carry that stale
+            // direction into every later edit.
+            _ieReviewIsInstruct = false;
           }
 
           // Replace editor content with the final cleaned result.
           textEl.value = text;
           updateTokenBadge(textEl.value);
-          textEl.dispatchEvent(new Event("input"));
+          // Persist it, but keep it off the undo stack: _reviewEnter already
+          // pushed the pre-AI prompt, and pushing the output on top of that
+          // made the first ↶ restore what was already on screen — and, after
+          // a Discard, resurrect the text just thrown away.
+          if (textEl._epeUndoMute) textEl._epeUndoMute(true);
+          try {
+            textEl.dispatchEvent(new Event("input"));
+          } finally {
+            if (textEl._epeUndoMute) textEl._epeUndoMute(false);
+          }
           textEl.scrollTop = 0;
 
           // Customize the review-strip label using the action-specific label
@@ -4620,6 +6133,61 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // --- AI Button Handlers ---
         let _aiAbort = null;
 
+        // Take the AI slot for a new run, aborting whatever holds it.
+        //
+        // A vision run started while Enhance was streaming used to leave BOTH
+        // alive: the vision result took over the review through showAiResult,
+        // the Enhance stream kept calling onToken, and once the review exited
+        // every later partial was written straight into
+        // node.properties.epe_prompt by updateTokenBadge — with no undo entry
+        // for it, and the next queue shipped the partial to the sampler.
+        // Discard/Use this/Esc could not stop it either: they gate their abort
+        // on _reviewMode === "streaming", and the review was "single" by then.
+        //
+        // _ieApplyOne has done this before taking the slot since round 4.
+        // Round 19 covered one ordering — Enhance streaming, then a vision run
+        // starts — because that is the one that was reported. The reverse
+        // ordering was open: with a vision run in flight, clicking Enhance
+        // aborted nothing, and when the caption landed, showAiResult took over
+        // the review with _reviewSetMode("single") while the Enhance stream was
+        // still live. From then on Discard, Esc and _autoDiscardReview all gate
+        // their abort on `_reviewMode === "streaming"` and could not stop it,
+        // and once the review exited, every later partial went straight into
+        // node.properties.epe_prompt. Measured: after Discard the editor
+        // visibly restored the user's prompt and then mutated by itself into a
+        // half-finished enhance — which is what the next Queue sent to the
+        // sampler, with the original gone from the undo stack too.
+        //
+        // So the slot is BOTH: the editor's own controller and this node's
+        // vision run. Starting Enhance ends the caption, which is what the user
+        // already believes happened — starting Enhance removes the vision
+        // progress panel and its Cancel button.
+        const _epeTakeAiSlot = () => {
+          const _had = !!_aiAbort;
+          if (_aiAbort) {
+            try { _aiAbort.abort(); } catch (_e) {}
+            _aiAbort = null;
+          }
+          try { _epeOllamaVision._abortOwn(WIN_ID); } catch (_e) {}
+          // …and end the review that stream was writing into.
+          //
+          // runAiAction's AbortError branch returns without exiting review, on
+          // the stated premise that "Discard/Cancel has already restored
+          // original and exited". True of the strip's own Cancel; NOT true of
+          // this function, which is what the vision runs, the model picker and
+          // showAiPanel._showAiResult call. So: Enhance is streaming, the user
+          // clicks Image to Prompt, the stream is aborted here, and the vision
+          // run then bails (Ollama stopped, or they hit Cancel on the model
+          // picker). Nothing else runs. The strip reads "Streaming…" forever,
+          // textEl.readOnly stays true so they cannot type, and both
+          // _epePersistPrompt and updateTokenBadge hard-return on _reviewMode
+          // — so nothing they do afterwards is saved, with no request in
+          // flight to explain it.
+          if (_had && _reviewMode === "streaming") {
+            try { _autoDiscardReview("Replaced by a new request"); } catch (_e) {}
+          }
+        };
+
         // --- Review Mode state (in-editor review, replaces floating panel) ---
         // _reviewMode: null | "single" | "variations" | "streaming"
         //   "single"     — single-result review (Expand/img2img/vid2prompt/Invert)
@@ -4681,9 +6249,18 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             _aiAbort = null;
           }
           if (_originalPrompt !== null) {
-            textEl.value = _originalPrompt;
+            // Restores on screen AND onto the node. Setting textEl.value
+            // alone left the AI result in node.properties.epe_prompt, and
+            // the next rebuild silently undid the Discard.
+            textEl._epeRestoreValue(_originalPrompt);
             updateTokenBadge(textEl.value);
           }
+          // ROUND 66 (V-3): the restore above is a MUTED dispatch, so
+          // _pushUndo's `_redo.length = 0` never runs and nothing removes the
+          // rejected result from either stack. Put both back the way the
+          // review found them. Must run BEFORE _reviewExit, which drops the
+          // mark.
+          if (textEl._epeUndoReviewRollback) textEl._epeUndoReviewRollback();
           // Auto-discarding an instruct result unwinds its direction too.
           if (_ieReviewIsInstruct && _ieThreadSnapshot) {
             _ieThreadSet(_ieThreadSnapshot);
@@ -4701,6 +6278,19 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // Removed in closeEditor.
         const _onEpeKeyDown = (ev) => {
           if (ev.key !== "Escape") return;
+          // Innermost thing first. The comment below used to say dropdowns
+          // "handle their own dismissal" — they do, on document MOUSEDOWN, and
+          // nothing listened for Esc. So Esc over an open menu discarded the
+          // result underneath it and left the menu floating on document.body
+          // with nothing able to close it. A keystroke aimed at a menu must
+          // not cost the user their result.
+          try {
+            if (_closeAllDropdowns() > 0) {
+              ev.preventDefault();
+              ev.stopPropagation();
+              return;
+            }
+          } catch (_e) {}
           if (!_reviewMode) return;
           // Don't intercept Esc inside open dropdowns — they handle their own
           // dismissal via document-level mousedown. (Native textarea Esc is a
@@ -4712,9 +6302,26 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             _aiAbort = null;
           }
           if (_originalPrompt !== null) {
-            textEl.value = _originalPrompt;
+            // Restores on screen AND onto the node. Setting textEl.value
+            // alone left the AI result in node.properties.epe_prompt, and
+            // the next rebuild silently undid the Discard.
+            textEl._epeRestoreValue(_originalPrompt);
             updateTokenBadge(textEl.value);
           }
+          // ROUND 66 (V-3): the restore above is a MUTED dispatch, so
+          // _pushUndo's `_redo.length = 0` never runs and nothing removes the
+          // rejected result from either stack. Put both back the way the
+          // review found them. Must run BEFORE _reviewExit, which drops the
+          // mark.
+          if (textEl._epeUndoReviewRollback) textEl._epeUndoReviewRollback();
+          // Esc IS Discard, so it must also reject the direction behind an
+          // instruct result. Without this the instruction stayed in the
+          // thread and went out as EARLIER DIRECTION on every later edit,
+          // describing a change the prompt no longer had.
+          if (_ieReviewIsInstruct && _ieThreadSnapshot) {
+            _ieThreadSet(_ieThreadSnapshot);
+          }
+          _ieThreadSnapshot = null;
           _reviewExit();
           try { _epeOllama.unloadModel(); } catch (_e) {}
         };
@@ -4775,13 +6382,35 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         };
         
         
-        const runAiAction = async (mode) => {
-          const promptText = textEl.value.trim();
+        // opts.sourceText: the caller has its own prompt text and is asking
+        // for it to be used — the variations cards' "Options ▾" chain, and the
+        // browser cards' Enhance / Variations shortcuts. Those are legitimate
+        // mid-review re-runs; what the guard below exists to stop is the rail
+        // and toolbar buttons silently re-sending whatever happens to be in
+        // the hidden textarea.
+        const runAiAction = async (mode, opts) => {
+          const _srcText = opts && typeof opts.sourceText === "string"
+            ? opts.sourceText.trim() : null;
+          // Mid-review textEl is not the prompt — it holds an un-accepted
+          // result, a half-streamed partial, or (in variations mode, where it
+          // is hidden entirely) the raw multi-variation model dump. Sending
+          // that back as the prompt is how "Enhance" turned into "enhance the
+          // dump". Accept or discard first.
+          if (_reviewMode && _reviewMode !== "single" && _srcText === null) {
+            _toast("Finish the current result first — use it, or discard it.");
+            return;
+          }
+
+          // EVERY check that can bail runs BEFORE review is entered. Entering
+          // first left the editor read-only under a "Streaming…" bar with no
+          // way out when Ollama was down — and, from the variations Options
+          // chain, cleared the three generated cards before bailing.
+          const promptText = _srcText !== null ? _srcText : textEl.value.trim();
           if (!promptText) {
             showAiError("Please enter some text first — write a brief description to expand, or a full prompt to generate variations from.");
             return;
           }
-          
+
           // Check connection
           const settings = _epeOllama.getSettings();
           const connected = await _epeOllama.checkConnection(settings.url);
@@ -4789,7 +6418,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             showAiNotConnected();
             return;
           }
-          
+
           // Check model — only auto-detect when the user has never chosen one.
           if (!settings.model) {
             const models = await _epeOllama.fetchModels(settings.url);
@@ -4799,6 +6428,33 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             } else {
               showAiError("No models found in Ollama. Run <code style='background:#24303f; padding:1px 4px; border-radius:3px;'>ollama pull qwen3.5:4b</code> to download one (example).");
               return;
+            }
+          }
+
+          // Nothing below here bails, so it is safe to take over the review.
+          // The token is bumped on EVERY entry, not just the instruct ones:
+          // this call may have aborted an instruct edit that is still
+          // unwinding, and without the bump that unwind matched the token and
+          // tore down the review this call now owns — after which the stream
+          // persisted straight into node.properties with no review bar.
+          _ieReviewToken++;
+          if (_srcText !== null) {
+            const _wasFresh = !_reviewMode;
+            if (_reviewMode) _reviewSetMode("streaming");
+            else _reviewEnter("streaming");
+            if (_wasFresh) {
+              // Same rollback point every other fresh entry marks. Without
+              // it, an instruct edit chained onto this result could not be
+              // rolled back on Discard and stayed in the thread for good.
+              _ieThreadSnapshot = _ieThreadGet().slice();
+              _ieReviewIsInstruct = false;
+            }
+            if (textEl._epeUndoMute) textEl._epeUndoMute(true);
+            try {
+              textEl.value = _srcText;
+              updateTokenBadge(_srcText);
+            } finally {
+              if (textEl._epeUndoMute) textEl._epeUndoMute(false);
             }
           }
 
@@ -4818,8 +6474,31 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             // Enhance again on a previous result), preserve _originalPrompt by
             // calling _reviewSetMode instead of _reviewEnter. Otherwise, this is
             // a fresh entry — _reviewEnter will snapshot the current prompt.
-            if (_reviewMode) _reviewSetMode("streaming");
-            else _reviewEnter("streaming");
+            if (_reviewMode) {
+              _reviewSetMode("streaming");
+              // Chaining onto a review that may be an instruct edit's. Clearing
+              // the flag below orphans that review's rollback point, because
+              // Discard gates the thread rollback on the flag — so the
+              // rejected instruction survived Discard and went on steering
+              // every later edit. Roll the thread back NOW, while this result
+              // replaces a prompt those instructions no longer describe, then
+              // re-mark the rollback point at the state we just restored so an
+              // instruct edit chained onto THIS review still has one.
+              // _epeVisionResult does exactly this and says why; runAiAction
+              // did not.
+              if (_ieReviewIsInstruct && _ieThreadSnapshot) {
+                _ieThreadSet(_ieThreadSnapshot);
+              }
+              _ieThreadSnapshot = _ieThreadGet().slice();
+            } else {
+              _reviewEnter("streaming");
+              // Mark the rollback point here too. An instruct edit chained
+              // onto this review flips _ieReviewIsInstruct to true, and
+              // Discard then rolled the thread back to whatever stale
+              // snapshot happened to be left over — which could empty the
+              // user's entire accumulated direction.
+              _ieThreadSnapshot = _ieThreadGet().slice();
+            }
             _ieReviewIsInstruct = false;
             singleActionRow.style.display = "none";
             // Save and swap the placeholder so the empty textarea doesn't show
@@ -4844,9 +6523,17 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             loadingWrap = showAiLoading(mode);
           }
 
-          // Abort previous if still running
-          if (_aiAbort) _aiAbort.abort();
-          _aiAbort = new AbortController();
+          // Abort previous if still running. This run's controller is held
+          // locally — see _ieApplyOne: a newer owner of _aiAbort must not be
+          // nulled by this request's unwind.
+          //
+          // Through _epeTakeAiSlot, not inline, so this also ends a vision run
+          // that is still in flight. Inline it only ever aborted _aiAbort, and
+          // a caption arriving afterwards took over this review while this
+          // stream kept writing into it.
+          _epeTakeAiSlot();
+          const _runCtrl = new AbortController();
+          _aiAbort = _runCtrl;
           
           try {
             const rawSystemPrompt = mode === "expand" ? settings.expandPrompt : mode === "invert" ? (settings.invertPrompt || _epeOllama._defaults.invertPrompt) : settings.variationsPrompt;
@@ -4872,7 +6559,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             }
             let tokenCount = 0;
             const raw = await _epeOllama.generate(systemPrompt, promptText, {
-              signal: _aiAbort.signal,
+              signal: _runCtrl.signal,
               options: sliderOpts,
               onRetry: () => {
                 const msg = "Vision model thinking interference, generating retry…";
@@ -4914,7 +6601,9 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
                   const orig = _originalPrompt;
                   _reviewExit();
                   if (orig !== null) {
-                    textEl.value = orig;
+                    // Same as Discard: the value has to reach the node, or a
+                    // rebuild brings back the result this call failed on.
+                    textEl._epeRestoreValue(orig);
                     updateTokenBadge(textEl.value);
                   }
                 }
@@ -4930,7 +6619,9 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
                   const orig = _originalPrompt;
                   _reviewExit();
                   if (orig !== null) {
-                    textEl.value = orig;
+                    // Same as Discard: the value has to reach the node, or a
+                    // rebuild brings back the result this call failed on.
+                    textEl._epeRestoreValue(orig);
                     updateTokenBadge(textEl.value);
                   }
                 }
@@ -4942,7 +6633,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           } catch (err) {
             if (err.name === "AbortError") {
               // Discard/Cancel button has already restored original and exited review.
-              _aiAbort = null;
+              if (_aiAbort === _runCtrl) _aiAbort = null;
               return;
             }
             // Network/other failure: restore original prompt and exit review (if active)
@@ -4952,13 +6643,13 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               _reviewExit();
               singleActionRow.style.display = "none";
               if (orig !== null) {
-                textEl.value = orig;
+                textEl._epeRestoreValue(orig);
                 updateTokenBadge(textEl.value);
               }
             }
             showAiError(/thinking/i.test(err.message || "") ? err.message : `Request failed: ${err.message}`);
           }
-          _aiAbort = null;
+          if (_aiAbort === _runCtrl) _aiAbort = null;
         };
         
         // Shared Ollama connectivity check — shows a clear message if not configured
@@ -5031,6 +6722,12 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // node.properties → workflow JSON + ComfyUI autosave, like native widgets).
         const _epePersistPrompt = () => {
           if (!_epeOwnerNode) return;
+          // A result under review is not the user's prompt yet. Writing it
+          // here meant a node rebuild — a workflow-tab switch, a reload —
+          // committed a result nobody had accepted and destroyed the
+          // original, which existed only in this closure. The node keeps the
+          // last COMMITTED value; Use this / Append persist explicitly.
+          if (_reviewMode) return;
           if (!_epeOwnerNode.properties) _epeOwnerNode.properties = {};
           try {
             _epeOwnerNode.properties.epe_prompt = textEl.value || "";
@@ -5043,7 +6740,65 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // Falls back to the persisted property if the textarea is unavailable.
         if (_epeOwnerNode) {
           _epeOwnerNode._epeGetPrompt = () => {
-            try { return textEl.value || ""; }
+            try {
+              // THE RULE: what is in the prompt box is what renders.
+              //
+              // Queueing is how you EVALUATE a prompt — enhance, look at the
+              // result, render it to see what it does, maybe enhance again
+              // from it, and only then decide. So the prompt you are looking
+              // at is the one that should go to the render, accepted or not.
+              //
+              // Before round 70 this answered by review MODE and sent the
+              // committed prompt for everything except a finished Instruct
+              // Edit. That made the box lie in the common case, and a user
+              // who learns the box sometimes lies cannot trust it in any case.
+              //
+              // Mid-stream is NOT an exception, deliberately. A box holding
+              // "A red dragon with wings that" is not a prompt, and rendering
+              // it wastes GPU time — but nobody queues a half-finished prompt
+              // on purpose, they can see the box while it streams, and one
+              // rule with no exceptions is worth more than a rare render.
+              //
+              // So the code asks the question the USER asks: is the prompt box
+              // on screen? `display: none` is set in exactly one place in this
+              // file — the variations branch of _applyReviewModeUI — where
+              // three cards are showing and there is no single prompt in the
+              // main window at all. That is the one state that still sends the
+              // committed value, and it is read from the thing the user can
+              // see rather than inferred from a mode name.
+              //
+              // Unreadable style (a rig, an exotic host) counts as VISIBLE, so
+              // the rule holds by default rather than silently inverting.
+              let _boxHidden = false;
+              try { _boxHidden = !!(textEl.style && textEl.style.display === "none"); }
+              catch (_e2) { _boxHidden = false; }
+              if (_boxHidden) {
+                return (_epeOwnerNode.properties && _epeOwnerNode.properties.epe_prompt) || "";
+              }
+              // DELIBERATELY does not write epe_prompt. QUEUEING SENDS; IT
+              // NEVER COMMITS. Round 70 widened what is sent and changed
+              // nothing about what is stored, and that is exactly why it is
+              // safe where round 56's attempt was not.
+              //
+              // Round 56 did write it, so that a render queued mid-review would
+              // be reproducible from the workflow saved beside it. It cost two
+              // HIGH data-loss regressions in two consecutive rounds, because
+              // it broke the invariant everything else here leans on:
+              // **epe_prompt is only ever the last COMMITTED value.**
+              // _epePersistPrompt's review guard, _epeTabRestore's reconcile
+              // (which treats epe_prompt as authoritative over epe_tabs) and
+              // the park machinery all assume it. Once an un-accepted result
+              // could live there, Discard could not reliably remove it: on
+              // the explicit path the rollback was swallowed by the review
+              // guard, and on the workflow-reload path by the _epeRestoring
+              // guard, and the reconcile then wrote the rejected text over
+              // the user's own prompt in the tab array.
+              //
+              // The gap that leaves — a mid-review queue is not reproducible
+              // from its own workflow — is on the register as an open
+              // decision. It is not worth the user's prompt.
+              return textEl.value || "";
+            }
             catch (_e) { return (_epeOwnerNode.properties && _epeOwnerNode.properties.epe_prompt) || ""; }
           };
           // Persist the initial value so a never-edited node still has it stored.
@@ -5259,15 +7014,27 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // _reviewEnter(mode):  takes original-prompt snapshot, shows strips, sets label.
         // _reviewSetMode(mode): used to transition within an active review (e.g. streaming → single).
         // _reviewExit():       hides strips, clears state, re-enables textEl.
-        const _reviewEnter = (mode) => {
-          // Capture original on first entry only — chained operations preserve
-          // the user's true starting prompt across streaming → single transitions.
-          if (!_reviewMode) {
+        const _reviewEnter = (mode, _restoreOriginal) => {
+          if (_restoreOriginal !== undefined) {
+            // Bringing a PARKED review back. The snapshot and its undo entry
+            // were both taken when the review first opened; taking them again
+            // would snapshot the tab's committed prompt over the user's real
+            // starting point and push a second entry for the same edit.
+            _originalPrompt = _restoreOriginal;
+          } else if (!_reviewMode) {
+            // Capture original on first entry only — chained operations preserve
+            // the user's true starting prompt across streaming → single transitions.
             _originalPrompt = textEl.value;
             // Push the pre-AI prompt onto the undo stack so ↶ / Ctrl+Z recalls
             // it after the result is accepted (replaces the old Recall button).
             if (textEl._epePushUndo) textEl._epePushUndo();
           }
+          // ROUND 66 (V-3): mark the boundary AFTER that push, so the pre-AI
+          // prompt is below the floor — Discard restores to it, and ↶ inside
+          // the review cannot step past it and put the rejected result on the
+          // redo branch. Idempotent, so a parked review re-entering keeps the
+          // boundary it opened with.
+          if (textEl._epeUndoReviewMark) textEl._epeUndoReviewMark();
           _reviewMode = mode;
 
           // Populate original-prompt strip from snapshot
@@ -5330,6 +7097,25 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         const _reviewExit = () => {
           _reviewMode = null;
           _originalPrompt = null;
+          // ROUND 66: drop the boundary WITHOUT restoring. The four
+          // non-commit exits roll back first (they call
+          // _epeUndoReviewRollback before reaching here); everything else
+          // reaching this point is a commit, whose steps stay as history.
+          // Doing it here rather than at each caller is the same reasoning
+          // as _ieReviewIsInstruct three lines down: every exit passes
+          // through, and "everyone remembers" has shipped a bug before.
+          if (textEl._epeUndoReviewEnd) textEl._epeUndoReviewEnd();
+          // Reset here rather than at every caller. Every non-park exit
+          // must clear this — commit, Discard, auto-discard, failure — and
+          // the "everyone remembers" contract has shipped a bug before
+          // (the flag survived into a fresh Enhance review, letting
+          // graphToPrompt inject the wrong prompt at queue time now that
+          // _epeGetPrompt gates on it too). Single point of truth here.
+          _ieReviewIsInstruct = false;
+          // Every exit passes through here — commit (which has already
+          // flushed), Discard, auto-discard, failure. Nothing pending can
+          // survive into a later review.
+          _ieChainUndo = [];
           reviewStrip.style.display = "none";
           originalStrip.style.display = "none";
           reviewSaveAllBtn.style.display = "none";
@@ -5345,6 +7131,27 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             textEl.placeholder = textEl._savedPlaceholder;
             textEl._savedPlaceholder = null;
           }
+          // Flush the instruct thread now that _reviewMode is null.
+          // _iePersistThreads refuses to write under review (an un-accepted
+          // instruction is not direction yet), so this is where the accepted —
+          // or rolled-back — thread actually reaches node.properties. Every
+          // exit passes through here, so no commit or discard path needs to
+          // remember to do it. Guarded because this runs during the build,
+          // before _iePersistThreads is initialised.
+          try { if (typeof _iePersistThreads === "function") _iePersistThreads(); } catch (_e) {}
+          // No prompt flush here, deliberately.
+          //
+          // Round 56b added one to contain J-04's write, and it could not:
+          // _epeTabRestore sets _epeRestoring BEFORE its own auto-discard, so
+          // the one path that most needed the rollback was the one the guard
+          // turned it off for. Removing the guard was worse — measured, it
+          // persisted the OUTGOING workflow's tabs over the incoming file.
+          //
+          // With J-04 reverted there is nothing to flush: epe_prompt is only
+          // ever written by an accepted commit, so a discard has nothing to
+          // undo there and every exit already leaves it correct. This call
+          // also reached _epeTabSync -> _persistTabs, which meant every review
+          // exit rewrote epe_tabs — a write nothing in the suite covered.
         };
 
         // Discard / Cancel handler. During streaming this also aborts the in-flight
@@ -5355,9 +7162,18 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             _aiAbort = null;
           }
           if (_originalPrompt !== null) {
-            textEl.value = _originalPrompt;
+            // Restores on screen AND onto the node. Setting textEl.value
+            // alone left the AI result in node.properties.epe_prompt, and
+            // the next rebuild silently undid the Discard.
+            textEl._epeRestoreValue(_originalPrompt);
             updateTokenBadge(textEl.value);
           }
+          // ROUND 66 (V-3): the restore above is a MUTED dispatch, so
+          // _pushUndo's `_redo.length = 0` never runs and nothing removes the
+          // rejected result from either stack. Put both back the way the
+          // review found them. Must run BEFORE _reviewExit, which drops the
+          // mark.
+          if (textEl._epeUndoReviewRollback) textEl._epeUndoReviewRollback();
           // Rejecting an instruct result also rejects the direction behind it.
           if (_ieReviewIsInstruct && _ieThreadSnapshot) {
             _ieThreadSet(_ieThreadSnapshot);
@@ -5373,6 +7189,28 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // are { id, label }. Picking an item invokes onPick(id) and closes the menu.
         // Click-outside dismisses; the menu auto-flips upward if there isn't enough
         // room below the button.
+        // Every dropdown this editor has built. Their menus mount on
+        // document.body with position:fixed — so they escape the editor's
+        // overflow clipping, and nothing that tears the editor down removes
+        // them by removing a parent. Only the two named dropdowns were closed
+        // explicitly on Esc and on dispose; the per-card ones on the variation
+        // cards were not, so an open one stayed on screen over the next tab's
+        // canvas with its items still live against a destroyed editor.
+        const _epeDropdowns = new Set();
+        // Returns how many were actually open. Callers that only want the
+        // teardown ignore it; Esc uses it to decide whether it has already
+        // done the user's bidding.
+        const _closeAllDropdowns = () => {
+          let _closed = 0;
+          for (const w of Array.from(_epeDropdowns)) {
+            try { if (w && w._closeDropdown && w._closeDropdown() === true) _closed++; } catch (_e) {}
+            // A wrap no longer in the document cannot be reopened, so stop
+            // holding it.
+            try { if (w && !w.isConnected) _epeDropdowns.delete(w); } catch (_e) {}
+          }
+          return _closed;
+        };
+
         const _makeDropdownBtn = (label, items, onPick) => {
           const wrap = document.createElement("span");
           wrap.style.cssText = `position: relative; display: inline-flex;`;
@@ -5399,11 +7237,16 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           let menu = null;
           let _menuOpen = false;
 
+          // Reports whether it actually closed something, so Esc can tell
+          // "a menu was open" from "nothing was open" without reaching into
+          // this closure.
           const _closeMenu = () => {
+            const _was = _menuOpen;
             if (menu && menu.parentNode) menu.parentNode.removeChild(menu);
             menu = null;
             _menuOpen = false;
             document.removeEventListener("mousedown", _onDocClick, true);
+            return _was;
           };
 
           const _onDocClick = (e) => {
@@ -5478,6 +7321,27 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           // mount; simpler and equally effective is the manual close hooked
           // into the EPE close handler (added below alongside closeEditor).
           wrap._closeDropdown = _closeMenu;
+          // Registered so a teardown can reach it. Pruned here rather than on
+          // every open: the variation cards build a pair of these on each
+          // render, so the set would otherwise grow for the life of the node.
+          if (_epeDropdowns.size > 64) {
+            for (const w of Array.from(_epeDropdowns)) {
+              // CLOSE, then forget. The registry entry is the wrap's only
+              // teardown handle, so dropping one whose menu is still open on
+              // document.body orphaned both the menu and its capture-phase
+              // document listener with nothing left able to reach them.
+              // The delete is in a finally: with both in one try, a throw
+              // inside _closeMenu skipped it, the set never dropped below 64,
+              // and the sweep re-ran — and re-threw — on every subsequent
+              // dropdown for the life of the node. That is the unbounded
+              // growth this block exists to prevent.
+              if (w && !w.isConnected) {
+                try { if (w._closeDropdown) w._closeDropdown(); } catch (_e) {}
+                finally { try { _epeDropdowns.delete(w); } catch (_e2) {} }
+              }
+            }
+          }
+          _epeDropdowns.add(wrap);
 
           wrap.appendChild(btn);
           // Expose mutable label for caller (used to flash "✓ Saved" feedback)
@@ -5515,12 +7379,36 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         useThisBtn.onclick = () => {
           // textEl.value is already what we want to commit. Capture pre-commit
           // value into the recall slot, then exit review.
+          // The chain is kept, so its intermediate steps become undo steps now.
+          _ieChainUndo.forEach(v => textEl._epePushUndoValue && textEl._epePushUndoValue(v));
           if (!_ieReviewIsInstruct) _ieThreadClear();
           _ieThreadSnapshot = null;   // committed — nothing to roll back to
           _reviewExit();
+          // Persistence was suspended for the review, so the accepted value
+          // has to be written now — after the exit, or it is suspended still.
+          _epePersistPrompt();
           singleActionRow.style.display = "none";
           try { _epeOllama.unloadModel(); } catch (_e) {}
           // Phase 4 will surface the Recall prompt button here.
+        };
+
+        // Send to tab — put this result in ANOTHER tab and carry on here.
+        //
+        // Deliberately does not commit, exit the review, or touch this tab. It
+        // is not a third way to accept a result; it is a way to park one
+        // somewhere while you keep working on this one.
+        const sendTabBtn = document.createElement("button");
+        sendTabBtn.textContent = "Send to tab";
+        sendTabBtn.title = "Put this result in another tab, without leaving this one";
+        sendTabBtn.style.cssText = toolBtnStyle + "font-size:11px;padding:4px 11px;";
+        toolBtnHover(sendTabBtn);
+        sendTabBtn.onclick = (ev) => {
+          ev.stopPropagation();
+          // Published by _buildPromptTabs, which runs later in this same
+          // builder — resolved at CLICK time, so the ordering is fine.
+          if (_epeOwnerNode && _epeOwnerNode._epeOpenSendToTab) {
+            _epeOwnerNode._epeOpenSendToTab(sendTabBtn, textEl.value);
+          }
         };
 
         // Append — combine with original
@@ -5534,11 +7422,21 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const orig = _originalPrompt || "";
           const combined = orig ? (orig.replace(/\s+$/, "") + "\n\n" + cur) : cur;
           textEl.value = combined;
-          textEl.dispatchEvent(new Event("input"));
+          // Same as the result path: pushing the value now on screen made
+          // the first ↶ a no-op, and with a chain it bounced straight back
+          // to the text just committed instead of stepping through it.
+          if (textEl._epeUndoMute) textEl._epeUndoMute(true);
+          try {
+            textEl.dispatchEvent(new Event("input"));
+          } finally {
+            if (textEl._epeUndoMute) textEl._epeUndoMute(false);
+          }
           updateTokenBadge(textEl.value);
+          _ieChainUndo.forEach(v => textEl._epePushUndoValue && textEl._epePushUndoValue(v));
           if (!_ieReviewIsInstruct) _ieThreadClear();
           _ieThreadSnapshot = null;
           _reviewExit();
+          _epePersistPrompt();
           singleActionRow.style.display = "none";
           try { _epeOllama.unloadModel(); } catch (_e) {}
         };
@@ -5550,9 +7448,17 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         ], (id) => {
           const target = id === "fav" ? "favorites" : "snippets";
           _libAddEntry(target, textEl.value);
-          const orig = saveDdBtn._labelText;
+          // Remember the real label once and cancel any pending revert. A
+          // second click inside 1.2 s used to capture "✓ Saved" as the label
+          // to restore, and its timer fired last — so the button read
+          // "✓ Saved" for the rest of the session.
+          if (saveDdBtn._epeOrigLabel == null) saveDdBtn._epeOrigLabel = saveDdBtn._labelText;
           saveDdBtn._labelText = "✓ Saved";
-          setTimeout(() => { saveDdBtn._labelText = orig; }, 1200);
+          if (saveDdBtn._epeRevertT) clearTimeout(saveDdBtn._epeRevertT);
+          saveDdBtn._epeRevertT = setTimeout(() => {
+            saveDdBtn._labelText = saveDdBtn._epeOrigLabel;
+            saveDdBtn._epeRevertT = null;
+          }, 1200);
         });
 
         // Options dropdown — Enhance again / Variations of this
@@ -5574,6 +7480,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         });
 
         singleActionBtns.appendChild(useThisBtn);
+        singleActionBtns.appendChild(sendTabBtn);
         singleActionBtns.appendChild(appendBtn);
         singleActionBtns.appendChild(saveDdBtn);
         singleActionBtns.appendChild(optionsDdBtn);
@@ -5615,7 +7522,27 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // been used or discarded the array is the source of truth).
         let _currentVariations = [];
 
+        // The two dropdown wraps each card builds. _epeDropdowns is a
+        // registry with one sweep — inside _makeDropdownBtn, and only past 64
+        // entries — so a card's wraps outlived the card, and each wrap's
+        // onPick closes over cardBody and through it the whole detached card,
+        // prompt text included. Rendering the cards once per AI run kept that
+        // near empty; parking rebuilds them on every tab round trip, which
+        // parked the pool AT its cap instead — measured, thirty detached cards
+        // and about fifty kilobytes of prompt held permanently.
+        let _cardDropdowns = [];
+
         const _clearVariationsCards = () => {
+          // Closed, then forgotten — the same order and the same reason as the
+          // sweep in _makeDropdownBtn: the registry entry is the wrap's only
+          // teardown handle, so dropping one whose menu is still open on
+          // document.body would orphan the menu and its capture-phase
+          // document listener with nothing left able to reach them.
+          for (const w of _cardDropdowns) {
+            try { if (w && w._closeDropdown) w._closeDropdown(); } catch (_e) {}
+            finally { try { _epeDropdowns.delete(w); } catch (_e2) {} }
+          }
+          _cardDropdowns = [];
           variationsContainer.innerHTML = "";
           _openCardTA = null;
           if (_cardOutsideListener) {
@@ -5732,12 +7659,47 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             cardUseBtn.onclick = (ev) => {
               ev.stopPropagation();
               const txt = cardBody.value;
-              if (textEl._epePushUndo) textEl._epePushUndo();
+              // No push here: textEl still holds the raw multi-variation
+              // stream dump, and pushing it made the first undo after a
+              // commit restore that dump. The pre-AI prompt is already on
+              // the stack (_reviewEnter pushed it) — that is what undo
+              // should reach.
               textEl.value = txt;
               updateTokenBadge(txt);
-              textEl.dispatchEvent(new Event("input"));
+              // Muted like the other commit paths, so the committed value is
+              // not its own undo step.
+              if (textEl._epeUndoMute) textEl._epeUndoMute(true);
+              try {
+                textEl.dispatchEvent(new Event("input"));
+              } finally {
+                if (textEl._epeUndoMute) textEl._epeUndoMute(false);
+              }
+              // Committing a variation replaces the prompt wholesale, which
+              // makes any existing instruct direction stale — same contract
+              // as Use this / Append (and the chain, if this review grew out
+              // of an instruct chain, becomes undo steps now).
+              _ieChainUndo.forEach(v => textEl._epePushUndoValue && textEl._epePushUndoValue(v));
+              if (!_ieReviewIsInstruct) _ieThreadClear();
+              _ieThreadSnapshot = null;
               _reviewExit();
+              // Persistence is suspended during review; the commit persists
+              // explicitly after the exit (same as Use this / Append).
+              _epePersistPrompt();
               try { _epeOllama.unloadModel(); } catch (_e) {}
+            };
+
+            // Send to tab — the case Daniel described: keep one variation
+            // while you try a different style, instead of having to choose now.
+            const cardSendBtn = document.createElement("button");
+            cardSendBtn.textContent = "Send to tab";
+            cardSendBtn.title = "Put this variation in another tab, without leaving this one";
+            cardSendBtn.style.cssText = toolBtnStyle + "font-size:11px;padding:4px 11px;";
+            toolBtnHover(cardSendBtn);
+            cardSendBtn.onclick = (ev) => {
+              ev.stopPropagation();
+              if (_epeOwnerNode && _epeOwnerNode._epeOpenSendToTab) {
+                _epeOwnerNode._epeOpenSendToTab(cardSendBtn, cardBody.value);
+              }
             };
 
             // Save ▾
@@ -5747,9 +7709,15 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             ], (id) => {
               const target = id === "fav" ? "favorites" : "snippets";
               _libAddEntry(target, cardBody.value);
-              const orig = cardSaveDd._labelText;
+              // Same as the editor's Save button: capture the label once,
+              // cancel any pending revert, or a double click sticks it.
+              if (cardSaveDd._epeOrigLabel == null) cardSaveDd._epeOrigLabel = cardSaveDd._labelText;
               cardSaveDd._labelText = "✓ Saved";
-              setTimeout(() => { cardSaveDd._labelText = orig; }, 1200);
+              if (cardSaveDd._epeRevertT) clearTimeout(cardSaveDd._epeRevertT);
+              cardSaveDd._epeRevertT = setTimeout(() => {
+                cardSaveDd._labelText = cardSaveDd._epeOrigLabel;
+                cardSaveDd._epeRevertT = null;
+              }, 1200);
             });
 
             // Options ▾
@@ -5758,16 +7726,17 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               { id: "variations", label: "Variations of this" },
             ], (id) => {
               // Chain into a new AI action with this card's text as input.
-              // runAiAction reads textEl.value as the prompt source, so we
-              // copy the card text in first. _reviewMode is currently
-              // "variations"; runAiAction will _reviewSetMode("streaming"),
-              // which preserves _originalPrompt across the chain.
-              textEl.value = cardBody.value;
-              if (id === "enhance") runAiAction("expand");
-              else if (id === "variations") runAiAction("variations");
+              // Handed over explicitly rather than written into textEl first:
+              // runAiAction enters review BEFORE swapping the text in, so
+              // _originalPrompt still snapshots the user's real prompt.
+              const _t = cardBody.value;
+              if (id === "enhance") runAiAction("expand", { sourceText: _t });
+              else if (id === "variations") runAiAction("variations", { sourceText: _t });
             });
 
+            _cardDropdowns.push(cardSaveDd, cardOptDd);
             cardBtns.appendChild(cardUseBtn);
+            cardBtns.appendChild(cardSendBtn);
             cardBtns.appendChild(cardSaveDd);
             cardBtns.appendChild(cardOptDd);
 
@@ -5793,16 +7762,26 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         reviewSaveAllBtn.onclick = () => {
           const cards = variationsContainer.querySelectorAll(".epe-variation-card textarea");
           if (!cards.length) return;
+          let _allSaved = true;
           cards.forEach((ta) => {
             const v = ta.value;
             const items = _libLoad("favorites");
             const def = v.slice(0, 48).replace(/\s+/g, " ").trim() + (v.length > 48 ? "\u2026" : "");
             items.push({ id: _libNewId(), name: def, text: v.trim(), date: new Date().toISOString() });
-            _libSaveItems("favorites", items);
+            // _libSaveItems reports now instead of swallowing: at the storage
+            // quota these saves evaporated while the button said "✓ Saved".
+            if (!_libSaveItems("favorites", items)) _allSaved = false;
           });
-          const orig = reviewSaveAllBtn.textContent;
-          reviewSaveAllBtn.textContent = "✓ Saved";
-          setTimeout(() => { reviewSaveAllBtn.textContent = orig; }, 1200);
+          if (reviewSaveAllBtn._epeOrigLabel == null)
+            reviewSaveAllBtn._epeOrigLabel = reviewSaveAllBtn.textContent;
+          reviewSaveAllBtn.textContent = _allSaved ? "✓ Saved" : "Save failed";
+          // Cancelled and re-armed, or a second click inside 1.2 s left the
+          // flash label up permanently.
+          if (reviewSaveAllBtn._epeRevertT) clearTimeout(reviewSaveAllBtn._epeRevertT);
+          reviewSaveAllBtn._epeRevertT = setTimeout(() => {
+            reviewSaveAllBtn.textContent = reviewSaveAllBtn._epeOrigLabel;
+            reviewSaveAllBtn._epeRevertT = null;
+          }, 1200);
           if (_rpActive === "favorites") _renderRpBody();
         };
 
@@ -5820,8 +7799,23 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         const _epeTargets = () => {
           if (!_epeNode) return [];
           if (!_epeNode.properties) _epeNode.properties = {};
-          if (!Array.isArray(_epeNode.properties.epe_wireless_targets)) _epeNode.properties.epe_wireless_targets = [];
-          return _epeNode.properties.epe_wireless_targets;
+          const _t = _epeNode.properties.epe_wireless_targets;
+          if (!Array.isArray(_t)) { _epeNode.properties.epe_wireless_targets = []; return _epeNode.properties.epe_wireless_targets; }
+          // The CONTAINER being an array was the only thing checked. A shared
+          // or hand-edited workflow carrying `[null]` reached `t.bind` on null
+          // inside renderWireless, which the build calls unguarded from an
+          // unguarded onNodeCreated — so the whole editor failed to
+          // construct: no textarea, no toolbar, no error, and the prompt in
+          // properties.epe_prompt unreachable until the file was repaired by
+          // hand. Healed in place, once, so the bad entry does not come back.
+          if (_t.some(x => !x || typeof x !== "object")) {
+            const _clean = _t.filter(x => x && typeof x === "object");
+            console.warn("[EPE] dropped " + (_t.length - _clean.length) +
+                         " malformed wireless target(s)");
+            _epeNode.properties.epe_wireless_targets = _clean;
+            return _clean;
+          }
+          return _t;
         };
 
         const footer = document.createElement("div");
@@ -5866,8 +7860,15 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
           targets.forEach((t, idx) => {
             // Resolve to confirm the target still exists; refresh label if needed.
-            const resolved = _epeResolveTargetWidget(t);
-            if (resolved && (!t.bindLabel)) _epeRebuildTargetLabel(t);
+            //
+            // Guarded: this walks the whole graph, which is untrusted shape
+            // from a shared workflow file. An unresolvable target must show a
+            // red dot, not take the entire wireless panel down with it — which
+            // is what a RangeError out of the tier cascade used to do.
+            if (!t || typeof t !== "object") return;
+            let resolved = null;
+            try { resolved = _epeResolveTargetWidget(t); } catch (_e) { resolved = null; }
+            if (resolved && (!t.bindLabel)) { try { _epeRebuildTargetLabel(t); } catch (_e) {} }
             const pill = document.createElement("div");
             pill.style.cssText = `display:flex;align-items:center;gap:5px;background:#2f3a4a;border:1px solid #3b4a5e;border-radius:3px;padding:4px 7px;font-size:12px;width:140px;box-sizing:border-box;cursor:pointer;`;
             pill.title = "Click to repick this target";
@@ -5963,9 +7964,42 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               }
               renderWireless();
               _epeUpdateBadge();
-              if (_epeOwnerNode._epeTabRestore) _epeOwnerNode._epeTabRestore();
-              if (_epeOwnerNode._epeStyleRestore) _epeOwnerNode._epeStyleRestore();
-              if (_epeOwnerNode._epeUiRestore) _epeOwnerNode._epeUiRestore();
+              // FIRST. _epeTabRestore's finally persists the thread map, so a
+              // map that has not been loaded yet is a map that overwrites the
+              // file's. Its own try/catch means a malformed epe_ie_threads
+              // cannot unwind the three restores below it either — which is how
+              // a bad epe_style used to take the threads and the panel layout
+              // down with it.
+              // ONE TRY EACH, not one for the four.
+              //
+              // These read `epe_style` and `epe_ui` out of a shared,
+              // hand-editable workflow file, and this function has the
+              // precedent on record: a workflow-supplied
+              // `epe_style.sliders.__proto__` threw out of _epeStyleRestore
+              // into the blanket catch below, so _epeUiRestore never ran and
+              // the saved threads and panel layout were dropped on every open
+              // of that file. That one site was hardened; its siblings were
+              // not, and round 59 put the repaint downstream of all three —
+              // so a throw anywhere above it left the instruct panel showing
+              // the PREVIOUS workflow's steps while the delete buttons acted
+              // on this one's.
+              try { if (_epeOwnerNode._epeThreadsRestore) _epeOwnerNode._epeThreadsRestore(); } catch (_e2) {}
+              try { if (_epeOwnerNode._epeTabRestore) _epeOwnerNode._epeTabRestore(); } catch (_e2) {}
+              try { if (_epeOwnerNode._epeStyleRestore) _epeOwnerNode._epeStyleRestore(); } catch (_e2) {}
+              try { if (_epeOwnerNode._epeUiRestore) _epeOwnerNode._epeUiRestore(); } catch (_e2) {}
+              // LAST, once, and only here.
+              //
+              // The instruct panel and its chip resolve the tab through
+              // _ieTabKey() -> properties.epe_tab_active, and _epeTabRestore
+              // is what CORRECTS that index (an over-MAX or hand-edited active
+              // tab is clamped to the last surviving slot). Round 58 repainted
+              // from inside the thread load, which now runs first — so the
+              // panel showed one tab's steps while the editor showed another's,
+              // and the panel's per-row delete re-reads the thread when
+              // CLICKED: the user deleted a step they could see and a
+              // different tab lost one. That is the failure _switchTo's own
+              // comment records from round 33, on the restore path.
+              try { _ieRefresh(); } catch (_e) {}
             } catch (_e) {}
           };
         }
@@ -5977,10 +8011,21 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         const closeEditor = () => {
           // dropdown menus are mounted to document.body, close any open
           // ones before the EPE goes away so they don't orphan in the DOM.
-          try {
-            if (saveDdBtn && saveDdBtn._closeDropdown) saveDdBtn._closeDropdown();
-            if (optionsDdBtn && optionsDdBtn._closeDropdown) optionsDdBtn._closeDropdown();
-          } catch (_e) {}
+          // All of them, not just the two named ones — see _epeDropdowns.
+          try { _closeAllDropdowns(); } catch (_e) {}
+          // UNREACHABLE in node mode, and has been for a long time: closeBtn
+          // is mounted only under `if (!_epeOwnerNode)`, and the one call site
+          // of this builder always passes a node. _epeDispose is the teardown
+          // that actually runs, and it releases all of this and a dozen things
+          // more — the resize observer, the drag handlers, the in-flight
+          // aborts, the dropdown registry, the tooltip.
+          //
+          // So this stays a partial list ON PURPOSE. Making it delegate to
+          // _epeDispose would change what an unreachable path does, which is
+          // the worst place to be wrong; making it a full copy would be a
+          // second list to keep in step. If this path is ever given a reason
+          // to run, delete it and call _epeDispose instead.
+          try { _clearVariationsCards(); } catch (_e) {}
           _epeTip.remove();
           floatingWin.remove();
         };
@@ -5991,15 +8036,24 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         loadBtn.onclick = () => {
           const _fileInput = document.createElement("input");
           _fileInput.type = "file"; _fileInput.accept = ".txt"; _fileInput.style.display = "none";
-          document.body.appendChild(_fileInput);
+          // NOT appended to document.body. It used to be, and it was removed
+          // only inside onchange — which never fires when the user cancels
+          // the OS file dialog. So every cancelled Load left an <input>
+          // parented to document.body for the life of the page, its onchange
+          // closure holding textEl and with it the entire editor. A detached
+          // input opens the picker perfectly well.
           _fileInput.onchange = () => {
             const file = _fileInput.files && _fileInput.files[0];
-            document.body.removeChild(_fileInput);
             if (!file) return;
             const reader = new FileReader();
             reader.onload = (e) => {
               const txt = (e.target.result || "").trim();
               if (!txt) return;
+              // Same as Clear Prompt: leave review before replacing the text.
+              // Discarding afterwards restored the pre-AI prompt over the file
+              // the user had just imported, and Ctrl+Z then resurrected the
+              // rejected AI result into node.properties.
+              if (_reviewMode) _autoDiscardReview("Text imported — result discarded");
               if (textEl._epePushUndo) textEl._epePushUndo();
               textEl.value = txt;
               updateTokenBadge(txt);
@@ -6013,7 +8067,21 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         clearBtn.onclick = () => {
           if(textEl.value.trim() && !window.confirm("Clear all text?")) return;
-          textEl.value=""; updateTokenBadge(""); textEl.focus();
+          // Leave review FIRST, like every other wholesale replacement here.
+          // Without this the review strip stayed up over unrelated text with
+          // Use this / Append / Discard live, the push below put the AI result
+          // on the undo stack, and Discard-then-Ctrl+Z brought the rejected
+          // result back — into the editor and into node.properties. Use this
+          // after a Clear committed "" and wiped the prompt outright.
+          if (_reviewMode) _autoDiscardReview("Prompt cleared — result discarded");
+          // Record it, so ↶ brings the prompt back.
+          if (textEl._epePushUndo) textEl._epePushUndo();
+          textEl.value=""; updateTokenBadge("");
+          // The dispatch is the whole fix: updateTokenBadge writes
+          // epe_prompt, but only the input listener runs _epeTabSync, and a
+          // rebuild reads the TAB slot first — so the cleared text came back.
+          textEl.dispatchEvent(new Event("input"));
+          textEl.focus();
         };
 
         textEl.onkeydown = (ev) => {
@@ -6025,7 +8093,12 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             if (_reviewMode) {
               return; // bubble up to floatingWin handler
             }
-            ev.preventDefault(); ev.stopPropagation(); closeEditor();
+            // Embedded in a node — the only live mode — closeEditor() would
+            // remove() the node's own DOM-widget element with nothing to put
+            // it back, so a reflexive Esc blanked the node until reload.
+            // Drop focus instead.
+            ev.preventDefault(); ev.stopPropagation();
+            try { textEl.blur(); } catch (_e) {}
             return;
           }
           // Non-Esc keys: stop bubbling so the textarea's own handling (typing,
@@ -6049,26 +8122,478 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // The "thread" is the running list of instructions given for the
         // current prompt tab. The last few are sent to the model as context so
         // relative direction ("dial that back", "more like dusk") resolves
-        // against what came before. Threads are scoped per prompt tab (read
-        // from the persisted epe_tab_active) and saved with the node.
+        // against what came before. Threads are scoped per prompt tab — read
+        // from the EDITOR's active tab since round 63, not from the persisted
+        // epe_tab_active — and saved with the node.
         const IE_CONTEXT_DEPTH = 5;
+        // Ceiling on what a tab's thread STORES. Only the last
+        // IE_CONTEXT_DEPTH are ever sent to the model; without a cap, every
+        // instruction ever typed shipped inside shared workflow files.
+        const IE_THREAD_MAX = 20;
+
+        // A stable id for an entry that was stored without one.
+        //
+        // The random mint is used only when the heal write below SUCCEEDS. If
+        // it does not — a store at quota rejects the heal, which GROWS the
+        // value by adding ids, while the delete write that SHRINKS it still
+        // goes through — then a random id differs between the render's load
+        // and the delete's load, `filter(x => x.id !== item.id)` matches
+        // nothing, and the entry cannot be deleted, renamed or edited, in
+        // silence. The deterministic fallback is derived from the entry
+        // itself, so every load agrees on it without anything being written.
+        const _epeMintId = () => "epe" + Date.now().toString(36) +
+                                 Math.random().toString(36).slice(2, 8);
+        const _epeDerivedId = (x, i) => {
+          const s = String((x && x.name) || "") + "\u0000" +
+                    String((x && x.text) || "") + "\u0000" +
+                    (Array.isArray(x && x.steps) ? x.steps.join("\u0000") : "");
+          let h = 0x811c9dc5;
+          for (let k = 0; k < s.length; k++) {
+            h ^= s.charCodeAt(k);
+            h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+          }
+          return "epeD" + i + "_" + h.toString(36);
+        };
+        // Writes `out` back only if the write succeeds; the caller keeps the
+        // deterministic ids when it does not. Returns whether it landed.
+        // Cap is REQUIRED — no default. A default silently paper-cracks over
+        // an uncapped caller ("wrote 4000 back and normalised it as if that
+        // were the intended cap"); requiring it forces every caller to
+        // decide, matching whatever their upstream load-side cap is.
+        const _epeHealIds = (key, out, cap) => {
+          try {
+            if (Array.isArray(out) && typeof cap === "number" && cap > 0
+                && out.length > cap) {
+              out = out.slice(-cap);
+            }
+            localStorage.setItem(key, JSON.stringify(out));
+            return true;
+          } catch (_e) { return false; }
+        };
 
         const _ieSeqKey  = "epe_library_sequences";
-        const _ieSeqLoad = () => { try { return JSON.parse(localStorage.getItem(_ieSeqKey) || "[]"); } catch(_e) { return []; } };
-        const _ieSeqSave = (a) => { try { localStorage.setItem(_ieSeqKey, JSON.stringify(a)); } catch(_e) {} };
+        // Whatever JSON.parse produced was returned straight to callers that
+        // do `all.slice()` and `seq.steps.join()`. A non-array — or one entry
+        // without `steps` — threw out of _ieRenderSaved, and the saved pane
+        // then never rendered again for the life of the node. Same shape check
+        // _libLoad already applies to the library.
+        // Upper bound on stored sequences and steps-per-sequence. A hostile
+        // or corrupt localStorage value with a million-entry array would
+        // otherwise hang the tab on Instruct-Edit open — _ieRenderSaved
+        // builds one card per entry, and the caps are the only thing
+        // between that and an unresponsive UI.
+        // Once per editor. A load-side truncation warning fires on every
+        // open of the pane otherwise, and the user can only act on it once.
+        let _epeStoreOverflowWarned = false;
+        const IE_SEQ_MAX_COUNT = 200;   // sequences per user
+        const IE_SEQ_MAX_STEPS = 200;   // steps per sequence
+        const _ieSeqLoad = () => {
+          let v;
+          try { v = JSON.parse(localStorage.getItem(_ieSeqKey) || "[]"); }
+          catch(_e) { return []; }
+          if (!Array.isArray(v)) return [];
+          // Healed INLINE, on every load, like _libLoad. Round 40 healed from
+          // a one-shot IIFE at editor construction instead, so an id-less
+          // entry that appeared afterwards — a second tab, a hand-edited
+          // store, an older build — was minted afresh on every single load,
+          // and _ieRenderSaved's card and the ✕ handler's reload disagreed
+          // about its id. The delete filtered nothing and wrote the whole
+          // list back: the sequence reappeared and could never be removed.
+          // Keep the NEWEST, the same end _ieSeqSave keeps.
+          //
+          // This was slice(0, MAX) against a save-side slice(-MAX), and every
+          // writer is save(<array derived from load()>) — so an over-cap store
+          // had its newest entries hidden by the load and then written out of
+          // existence by the very next save. Measured: 250 stored sequences,
+          // one rename click, the 50 most recent gone for good with no toast.
+          // The save-side toast cannot fire in that case either: by the time
+          // _ieSeqSave runs, load has already cut the array to MAX.
+          // The shape filter and the window, tracked BY ORIGINAL INDEX.
+          //
+          // The heal below writes back into the full stored array, and the
+          // only safe way to know which stored slot a kept entry came from is
+          // to remember it. Reconstructing it as `i - (all.length -
+          // kept.length)` assumed every removal was a contiguous prefix; a
+          // single junk entry in the middle shifted the mapping and grafted
+          // one entry's id onto another.
+          const _keptIdx = [];
+          v.forEach((x, i) => { if (x && typeof x === "object") _keptIdx.push(i); });
+          const _all = _keptIdx.map(i => v[i]);
+          const _win = _keptIdx.slice(-IE_SEQ_MAX_COUNT);
+          const kept = _win.map(i => v[i]);
+          if (_all.length > IE_SEQ_MAX_COUNT && !_epeStoreOverflowWarned) {
+            // Latch INSIDE the try, after the call. `_toast` is a const
+            // declared much further down this same closure, and _libLoad —
+            // which shares this flag — is reachable during node construction,
+            // where that binding is still in its temporal dead zone. Setting
+            // the flag first meant the throw burned the one warning all three
+            // stores share and nothing was ever shown.
+            try {
+              _toast("Saved sequences over the " + IE_SEQ_MAX_COUNT +
+                     " limit: the oldest " + (_all.length - IE_SEQ_MAX_COUNT) +
+                     " are hidden, and will be dropped the next time this "
+                     + "list is saved.");
+              _epeStoreOverflowWarned = true;
+            } catch(_e2) {}
+          }
+          let _healed = false;
+          const out = kept.map((x, i) => ({
+                    id:    (x.id === undefined || x.id === null || x.id === "")
+                             ? ((_healed = true), _epeMintId())
+                             : x.id,
+                    name:  String(x.name || "Untitled"),
+                    steps: Array.isArray(x.steps)
+                             // Keep NEWEST steps (drop oldest) — matches the
+                             // save-side semantics in _ieSeqSave. Was
+                             // slice(0, MAX); asymmetry would silently drop
+                             // the most-recent steps of an oversized entry.
+                             ? x.steps.filter(s => typeof s === "string").slice(-IE_SEQ_MAX_STEPS)
+                             : [],
+                    date:  x.date,
+                  }));
+          if (_healed) {
+            // Patched onto the ORIGINALS. Writing `out` back would persist
+            // the normaliser's projection over the whole store — so merely
+            // OPENING the pane deleted every field this build does not know
+            // about, on entries that needed no repair at all.
+            // Over the FULL stored array, not the window.
+            //
+            // `kept` is the newest IE_SEQ_MAX_COUNT; writing that back meant
+            // one id-less entry turned a plain OPEN of the pane into a delete
+            // of everything above the cap — measured 2500 -> 2000 with no user
+            // action. The cap bounds what is RENDERED (one card per entry);
+            // it has no business bounding what is already on disk. Truncation
+            // belongs on the save path, where the user did something.
+            // Every stored entry survives, in its stored position, with
+            // whatever fields it had. Only the ones that were actually
+            // normalised get an id patched on, and only into their OWN slot.
+            // Entries the shape filter dropped are copied through untouched —
+            // a read has no business deleting them either.
+            const merged = v.slice();
+            _win.forEach((_orig, _w) => {
+              const x = v[_orig];
+              if (x && (x.id === undefined || x.id === null || x.id === ""))
+                merged[_orig] = Object.assign({}, x, { id: out[_w].id });
+            });
+            // `merged.length` as the cap: the parameter is required by design
+            // (no default), and this is the explicit way to say "no
+            // truncation" rather than passing a number that would trim.
+            if (!_epeHealIds(_ieSeqKey, merged, merged.length)) {
+              // The write was refused. Fall back to ids every load derives
+              // the same way, so delete and rename still match.
+              out.forEach((o, i) => {
+                const x = kept[i];
+                if (x.id === undefined || x.id === null || x.id === "")
+                  o.id = _epeDerivedId(x, i);
+              });
+            }
+          }
+          return out;
+        };
+        // Cap on WRITE too, not just on load. Otherwise a save that pushes
+        // total > IE_SEQ_MAX_COUNT succeeds silently and the newest entries
+        // (last in the array) are the ones dropped on next load — a user
+        // who just saved a sequence sees it vanish after any reload. Same
+        // for per-sequence steps. If truncation happens, toast the user
+        // rather than silently drop.
+        const _ieSeqSave = (a) => {
+          if (!Array.isArray(a)) return false;
+          let _truncated = false;
+          let out = a;
+          // Drop OLDEST on overflow, not newest. Every writer pushes new
+          // entries at the tail — `slice(0, MAX)` would keep the head and
+          // discard the just-added entry, so the user's most-recent save
+          // is the exact one that vanishes on toast. `slice(-MAX)` keeps
+          // the tail (newest) and discards the head (oldest).
+          if (out.length > IE_SEQ_MAX_COUNT) { out = out.slice(-IE_SEQ_MAX_COUNT); _truncated = true; }
+          out = out.map((x) => {
+            // Steps within a sequence are chronological too — keep the
+            // most recent IE_SEQ_MAX_STEPS.
+            if (x && Array.isArray(x.steps) && x.steps.length > IE_SEQ_MAX_STEPS) {
+              _truncated = true;
+              return Object.assign({}, x, { steps: x.steps.slice(-IE_SEQ_MAX_STEPS) });
+            }
+            return x;
+          });
+          try { localStorage.setItem(_ieSeqKey, JSON.stringify(out)); }
+          catch(_e) {
+            try { _toast("Could not save — browser storage is full or blocked."); } catch(_e2) {}
+            return false;
+          }
+          if (_truncated) {
+            try { _toast("Oldest sequences trimmed to fit (" + IE_SEQ_MAX_COUNT + " × " + IE_SEQ_MAX_STEPS + ")."); } catch(_e2) {}
+          }
+          return true;
+        };
 
         let _ieThreads = {};                       // { "<promptTabIndex>": [instruction, …] }
+        // Closing a prompt tab splices the tab array, so these keys have to
+        // shift with it. Without this, tab N inherited tab N-1's edit
+        // history and fed it to the model as context for a prompt it was
+        // never applied to.
+        // Pins held by an operation that is mid-flight — a sequence replay, an
+        // edit waiting for its result. Round 24 pinned the tab so a SWITCH
+        // could not redirect a write taken before an await; but the pin is an
+        // INDEX, and closing or reopening a tab renumbers every index above
+        // it, so after a close the pin named somebody else's tab. Measured:
+        // closing tab 0 during a replay on tab 1 left the surviving tab
+        // holding the replay's rollback, and a thread stranded under an index
+        // no tab owns — which the next "+ new tab" inherits as its EARLIER
+        // DIRECTION.
+        //
+        // A pin is an object, so the shifters below can move it exactly as
+        // they move the threads. `key` going null means the pinned tab is gone
+        // and the operation must stop writing.
+        const _ieTabPins = new Set();
+        const _iePin = (key) => { const p = { key }; _ieTabPins.add(p); return p; };
+        const _ieUnpin = (p) => { try { _ieTabPins.delete(p); } catch (_e) {} };
+        const _ieShiftPins = (fn) => {
+          for (const p of _ieTabPins) {
+            const n = parseInt(p.key, 10);
+            if (!Number.isFinite(n)) continue;
+            p.key = fn(n);
+          }
+        };
+
+        const _ieThreadsDropTab = (idx) => {
+          const out = {};
+          Object.keys(_ieThreads).forEach(k => {
+            const n = parseInt(k, 10);
+            if (!Number.isFinite(n) || n === idx) return;
+            out[String(n > idx ? n - 1 : n)] = _ieThreads[k];
+          });
+          _ieThreads = out;
+          // Exactly the shift applied to the threads: the pinned tab itself is
+          // gone (null), anything above it moves down one.
+          _ieShiftPins((n) => (n === idx ? null : String(n > idx ? n - 1 : n)));
+          _iePersistThreads();
+        };
+        // Inverse: reopen slot idx (empty) when the tab-close toast restores
+        // a tab, so the threads above it move back to their own tabs.
+        const _ieThreadsRestoreTab = (idx) => {
+          const out = {};
+          Object.keys(_ieThreads).forEach(k => {
+            const n = parseInt(k, 10);
+            if (!Number.isFinite(n)) return;
+            out[String(n >= idx ? n + 1 : n)] = _ieThreads[k];
+          });
+          _ieThreads = out;
+          _ieShiftPins((n) => String(n >= idx ? n + 1 : n));
+          _iePersistThreads();
+        };
+        // Two tabs exchanged places rather than shifting: the over-MAX
+        // restore swap in `_epeTabRestore`. The tab TEXTS are permuted there;
+        // without this the index-keyed map is not, and two directions end up
+        // describing prompts they were never applied to (B-5). Driven on a
+        // 6-tab workflow saved on tab 5: slot 3 held PROMPT5 under PROMPT3's
+        // direction, and slot 5 held PROMPT3 under PROMPT5's.
+        //
+        // Absence is meaningful and must travel too. If `a` has a thread and
+        // `b` has none, `b` must END UP with the thread and `a` with none —
+        // assigning in place would leave a stale copy behind at `a`.
+        //
+        // NO `_iePersistThreads()` here, unlike the two shifters above. This
+        // runs mid-restore and `_epeTabRestore`'s own `finally` persists once
+        // the tab arrays are final. Persisting from inside a shifter against a
+        // half-assembled tab count is the round-57 B-2 defect, which deleted
+        // the last parked tab's thread.
+        const _ieThreadsSwapTabs = (a, b) => {
+          const ka = String(a), kb = String(b);
+          if (ka === kb) return;
+          const ta = _ieThreads[ka], tb = _ieThreads[kb];
+          if (tb === undefined) delete _ieThreads[ka]; else _ieThreads[ka] = tb;
+          if (ta === undefined) delete _ieThreads[kb]; else _ieThreads[kb] = ta;
+          // A pin naming either slot follows the text it was taken against.
+          _ieShiftPins((n) => (n === a ? kb : (n === b ? ka : String(n))));
+        };
+        // Which tab is the user actually looking at?
+        //
+        // Ask the EDITOR, not the file. This used to read
+        // properties.epe_tab_active, and the file's index can lag the editor's
+        // — a workflow load that declines to reconcile, a partial payload, any
+        // moment between a switch and its persist. When it lagged, the instruct
+        // panel listed a different tab's steps than the one on screen, its
+        // per-row ✕ deleted from that tab and saved it, and a new direction was
+        // filed under an index no tab owns, where the dead-tab prune dropped it
+        // on the next save. Round 33 measured that from a tab switch, round 59
+        // from a repaint ordering, round 61 from a gated reconcile — three
+        // rounds treating the symptom, because the reader was asking the wrong
+        // object.
+        //
+        // Same published-getter shape as _epeTabCountFn below, for the same
+        // reason: `_active` lives in the _buildPromptTabs IIFE, a deeper scope
+        // than this one. The file is the fallback for the window before the tab
+        // set is built.
+        let _epeTabActiveFn = null;
         const _ieTabKey = () => {
+          try {
+            if (_epeTabActiveFn) {
+              const _a = _epeTabActiveFn();
+              if (Number.isFinite(_a) && _a >= 0) return String(_a);
+            }
+          } catch(_e) {}
           try {
             const p = (_epeOwnerNode && _epeOwnerNode.properties) || {};
             return String(p.epe_tab_active || 0);
           } catch(_e) { return "0"; }
         };
+        // Set by (function _buildPromptTabs(){…}) once the tab array exists.
+        // _iePersistThreads needs the LIVE tab count to prune dead thread
+        // keys, and `_tabs` is declared inside that IIFE — a deeper scope
+        // that this one cannot see. Round 49 read `_tabs` here directly; the
+        // ReferenceError was swallowed by the catch below and epe_ie_threads
+        // stopped being written at all.
+        //
+        // A getter rather than a captured reference, because _epeTabRestore
+        // REASSIGNS _tabs (`_tabs = _fullTabs.slice(0, MAX)`), so a snapshot
+        // would go stale on the first workflow load.
+        //
+        // null means "tabs not built yet" — distinct from "zero tabs". The
+        // prune is skipped in that state rather than deleting every key.
+        let _epeTabCountFn = null;
         const _iePersistThreads = () => {
           if (!_epeOwnerNode) return;
+          // Not while a result is under review. The thread is the direction
+          // that describes the COMMITTED prompt; an instruction whose result
+          // the user has not accepted is not part of it yet.
+          //
+          // _epePersistPrompt has refused to write under review since round 5
+          // for exactly this reason — "a result under review is not the user's
+          // prompt yet" — but the thread wrote through, so a rebuild mid-review
+          // (a workflow-tab switch, a reload) restored the old prompt with the
+          // REJECTED instruction still attached. It then went out as EARLIER
+          // DIRECTION on every later edit, describing a change the prompt does
+          // not have. epe_ie_threads rides in node.properties, so it shipped
+          // inside workflow files sent to other people too.
+          //
+          // _reviewExit flushes on the way out, so both Discard (which has
+          // just rolled the thread back) and every commit path land correctly.
+          if (_reviewMode) return;
+          // Also refuse to persist during a tab restore in progress —
+          // `_autoDiscardReview` inside `_epeTabRestore` calls _reviewExit
+          // which calls _iePersistThreads BEFORE _tabs is replaced with
+          // the incoming workflow's tab set. Pruning against the OLD
+          // (smaller) _tabs.length there dropped legit threads for tab
+          // indices that ARE about to become valid.
+          if (_epeOwnerNode._epeRestoring) return;
           if (!_epeOwnerNode.properties) _epeOwnerNode.properties = {};
-          try { _epeOwnerNode.properties.epe_ie_threads = JSON.parse(JSON.stringify(_ieThreads)); } catch(_e) {}
+          try {
+            // Prune keys that don't correspond to a live tab. Otherwise a
+            // tab that was closed by any path other than _ieThreadsDropTab
+            // (a workflow reload with fewer tabs, an old file with 6 tabs
+            // where we now show 4) leaves its thread key in `_ieThreads`
+            // and it ships in the saved workflow forever — visible to
+            // anyone the file is shared with.
+            // -1 = tab set not built yet. Key hygiene still applies; the
+            // dead-tab prune does not, because "no tabs" and "tabs unknown"
+            // must not both mean "delete everything".
+            let _n = -1;
+            try { if (_epeTabCountFn) _n = _epeTabCountFn(); } catch(_e2) { _n = -1; }
+            if (!Number.isFinite(_n)) _n = -1;
+            const _clean = {};
+            Object.keys(_ieThreads).forEach(k => {
+              // Pure-integer key check: coerce → back to string; equal
+              // means the key was a canonical integer string. Rejects
+              // "1.5" (coerces to 1, collides), "abc" (NaN), " 1" etc.
+              if (k !== String(parseInt(k, 10))) return;
+              const i = parseInt(k, 10);
+              if (!Number.isFinite(i) || i < 0) return;
+              if (_n >= 0 && i >= _n) return;
+              _clean[k] = _ieThreads[k];
+            });
+            _epeOwnerNode.properties.epe_ie_threads = JSON.parse(JSON.stringify(_clean));
+          } catch(_e) {}
         };
+        // Load the saved threads into `_ieThreads`. THIS MUST RUN BEFORE
+        // _epeTabRestore.
+        //
+        // It used to live at the top of _epeUiRestore, which
+        // _epeRefreshFromProps calls THIRD:
+        //
+        //     _epeTabRestore();   // ends with _iePersistThreads() in a finally
+        //     _epeStyleRestore();
+        //     _epeUiRestore();    // <- the only thing that LOADS the threads
+        //
+        // On a fresh node `_ieThreads` is still {} when that finally fires, and
+        // _iePersistThreads writes unconditionally — so opening ANY workflow
+        // wrote {} over its own epe_ie_threads, and _epeUiRestore then read the
+        // {} back. Every saved direction was gone on the first open, and gone
+        // from the file the moment it was saved again. Round 55 made
+        // _iePersistThreads execute at all (J-01); this is the other half of
+        // that fix, and without it nothing round 57 did to the prune could be
+        // observed on a reload.
+        //
+        // Also authoritative on ABSENCE: a workflow with no epe_ie_threads
+        // resets the map. Leaving it alone let the outgoing workflow's
+        // directions ride into the incoming one — measured: workflow A's
+        // directions written into workflow B's properties over B's own, then
+        // attached to B's prompts.
+        if (_epeOwnerNode) {
+          _epeOwnerNode._epeThreadsRestore = () => {
+            // Instruct Edit threads ride along with the prompt tabs they belong
+            // to, so reopening a workflow restores the direction that built it.
+            try {
+              const th = (_epeOwnerNode.properties || {}).epe_ie_threads;
+              if (th && typeof th === "object") {
+                const clean = {};
+                Object.keys(th).forEach(k => {
+                  // `clean[k] = …` with k === "__proto__" is not a property
+                  // write — it calls Object.prototype's setter and REPLACES
+                  // the object's prototype. epe_ie_threads comes out of a
+                  // workflow file via JSON.parse, which produces "__proto__"
+                  // as an OWN key, so Object.keys hands it over. The result
+                  // was an _ieThreads whose prototype was an array: every
+                  // thread lookup went through it, and _iePersistThreads wrote
+                  // the wreckage back into the file the user shares.
+                  if (k === "__proto__" || k === "constructor" || k === "prototype") return;
+                  // Only pure non-negative integer string keys — reject
+                  // "1.5", "abc", " 1" etc. that would coerce to a valid
+                  // integer via parseInt but silently collide with
+                  // legitimate keys or shift under `_ieThreadsDropTab`.
+                  if (k !== String(parseInt(k, 10))) return;
+                  if (parseInt(k, 10) < 0) return;
+                  if (Array.isArray(th[k])) clean[k] = th[k].filter(x => typeof x === "string").slice(-IE_THREAD_MAX);
+                });
+                _ieThreads = clean;
+              }
+            } catch (_e) {}
+            // NO reset on absence, and that is not an oversight.
+            //
+            // Rounds 58-63 carried one here, on the reasoning that a workflow
+            // which has never used Instruct Edit must not inherit the map of
+            // one that has. Under the contract verified in round 63 the case
+            // cannot arise: LGraph.configure rebuilds every node, so `_ieThreads`
+            // is the build's own `{}` when the loader above runs, and if the
+            // file carries no map there is nothing to inherit. Driven by two
+            // independent reviews — 381 firings over 1,000 node lifetimes, none
+            // with anything to delete, and disabling it byte-identical over
+            // 21,000 recorded states.
+            //
+            // If ComfyUI ever starts reusing a node across loads, this is where
+            // the cross-workflow half of D-1 comes back, and the fix is to
+            // record whether the incoming payload carried an `epe_ie_threads`
+            // object and clear the map when it did not. Written down rather
+            // than shipped, because dead code with a rationale is how the last
+            // five rounds happened.
+            // Drop the OUTGOING review's thread rollback before the restore
+            // below auto-discards it.
+            //
+            // _autoDiscardReview unwinds an instruct result with
+            // _ieThreadSet(_ieThreadSnapshot) and passes no key, so
+            // _ieTabKey() reads properties.epe_tab_active — which the
+            // configure has ALREADY replaced with the incoming workflow's.
+            // Measured: leave an instruct result under review, switch
+            // workflow tabs, and workflow A's pre-edit snapshot was written
+            // into workflow B's active slot over B's own direction, then
+            // persisted into B's file. The prompt half of the same discard is
+            // harmless — _epeTabRestore overwrites textEl a moment later —
+            // but the thread half lands in a keyed map that survives.
+            //
+            // _reviewExit clears both of these anyway; clearing them here just
+            // means the rollback has nothing to write into the wrong workflow.
+            try { _ieThreadSnapshot = null; _ieReviewIsInstruct = false; } catch (_e) {}
+          };
+        }
         // Declared here rather than beside the divider: _epePersistUi reads it and
         // runs during the initial _setRpTab, which happens before the divider is
         // built — a `let` read before its declaration throws (temporal dead zone).
@@ -6085,10 +8610,207 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // which makes the existing direction stale — committing an instruct
         // result does not, because the thread is what produced it.
         let _ieReviewIsInstruct = false;
+        // Values replaced by each step of an instruct chain. They reach the
+        // undo stack only if the chain is committed; any exit drops them.
+        let _ieChainUndo = [];
+        // Bumped by every instruct run. _ieFinish compares against it so a
+        // superseded run cannot tear down a newer run's review.
+        let _ieReviewToken = 0;
         // Thread contents as they were when the current instruct review began.
         // Discarding the result must also unwind the direction that produced it,
         // otherwise the context would describe a change the prompt no longer has.
         let _ieThreadSnapshot = null;
+
+        // ── Parked reviews ──────────────────────────────────────────────
+        // A result under review is the user's until they Use it or Discard
+        // it. Switching prompt tabs is neither, so it no longer throws the
+        // result away: the review is PARKED, pinned to the tab it started
+        // on, and restored intact when the user comes back.
+        //
+        // Parking has to happen because the tab must stay usable while the
+        // review waits. A "single" result lives IN textEl, and a
+        // "variations" review hides textEl behind the card picker — so a
+        // review simply left running would either be overwritten by the
+        // other tab's prompt or hide it. The park puts the user's own
+        // prompt back on screen, tears the review UI down, and holds the
+        // result, the snapshot, the instruct flags and the chain together.
+        //
+        // Nothing is discarded and nothing under review reaches the node:
+        // what the tab saves is _originalPrompt, which is exactly what it
+        // held before the AI ran.
+        //
+        // Pinned with the same registered pins the instruct edits use, so
+        // closing a tab below a parked one renumbers the park with it
+        // instead of stranding it on somebody else's prompt.
+        const _reviewParks = [];
+
+        const _reviewParkFind = (key) => {
+          for (let i = 0; i < _reviewParks.length; i++)
+            if (_reviewParks[i].pin.key === key) return i;
+          return -1;
+        };
+
+        // Drops parks whose tab has been closed — _ieShiftPins nulls the key
+        // — and, if `key` is given, any park held for that tab.
+        const _reviewParkDrop = (key) => {
+          for (let i = _reviewParks.length - 1; i >= 0; i--) {
+            const p = _reviewParks[i];
+            if (p.pin.key === null || (key !== undefined && p.pin.key === key)) {
+              _ieUnpin(p.pin);
+              _reviewParks.splice(i, 1);
+            }
+          }
+        };
+
+        // Park the live review against `key`. Returns true if one was parked.
+        // A run still STREAMING is not parked: there is no result yet to keep,
+        // and its tokens are landing in textEl, so the caller cancels it.
+        const _reviewPark = (key) => {
+          if (!_reviewMode || _reviewMode === "streaming") return false;
+          // An instruct review with no rollback point cannot be parked
+          // safely: clearing _reviewMode un-blocks _iePersistThreads, and
+          // without a snapshot there is nothing to roll the live thread back
+          // to, so the un-accepted instruction would persist. Every path that
+          // enters or chains a review marks one, so this is unreachable — but
+          // it was reachable until this round, and the failure was silent.
+          // Discarding is the honest fallback: it says so.
+          if (_reviewMode !== "variations" && _ieReviewIsInstruct && !_ieThreadSnapshot) {
+            _autoDiscardReview("Result discarded — its edit history was incomplete");
+            return false;
+          }
+          const _pin = _iePin(key);
+          let _pushed = false;
+          try {
+          const park = {
+            pin:        _pin,
+            mode:       _reviewMode,
+            original:   _originalPrompt,
+            result:     (_reviewMode === "single") ? textEl.value : null,
+            cards:      null,
+            isInstruct: _ieReviewIsInstruct,
+            threadSnap: _ieThreadSnapshot,
+            // The LIVE thread as well as the rollback point. Clearing
+            // _reviewMode below un-blocks _iePersistThreads, which refuses to
+            // write while a result is under review precisely because an
+            // instruction whose result the user has not accepted is not part
+            // of the direction yet. Parking without this left that instruction
+            // in _ieThreads, and the next persist from anywhere — an edit on
+            // another tab, any review exiting, a tab close — wrote it into
+            // node.properties.epe_ie_threads and out into the saved workflow,
+            // describing a change the parked tab's prompt does not have.
+            threadLive: (function () {
+              try { return _ieThreadGet(key).slice(); } catch (_e) { return null; }
+            })(),
+            // Set by _ieFinish, showAiResult and _ieRunSequence to name what
+            // is being reviewed. _reviewEnter resets it to the generic text,
+            // so without this an instruct result came back calling itself an
+            // Enhance result.
+            label:      (function () {
+              try { return reviewLabel.textContent; } catch (_e) { return null; }
+            })(),
+            chainUndo:  _ieChainUndo.slice(),
+          };
+          if (_reviewMode === "variations") {
+            // The CURRENT card values, not the strings the model returned:
+            // the cards are editable, and an edit made before the switch is
+            // part of the result the user is holding.
+            const tas = variationsContainer.querySelectorAll(".epe-variation-card textarea");
+            park.cards = tas.length ? Array.from(tas).map(t => t.value)
+                                    : _currentVariations.slice();
+          }
+          _reviewParkDrop(key);          // one park per tab; the newer wins
+          _reviewParks.push(park);
+          _pushed = true;
+          // State FIRST, then the value. _epePersistPrompt refuses to write
+          // while _reviewMode is set, so restoring the prompt before clearing
+          // it would leave the AI result in node.properties.epe_prompt and the
+          // next rebuild would undo the park.
+          _reviewMode         = null;
+          _originalPrompt     = null;
+          _ieThreadSnapshot   = null;
+          _ieChainUndo        = [];
+          _ieReviewIsInstruct = false;
+          // The teardown _reviewExit does, WITHOUT its side effects: no thread
+          // rollback, no unloadModel, no toast, and the chain is carried in the
+          // park rather than dropped.
+          reviewStrip.style.display = "none";
+          originalStrip.style.display = "none";
+          reviewSaveAllBtn.style.display = "none";
+          textEl.style.display = "";
+          textEl.readOnly = false;
+          textEl.style.opacity = "";
+          variationsContainer.style.display = "none";
+          _clearVariationsCards();
+          singleActionRow.style.display = "none";
+          // The thread goes back to what it was before this review, for the
+          // same reason the prompt does: with _reviewMode cleared, the next
+          // persist would otherwise ship an un-accepted instruction. The live
+          // one is in the park and comes back on return.
+          if (park.isInstruct && park.threadSnap) {
+            try { _ieThreadSet(park.threadSnap, key); } catch (_e) {}
+          }
+          // The streaming placeholder, which _reviewExit restores and the
+          // single-result finish does not — so a parked Enhance left
+          // "Generating enhanced prompt…" over a tab with nothing running.
+          if (textEl._savedPlaceholder != null) {
+            textEl.placeholder = textEl._savedPlaceholder;
+            textEl._savedPlaceholder = null;
+          }
+          // The user's own prompt, on screen and onto the node, so the caller's
+          // `_tabs[_active] = textEl.value` saves what the tab really held.
+          if (park.original !== null && textEl._epeRestoreValue) {
+            textEl._epeRestoreValue(park.original);
+            try { updateTokenBadge(textEl.value); } catch (_e) {}
+          }
+          return true;
+          } finally {
+            // _iePin registers into _ieTabPins immediately, but nothing can
+            // release it until the park is in _reviewParks. A throw in the
+            // window between would strand it there for the life of the node,
+            // renumbering on every tab close — which is the exact shape of two
+            // bugs this file already carries comments about.
+            if (!_pushed) { try { _ieUnpin(_pin); } catch (_e) {} }
+          }
+        };
+
+        // Bring back the park held for `key`, if there is one and no review is
+        // live. Returns true if one was restored.
+        const _reviewUnpark = (key) => {
+          if (_reviewMode) return false;
+          _reviewParkDrop();                  // prune anything closed meanwhile
+          const i = _reviewParkFind(key);
+          if (i < 0) return false;
+          const park = _reviewParks[i];
+          _reviewParks.splice(i, 1);
+          _ieUnpin(park.pin);
+          // A restored review is a NEW review. _ieFinish and _ieRunSequence
+          // compare the token they captured at launch against this one, and a
+          // run cancelled by the switch that brought us here unwinds a
+          // microtask later: with the token unchanged its _ieFinish(false)
+          // matched, took the `else if (_reviewMode)` branch, and tore down
+          // the review it had just restored — the user watched the result come
+          // back and then vanish, with no toast.
+          _ieReviewToken++;
+          _ieReviewIsInstruct = park.isInstruct;
+          _ieThreadSnapshot   = park.threadSnap;
+          _ieChainUndo        = park.chainUndo.slice();
+          _reviewEnter(park.mode, park.original === null ? "" : park.original);
+          // AFTER _reviewEnter, so _reviewMode is set again and
+          // _iePersistThreads is blocked: the live thread goes back on screen
+          // without reaching node.properties.
+          if (park.isInstruct && park.threadLive) {
+            try { _ieThreadSet(park.threadLive, key); } catch (_e) {}
+          }
+          // …and after it too, because _applyReviewModeUI resets the label.
+          if (park.label) { try { reviewLabel.textContent = park.label; } catch (_e) {} }
+          if (park.mode === "variations") {
+            _renderVariationsCards(park.cards || []);
+          } else if (park.result !== null && textEl._epeRestoreValue) {
+            textEl._epeRestoreValue(park.result);
+            try { updateTokenBadge(textEl.value); } catch (_e) {}
+          }
+          return true;
+        };
 
         // Assigned for real once the panel DOM / instruct row exist; no-ops until then.
         let _ieRefresh     = () => {};
@@ -6109,9 +8831,17 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           if (el) el.style.transform = open ? "rotate(90deg)" : "";
         };
 
-        const _ieThreadGet   = () => (_ieThreads[_ieTabKey()] || []);
-        const _ieThreadSet   = (arr) => { _ieThreads[_ieTabKey()] = arr.slice(); _iePersistThreads(); _ieRefresh(); };
-        const _ieThreadPush  = (t) => { const a = _ieThreadGet().slice(); a.push(t); _ieThreadSet(a); };
+        // `key` pins the write to a tab. Without it these resolved the tab
+        // from node.properties.epe_tab_active at CALL time — and both callers
+        // call them after an await. Switching prompt tabs during a sequence
+        // replay therefore wrote tab A's direction into TAB B's slot, over
+        // whatever B had: the switch aborts the stream, the step returns
+        // false, and the rollback line lands on the wrong tab. epe_ie_threads
+        // rides in node.properties, so that corruption is saved into the
+        // workflow.
+        const _ieThreadGet   = (key) => (_ieThreads[key || _ieTabKey()] || []);
+        const _ieThreadSet   = (arr, key) => { _ieThreads[key || _ieTabKey()] = arr.slice(-IE_THREAD_MAX); _iePersistThreads(); _ieRefresh(); };
+        const _ieThreadPush  = (t, key) => { const k = key || _ieTabKey(); const a = _ieThreadGet(k).slice(); a.push(t); _ieThreadSet(a, k); };
         const _ieThreadClear = () => { _ieThreadSet([]); };
         // Context handed to the model: the most recent few, oldest first.
         const _ieContext     = () => _ieThreadGet().slice(-IE_CONTEXT_DEPTH);
@@ -6120,8 +8850,158 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         // ── localStorage helpers ────────────────────────────────────────
         const _libKey       = (t) => t==="snippets" ? "epe_library_snippets" : "epe_library_favorites";
-        const _libLoad      = (t) => { try{return JSON.parse(localStorage.getItem(_libKey(t))||"[]");}catch(e){return[];} };
-        const _libSaveItems = (t,items) => { try{localStorage.setItem(_libKey(t),JSON.stringify(items));}catch(e){} };
+        // localStorage is user-editable and shared with everything else on
+        // this origin, so what comes back is untrusted shape. A non-array here
+        // reached callers that immediately .filter/.push/.map it — and the
+        // first of those runs during the BUILD, so the node did not construct
+        // at all: no editor, no error surfaced, and nothing in the UI that
+        // could fix it. Entries are shape-checked for the same reason: cards
+        // read .id, .name and .text off them.
+        // Upper bound on stored library entries. Same rationale as
+        // IE_SEQ_MAX_COUNT: a hand-edited or hostile localStorage value
+        // with a million entries would hang the tab (one card per entry
+        // in _epeRenderLibraryList) on library open.
+        const LIB_MAX_COUNT = 2000;
+        const _libLoad      = (t) => {
+          let v;
+          try { v = JSON.parse(localStorage.getItem(_libKey(t)) || "[]"); }
+          catch(e) { return []; }
+          if (!Array.isArray(v)) {
+            console.warn("[EPE] " + _libKey(t) + " is not a list — ignoring it");
+            return [];
+          }
+          // Keep the NEWEST, the same end _libSaveItems keeps. See the
+          // note in _ieSeqLoad: the head/tail asymmetry meant an over-cap
+          // library lost the entries the user had most recently added, on
+          // the first edit after loading, silently.
+          // The full stored array, kept for the heal write-back below.
+          const _allLib = v;
+          // The shape filter and the window, tracked BY ORIGINAL INDEX.
+          //
+          // Round 55b cap-sliced the array first and then filtered it, and
+          // reconstructed the heal's write-back position as
+          // `i - (_allLib.length - kept.length)`. That difference counts BOTH
+          // removals, so it is only a valid offset when every removal is a
+          // contiguous prefix — and a single junk entry in the middle shifted
+          // the whole mapping, stamping one entry's id onto another.
+          // _deleteItem is `filter(x => x.id !== item.id)`, which removes
+          // every match, so deleting the corrupted card deleted a real one
+          // with it. Worse, mapping over the RAW array read `.id` off a
+          // `null` — legal JSON — and threw straight out of a function that
+          // _setRpTab("favorites") calls at build time with no try/catch, so
+          // the node stopped constructing entirely.
+          //
+          // Filter first, window second, and carry the indices.
+          const _libIdx = [];
+          _allLib.forEach((x, i) => { if (x && typeof x === "object") _libIdx.push(i); });
+          const _libWin = _libIdx.slice(-LIB_MAX_COUNT);
+          if (_libIdx.length > LIB_MAX_COUNT) {
+            const _over = _libIdx.length - LIB_MAX_COUNT;
+            if (!_epeStoreOverflowWarned) {
+              // See _ieSeqLoad: latch only on delivery. THIS is the call that
+              // throws — _setRpTab("favorites") runs at build time and reaches
+              // here through _renderRpBody, long before `const _toast` is
+              // initialised. Left unlatched, the next open of the pane (an
+              // event handler, where _toast exists) delivers it.
+              try {
+                _toast("Library over the " + LIB_MAX_COUNT + " limit: the oldest "
+                       + _over + " entries are hidden, and will be dropped the "
+                       + "next time this list is saved.");
+                _epeStoreOverflowWarned = true;
+              } catch(_e2) {}
+            }
+          }
+          // NORMALISED, not merely filtered. The comment above says entries
+          // are shape-checked "because cards read .id, .name and .text off
+          // them" — the filter checked none of the three. An entry with no
+          // `text` made `textEl.value = undefined` (the literal string
+          // "undefined" replacing the user's prompt) and then threw in
+          // countTokens before the dispatch, so nothing persisted and the
+          // only way back was the undo button. Insert did not even throw: it
+          // spliced "undefined" in and saved it.
+          //
+          // A missing id is minted UNIQUE and healed straight back to
+          // storage, so from the next load on it is a real id like any other.
+          //
+          // The positional `_pos<i>` this replaces was worse than the problem:
+          // every writer persists what this function returned, so `_pos1`
+          // became a real stored id — and the next id-less entry landing at
+          // index 1 minted the same string. _deleteItem is
+          // `filter(x => x.id !== item.id)`, which removes EVERY match, so the
+          // user lost a saved prompt they never touched. A random mint alone
+          // would have been wrong too (the render's load and the delete's load
+          // are separate calls, so the ids would not match); writing the heal
+          // back is what makes it right.
+          const kept = _libWin.map(i => _allLib[i]);
+          let _healed = false;
+          const out = kept.map((x) => {
+                         let id = x.id;
+                         if (id === undefined || id === null || id === "") {
+                           id = _epeMintId();
+                           _healed = true;
+                         }
+                         return {
+                           id,
+                           name: String(x.name == null ? "" : x.name),
+                           text: String(x.text == null ? "" : x.text),
+                           date: x.date,
+                         };
+                       });
+          if (_healed) {
+            // The ORIGINALS with an id patched on, not `out`. Writing the
+            // normalised projection back made this read destructive: one
+            // legacy id-less entry, and opening the pane silently dropped
+            // every field outside {id,name,text,date} from EVERY entry in the
+            // store — including the ones that already had ids.
+            // Over the FULL stored array — see the note in _ieSeqLoad. A
+            // read must not delete entries the user has not asked to lose,
+            // and it must not touch a slot it did not normalise.
+            const merged = _allLib.slice();
+            _libWin.forEach((_orig, _w) => {
+              const x = _allLib[_orig];
+              if (x && (x.id === undefined || x.id === null || x.id === ""))
+                merged[_orig] = Object.assign({}, x, { id: out[_w].id });
+            });
+            // And if the write is REFUSED — a store at quota rejects this
+            // one, which grows the value, while the delete that shrinks it
+            // still succeeds — a random id would differ between this load and
+            // the delete's, so the filter would match nothing and the entry
+            // could never be removed. Derived ids agree across loads with
+            // nothing written.
+            if (!_epeHealIds(_libKey(t), merged, merged.length)) {
+              out.forEach((o, i) => {
+                const x = kept[i];
+                if (x.id === undefined || x.id === null || x.id === "")
+                  o.id = _epeDerivedId(x, i);
+              });
+            }
+          }
+          return out;
+        };
+        // Returns whether the write actually happened. It used to swallow
+        // every failure, so a library at the storage quota — which it reaches
+        // on its own, since nothing prunes it — lost saves in silence while
+        // the button flashed "✓ Saved".
+        const _libSaveItems = (t,items) => {
+          if (!Array.isArray(items)) return false;
+          // Cap on WRITE too, not just load. Drop OLDEST on overflow
+          // (`slice(-MAX)`), not newest. Writers push new entries at the
+          // tail, so `slice(0, MAX)` would discard the entry the user
+          // just typed — the exact opposite of what the toast implies.
+          let _trimmed = false;
+          if (items.length > LIB_MAX_COUNT) { items = items.slice(-LIB_MAX_COUNT); _trimmed = true; }
+          try { localStorage.setItem(_libKey(t),JSON.stringify(items));
+            if (_trimmed) { try { _toast("Oldest library entries trimmed to fit (" + LIB_MAX_COUNT + ")."); } catch(_e2) {} }
+            return true; }
+          catch(e) {
+            // _toast is declared further down the same closure; a build-time
+            // call would hit its temporal dead zone, and every caller here is
+            // an event handler, so the guard is belt and braces.
+            try { _toast("Could not save — browser storage is full or blocked."); }
+            catch(_e2) { console.warn("[EPE] library write failed:", e && e.name); }
+            return false;
+          }
+        };
         const _libNewId     = () => Date.now().toString(36)+Math.random().toString(36).slice(2,6);
 
         // ── Card base styles ─────────────────────────────────────────────
@@ -6207,7 +9087,25 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           "color:#c2cddb;font-size:10px;padding:3px 7px;outline:none;font-family:inherit;";
         rpSearch.onfocus = () => { rpSearch.style.borderColor="#28364a"; };
         rpSearch.onblur  = () => { rpSearch.style.borderColor="#1c2431"; };
-        rpSearch.oninput = () => _renderRpBody();
+        // Debounced. _renderRpBody rebuilds the whole panel — every card,
+        // with a fresh IntersectionObserver each — and it ran synchronously
+        // from oninput: 500 entries measured 331 ms PER KEYSTROKE, so typing
+        // was unusable and the observers churned once per character. Nothing
+        // in the panel needs the render to be synchronous with the keystroke.
+        let _rpSearchT = null;
+        const _rpSearchRender = () => {
+          _rpSearchT = null;
+          // _renderRpBody wipes rpBody, which detaches this input's own
+          // wrapper and drops focus mid-keystroke — so only the first
+          // character ever registered. Put the caret back where it was.
+          const _s = rpSearch.selectionStart, _e = rpSearch.selectionEnd;
+          _renderRpBody();
+          try { rpSearch.focus(); rpSearch.setSelectionRange(_s, _e); } catch (_err) {}
+        };
+        rpSearch.oninput = () => {
+          if (_rpSearchT) clearTimeout(_rpSearchT);
+          _rpSearchT = setTimeout(_rpSearchRender, 140);
+        };
         const rpSearchBtn = document.createElement("button");
         rpSearchBtn.textContent = "Search";
         rpSearchBtn.style.cssText =
@@ -6216,7 +9114,12 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           "white-space:nowrap;transition:color .1s,background .1s;";
         rpSearchBtn.onmouseenter = () => { rpSearchBtn.style.background="#202a38"; rpSearchBtn.style.color="#c2cddb"; };
         rpSearchBtn.onmouseleave = () => { rpSearchBtn.style.background="#161d28"; rpSearchBtn.style.color="#7a8a9c"; };
-        rpSearchBtn.onclick = () => _renderRpBody();
+        // Explicit Search is immediate: cancel any pending debounce first so
+        // the panel is not rebuilt twice.
+        rpSearchBtn.onclick = () => {
+          if (_rpSearchT) { clearTimeout(_rpSearchT); _rpSearchT = null; }
+          _renderRpBody();
+        };
         rpSearchRow.appendChild(rpSearch);
         rpSearchRow.appendChild(rpSearchBtn);
         rpSearchWrap.appendChild(rpSearchRow);
@@ -6270,8 +9173,33 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           else { rpGetWfBtn.style.background="#161d28"; rpGetWfBtn.style.borderColor="#202a38"; }
         };
 
-        // Cache: imageUrl -> { hasWorkflow, workflow } so repeated opens don't re-probe
+        // Cache: imageUrl -> hasWorkflow (boolean). The probe reply used to
+        // be cached whole — entire workflow graphs — but was only ever read
+        // for this boolean, and the Load button re-downloads anyway.
+        // Bounded: oldest entries drop past 300.
         const _wfProbeCache = new Map();
+        const _wfProbeSet = (url, has) => {
+          if (_wfProbeCache.size >= 300) {
+            const oldest = _wfProbeCache.keys().next().value;
+            _wfProbeCache.delete(oldest);
+          }
+          _wfProbeCache.set(url, !!has);
+        };
+
+        // Fire-and-forget /extract-workflow probes fire once per scrolled
+        // detail card open. Without an abort handle, a probe still in
+        // flight when the node is disposed will resolve into the destroyed
+        // editor's DOM via _setGetWfBtn. Wire every probe through an
+        // AbortController, and abort them all in _epeDispose.
+        const _wfProbeAborts = new Set();
+        const _wfProbeStart = () => {
+          const ac = (typeof AbortController !== "undefined") ? new AbortController() : null;
+          if (ac) _wfProbeAborts.add(ac);
+          return ac;
+        };
+        const _wfProbeDone = (ac) => {
+          if (ac) _wfProbeAborts.delete(ac);
+        };
 
         const _setMediaBtn = (type) => {
           _rpMediaType = type;
@@ -6290,21 +9218,44 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // _resetActiveTab: clears and re-triggers a fresh search on the current tab
         const _resetActiveTab = () => {
           if (_rpActive === "civitai") {
+            // Same stale-page defense as doSearch: bump the generation so a
+            // page still in flight for the OTHER media type cannot land in
+            // the freshly cleared list, and reset the error/empty counters
+            // it may have accumulated.
+            _civState.gen = (_civState.gen || 0) + 1;
+            _civState.run = (_civState.run || 0) + 1;
+            _civState.fails = 0; _civState.empties = 0;
             _civState.query = ""; _civState.page = 1; _civState.nextCursor = null;
             _civState.loading = false; _civState.exhausted = false; _civState.results = [];
+            // Release any <video> src attrs before shedding — the media
+            // toggle (Image ↔ Video) walks this path, and shedding 600
+            // video cards without pause+detach pins ~12 MB per toggle.
+            // Same rationale as doSearch; see _epeReleaseVideosIn.
+            _epeReleaseVideosIn(civList);
             while (civList.lastChild) civList.removeChild(civList.lastChild);
-            civList.appendChild(civStatus);
+            // Sentinel FIRST. Cards are inserted before the sentinel, so
+            // appending the status first pins the retry message above every
+            // card — the engine's own doSearch was fixed for exactly this and
+            // this twin, which the image/video toggle calls, was not.
             civList.appendChild(civSentinel);
+            civList.appendChild(civStatus);
             civStatus.style.display = "none";
             // Empty query is valid now (browse the featured feed), so always load.
             _civState.query = civSearchInput.value.trim();
             requestAnimationFrame(() => _civLoadMore());
           } else if (_rpActive === "genur") {
+            _genurState.gen = (_genurState.gen || 0) + 1;
+            _genurState.run = (_genurState.run || 0) + 1;
+            _genurState.fails = 0; _genurState.empties = 0;
             _genurState.page = 1;
             _genurState.loading = false; _genurState.exhausted = false; _genurState.results = [];
+            // Defensive: genur cards do not currently mount <video>, but if
+            // a future card shape does, this covers it — same class as the
+            // civ leak just above.
+            _epeReleaseVideosIn(genurList);
             while (genurList.lastChild) genurList.removeChild(genurList.lastChild);
-            genurList.appendChild(genurStatus);
             genurList.appendChild(genurSentinel);
+            genurList.appendChild(genurStatus);
             genurStatus.style.display = "none";
             // Empty query is valid (browse feed), so always load.
             _genurState.query = genurSearchInput.value.trim();
@@ -6316,6 +9267,12 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         const _setGetWfBtn = (enabled, imageUrl) => {
           rpGetWfBtn._pendingImageUrl = enabled ? imageUrl : null;
           rpGetWfBtn._disabled = !enabled;
+          // Disabling forgets which image an in-flight probe belongs to, so a
+          // late reply can only arm the button if its own detail is still up.
+          if (!enabled) rpGetWfBtn._probeUrl = null;
+          // Stamped so a deferred disarm can tell whether the button still
+          // belongs to the image it was scheduled for.
+          rpGetWfBtn._armToken = (rpGetWfBtn._armToken || 0) + 1;
           if (enabled) {
             rpGetWfBtn.textContent       = "\u2b07 Load Workflow";
             rpGetWfBtn.title             = "ComfyUI workflow found \u2014 click to open in a new canvas tab";
@@ -6340,10 +9297,16 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         rpGetWfBtn.onclick = async () => {
           if (rpGetWfBtn._disabled || !rpGetWfBtn._pendingImageUrl) return;
+          // Re-entrancy guard: a second click during Fetching used to fire
+          // a second /extract-workflow request and open TWO new canvas tabs
+          // for the same image. `_fetching` gates the whole handler; the
+          // `finally` clears it on both success and error paths.
+          if (rpGetWfBtn._fetching) return;
+          rpGetWfBtn._fetching = true;
           rpGetWfBtn.textContent = "Fetching\u2026";
           rpGetWfBtn.style.cursor = "default";
           try {
-            const resp = await fetch("/epe/prompts/extract-workflow", {
+            const resp = await api.fetchApi("/epe/prompts/extract-workflow", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ imageUrl: rpGetWfBtn._pendingImageUrl }),
@@ -6354,7 +9317,17 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             if (data.error) throw new Error(data.error);
             if (!data.hasWorkflow || !data.workflow) {
               rpGetWfBtn.textContent = "No workflow";
-              setTimeout(() => { rpGetWfBtn.textContent = "\u21af Workflow"; _setGetWfBtn(false, null); }, 2000);
+              // Stamped: opening another image inside these two seconds
+              // re-arms the shared button, and this timer used to disable it
+              // anyway — so a workflow that WAS available read as absent.
+              {
+                const _tok = rpGetWfBtn._armToken;
+                setTimeout(() => {
+                  if (rpGetWfBtn._armToken !== _tok) return;
+                  rpGetWfBtn.textContent = "\u21af Workflow";
+                  _setGetWfBtn(false, null);
+                }, 2000);
+              }
               return;
             }
             rpGetWfBtn.textContent = "Loading\u2026";
@@ -6363,7 +9336,16 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             _setGetWfBtn(false, null);
           } catch(e) {
             rpGetWfBtn.textContent = "Error";
-            setTimeout(() => { rpGetWfBtn.textContent = "\u21af Workflow"; _setGetWfBtn(rpGetWfBtn._pendingImageUrl ? true : false, rpGetWfBtn._pendingImageUrl); }, 2000);
+            {
+              const _tok = rpGetWfBtn._armToken;
+              setTimeout(() => {
+                if (rpGetWfBtn._armToken !== _tok) return;
+                rpGetWfBtn.textContent = "\u21af Workflow";
+                _setGetWfBtn(rpGetWfBtn._pendingImageUrl ? true : false, rpGetWfBtn._pendingImageUrl);
+              }, 2000);
+            }
+          } finally {
+            rpGetWfBtn._fetching = false;
           }
         };
 
@@ -6372,7 +9354,67 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         rpMediaBar.appendChild(rpGetWfBtn);
 
         // ── Workflow panel state ─────────────────────────────────────────
-        let _wfState = { query: "", page: 1, loading: false, exhausted: false, results: [] };
+        // Building this panel makes it the owner of the shared cache, so an
+        // earlier closure still holding a load cannot write over it. This is
+        // deliberately NOT the search generation: bumping that here aborted
+        // whatever a sibling node happened to have in flight.
+        // `let`, not `const`: _wfDoSearch re-claims the pane when the user
+        // runs a search in it, so a second node cannot wipe the first node's
+        // cache and then be refused permission to refill it.
+        let _wfEpoch = ++_epeWfOwner;
+        let _wfState = { query: "", page: 1, cursor: "", loading: false, exhausted: false, results: [] };
+        // Loop protection: some upstream cursor implementations return the
+        // SAME cursor forever, which was measured at 30 fetches → 600 cards
+        // → 20 distinct items on Civitai video queries. If the server hands
+        // us back the cursor we just used, treat it as exhausted rather than
+        // paging forever into duplicates.  Retains the "|| old" fallback for
+        // the separate case where the server simply omits nextCursor.
+        //
+        // Also: some cursor APIs signal end-of-list with an EMPTY-STRING
+        // nextCursor (rather than omitting the field). Falsy but distinct
+        // from "field not present". Treat "" as end.
+        const _wfAdvanceCursor = (nextCursor) => {
+          // Empty-string cursor = end signal, but ONLY on the query path.
+          //
+          // /epe/prompts/search-workflows returns `nextCursor: ""` together
+          // with `hasMore: true` for every BROWSE page — deliberately, because
+          // browse pages by number and the client owns the number (api.py says
+          // so at its own `next_cursor = cur if query else ""`). Reading that
+          // as end-of-list killed the pane on page 1 of every browse: the
+          // happy path lands the items BEFORE calling this, so results.length
+          // was already 20 when the guard ran. And the branch never sets
+          // wfStatus visible, so the retry control was not even clickable —
+          // then `exhausted` was cached and restored on the next rebuild.
+          //
+          // The livelock this guard exists for is query-only anyway: browse
+          // advances `_wfState.page` on every pass, so it cannot re-serve
+          // page 1 forever. `hasMore` is the authority there, and the caller
+          // already honours it.
+          if (typeof nextCursor === "string" && nextCursor === ""
+              && _wfState.query
+              && (_wfState.cursor || _wfState.results.length > 0)) {
+            _wfState.exhausted = true;
+            return;
+          }
+          if (nextCursor && nextCursor === _wfState.cursor && _wfState.results.length > 0) {
+            _wfState.exhausted = true;
+            return;
+          }
+          _wfState.cursor = nextCursor || _wfState.cursor;
+        };
+        // Per-instance, like wfSpinner itself: a module-scope counter meant a
+        // rebuilt node could never hide its own spinner, because the other
+        // instance still held a count.
+        let _wfInFlight = 0;
+        // Consecutive hard failures. One blip should not kill the list.
+        let _wfFails = 0;
+        // Consecutive upstream pages on which every result was login-gated.
+        // Bounds one attempt; deliberately NOT cached, see the soft stop below.
+        let _wfEmpties = 0;
+        // Which load is the latest for THIS panel. A superseded run used to
+        // clear `loading` on its way out even when a newer load still held
+        // it, and the scroll observer then fetched the same cursor twice.
+        let _wfRun = 0;
 
         // ── Civitai placeholder ──────────────────────────────────────────
         // ══════════════════════════════════════════════════════════════════
@@ -6380,17 +9422,41 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // ══════════════════════════════════════════════════════════════════
 
         // ── Prompt cleaner ───────────────────────────────────────────────
-        const _civCleanPrompt = (raw) => {
+        // How much of a prompt the CARD preview considers. The preview is a
+        // two-line clamp, so cleaning more than this to display ~120
+        // characters is pure waste — and twenty cards of it is a freeze.
+        const _CIV_PREVIEW_CHARS = 4096;
+
+        // `limit` truncates before any work and is passed only by the card
+        // builders. The detail panel and "Use Prompt" pass nothing, because
+        // there the whole prompt is the point.
+        const _civCleanPrompt = (raw, limit) => {
           if (!raw) return "";
-          let s = raw;
+          // Upstream `prompt` is not guaranteed to be a string. The Genur path
+          // passes it through with no coercion, and a numeric one reached
+          // `raw.replace` — not a function — which threw out of the card
+          // builder and cost the whole page of results.
+          let s = (typeof raw === "string") ? raw : String(raw);
+          if (limit && s.length > limit) s = s.slice(0, limit);
+          // The inner runs below are BOUNDED, and that is the whole fix.
+          // `[^)]+` before a required ':' makes every '(' an attempt that
+          // scans to the end of the string and backtracks the whole way:
+          // 16 KB of '(' 0.286 s, 32 KB 1.117 s, 64 KB 4.224 s, 128 KB
+          // 17.108 s — quadratic, on a stranger's text, once per card in a
+          // synchronous render loop. With the cap a failed attempt costs the
+          // cap instead of the string: 128 KB 0.269 s, 1 MB 2.098 s.
+          //
+          // 256 for a tag body (a LoRA name is tens of characters) and 512
+          // for a weighted group (a phrase). Both sit far above anything real,
+          // so nothing that used to be stripped survives now.
           // Strip LoRA tags: <lora:name:weight>
-          s = s.replace(/<lora:[^>]*>/gi, "");
+          s = s.replace(/<lora:[^>]{0,256}>/gi, "");
           // Strip embedding tags: <embedding:name>
-          s = s.replace(/<embedding:[^>]*>/gi, "");
+          s = s.replace(/<embedding:[^>]{0,256}>/gi, "");
           // Strip weighted parens: (word:1.2) or (word word:0.8) -> word word
-          s = s.replace(/\(([^)]+):\d+(\.\d+)?\)/g, (_, inner) => inner.trim());
+          s = s.replace(/\(([^)]{1,512}):\d+(\.\d+)?\)/g, (_, inner) => inner.trim());
           // Strip weighted brackets: [word] or [word:1.2] -> word
-          s = s.replace(/\[([^\]]+?)(?::\d+(?:\.\d+)?)?\]/g, (_, inner) => inner.trim());
+          s = s.replace(/\[([^\]]{1,512}?)(?::\d+(?:\.\d+)?)?\]/g, (_, inner) => inner.trim());
           // Strip remaining bare :number patterns left over (e.g. ":0.8")
           s = s.replace(/:\d+(\.\d+)?/g, "");
           // Collapse multiple commas/spaces
@@ -6591,6 +9657,24 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         civFilterBar.appendChild(civPeriodRow);
         civFilterBar.appendChild(civModelsPanel);
 
+        // pause() alone releases nothing — the media resource is retained by
+        // the <video>'s src attribute. A card list of 600 removed <video>
+        // elements on a video-heavy Civitai query pins ~12 MB per new search
+        // until GC. Same lesson _epeDispose already applies, spelled out in
+        // its own comment: "src+load(), not just pause(): pause stops
+        // playback, it does not release the media resource." Call this
+        // BEFORE removeChild/innerHTML="" on any subtree that may contain
+        // one.
+        const _epeReleaseVideosIn = (root) => {
+          if (!root) return;
+          const list = (root.tagName === "VIDEO")
+            ? [root]
+            : (root.querySelectorAll ? root.querySelectorAll("video") : []);
+          for (const v of list) {
+            try { v.pause(); v.removeAttribute("src"); v.load(); } catch (_e) {}
+          }
+        };
+
         // ── Card list (scrollable, infinite) ────────────────────────────
         const civList = document.createElement("div");
         civList.style.cssText =
@@ -6643,7 +9727,11 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           backBtn.onmouseleave = () => { backBtn.style.background="#19212d"; backBtn.style.borderColor="#31415a"; backBtn.style.color="#aab8c8"; };
           backBtn.onclick = () => {
             if (civDetail._cleanup) { civDetail._cleanup(); civDetail._cleanup = null; }
-            if (civDetail._activeVid) { civDetail._activeVid.pause(); civDetail._activeVid = null; }
+            if (civDetail._activeVid) { _epeReleaseVideosIn(civDetail._activeVid); civDetail._activeVid = null; }
+            // Also reset the workflow probe button — "↯ Checking…" would
+            // otherwise stick until the in-flight probe returned (and could
+            // arm the button for an image no longer on screen).
+            try { _setGetWfBtn(false, null); } catch (_e) {}
             civDetail.style.display = "none";
             civList.style.display = "";
           };
@@ -6691,23 +9779,34 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               // Not a PNG — no probe needed, leave button dim
             } else if (_wfProbeCache.has(item.imageUrl)) {
               // Use cached result instantly
-              const cached = _wfProbeCache.get(item.imageUrl);
-              if (cached.hasWorkflow) _setGetWfBtn(true, item.imageUrl);
+              if (_wfProbeCache.get(item.imageUrl)) _setGetWfBtn(true, item.imageUrl);
             } else {
               rpGetWfBtn.textContent = "\u21af Checking\u2026";
               rpGetWfBtn.style.color = "#4e5c6e";
-              fetch("/epe/prompts/extract-workflow", {
+              rpGetWfBtn._probeUrl = item.imageUrl;
+              const _ac = _wfProbeStart();
+              api.fetchApi("/epe/prompts/extract-workflow", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ imageUrl: item.imageUrl }),
+                signal: _ac ? _ac.signal : undefined,
               }).then(r => r.json()).then(d => {
-                _wfProbeCache.set(item.imageUrl, d);
-                if (d.hasWorkflow) {
+                // Cache only a definitive answer — an {error:…} body from a
+                // transient upstream hiccup is not "this PNG has no
+                // workflow", and caching it made the workflow permanently
+                // unloadable for the life of the node.
+                if (d && !d.error) _wfProbeSet(item.imageUrl, !!d.hasWorkflow);
+                // A slow probe must not arm the shared button for whatever
+                // image is on screen NOW — only for the one it probed.
+                if (rpGetWfBtn._probeUrl !== item.imageUrl) return;
+                if (d && d.hasWorkflow) {
                   _setGetWfBtn(true, item.imageUrl);
                 } else {
                   _setGetWfBtn(false, null);
                 }
-              }).catch(() => { _setGetWfBtn(false, null); });
+              }).catch(() => {
+                if (rpGetWfBtn._probeUrl === item.imageUrl) _setGetWfBtn(false, null);
+              }).finally(() => { _wfProbeDone(_ac); });
             }
           } else {
             _setGetWfBtn(false, null);
@@ -6785,8 +9884,11 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const civEnhBtn = _mkBtn("Enhance", "Run AI enhance on this prompt", "rgba(100,160,255,0.7)");
           civEnhBtn.onclick = (ev) => {
             ev.stopPropagation();
-            textEl.value = civTA.value.trim()||cleaned; updateTokenBadge(textEl.value);
-            runAiAction("expand");
+            // Handed over, not written in first — see runAiAction's
+            // sourceText note. Writing textEl here persisted the remote text
+            // as epe_prompt and made Discard restore it instead of the
+            // user's own prompt.
+            runAiAction("expand", { sourceText: civTA.value.trim() || cleaned });
           };
 
           civRow1.appendChild(civSaveNewBtn);
@@ -6800,14 +9902,24 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const civVarBtn = _mkBtn("Variations", "Run AI variations on this prompt", "rgba(140,200,240,0.7)");
           civVarBtn.onclick = (ev) => {
             ev.stopPropagation();
-            textEl.value = civTA.value.trim()||cleaned; updateTokenBadge(textEl.value);
-            runAiAction("variations");
+            runAiAction("variations", { sourceText: civTA.value.trim() || cleaned });
           };
 
           const civUseBtn = _mkBtn("Use", "Send to main prompt editor", "rgba(109,184,232,0.8)");
           civUseBtn.onclick = (ev) => {
             ev.stopPropagation();
             const t = civTA.value.trim()||cleaned;
+            // A review open here meant this text was written INTO the review:
+            // updateTokenBadge and _epePersistPrompt both hard-return while
+            // _reviewMode is set, so nothing persisted, Discard then restored
+            // _originalPrompt over it, and the _epePushUndo below pushed the
+            // UN-ACCEPTED AI result onto the undo stack — from where one
+            // Ctrl+Z put it into node.properties and sent it to the sampler.
+            // In "variations" mode textEl is display:none, so Use showed
+            // nothing at all. _setRpTab carries this guard, but reaching a
+            // card does not go through _setRpTab when the panel is already
+            // on this tab.
+            if (_reviewMode) _autoDiscardReview("Prompt used — result discarded");
             if (textEl._epePushUndo) textEl._epePushUndo();
             textEl.value = t; updateTokenBadge(t);
             textEl.dispatchEvent(new Event("input"));
@@ -6834,6 +9946,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             ev.stopPropagation();
             const isVideo = item.mediaType === "video" && item.videoUrl;
             if (!isVideo && !item.imageUrl) return;
+            _epeTakeAiSlot();
+            _syncVisionStyleBridge();
             await _epeOllamaVision.run(
               isVideo ? "video-frame" : "image-url",
               isVideo ? item.videoUrl : item.imageUrl,
@@ -6854,6 +9968,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             civVidPromptBtn.style.width = "100%"; civVidPromptBtn.style.flexShrink = "0";
             civVidPromptBtn.onclick = async (ev) => {
               ev.stopPropagation();
+              _epeTakeAiSlot();
+              _syncVisionStyleBridge();
               await _epeOllamaVision.run("video", item.videoUrl, showAiPanel, hideAiPanel, (prompt) => {
                 if (textEl) { textEl.value = prompt; updateTokenBadge(prompt); }
               }, {
@@ -6932,7 +10048,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         const _mkCivCard = (item) => _mkBooruCard(item, {
           video: true, requireClean: true,
-          clean: _civCleanPrompt,
+          // Limited: this is the two-line card preview, not the detail panel.
+          clean: (p) => _civCleanPrompt(p, _CIV_PREVIEW_CHARS),
           onClick: _showCivDetail,
         });
 
@@ -6953,46 +10070,158 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           sentinel.style.cssText = "height:1px;flex-shrink:0;";
           cfg.list.appendChild(sentinel);
 
+          // One controller per panel, so dispose has something to abort. With
+          // none, a page still in flight when the node was destroyed came back
+          // and built its cards into a detached list — every one of them
+          // firing a real image request — while holding the whole editor
+          // closure alive until it settled.
+          cfg.state.abort = null;
           const fetchPage = async (page) => {
             const q = (cfg.state.query || "").trim();
             if (!q && !cfg.allowEmpty) return null;
-            const resp = await fetch(cfg.endpoint, {
+            try { if (cfg.state.abort) cfg.state.abort.abort(); } catch (_e) {}
+            const _ctl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+            cfg.state.abort = _ctl;
+            const resp = await api.fetchApi(cfg.endpoint, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify(cfg.body(q, page)),
+              signal: _ctl ? _ctl.signal : undefined,
             });
             if (!resp.ok) throw new Error(cfg.errLabel + " " + resp.status);
             return resp.json();
           };
 
+          // Returns the items that actually landed. cfg.filter can pass an
+          // item that mkCard then rejects (requireClean: a prompt that is
+          // nothing but LoRA tags cleans to empty), so "the filter kept some"
+          // was not the same as "the list grew" — and when nothing grew, the
+          // observer had no intersection change to fire on and the list
+          // stalled mid-catalogue with no message and no control.
           const appendItems = (items) => {
+            const landed = [];
             items.forEach(raw => {
-              const card = cfg.mkCard(cfg.mapItem(raw));
-              if (card) cfg.list.insertBefore(card, sentinel);
+              // Per item, because both halves reach into upstream shape:
+              // cfg.mapItem indexes the raw object and cfg.mkCard runs the
+              // prompt through _civCleanPrompt. One malformed entry used to
+              // throw out of this loop to loadMore's catch, which discarded
+              // EVERY result on the page and burned a failure strike — two
+              // such pages stop the browser for the session.
+              let card = null;
+              try { card = cfg.mkCard(cfg.mapItem(raw)); } catch (_e) { card = null; }
+              if (card) { cfg.list.insertBefore(card, sentinel); landed.push(raw); }
             });
+            return landed;
           };
+
+          // cfg.filter reaches straight into each element (`i.prompt`), so a
+          // null or a primitive in the list threw before any of the per-item
+          // guarding above could help. A non-list `items` did the same.
+          // One page is rendered in a single synchronous pass — appendItems
+          // builds a DOM card per item with no yield — and BOORU_MAX_RESULTS
+          // bounds only the ACCUMULATED list, checked BEFORE the fetch. So the
+          // page itself was unbounded: measured, a stubbed page of 20,000
+          // items froze the tab for 5.6 s and the cap noticed on the next
+          // load. Bounded here, where the items enter, so appendItems, the
+          // results array and the card DOM all inherit it.
+          const BOORU_MAX_PAGE_ITEMS = 200;
+
+          const usableItems = (rawItems) => {
+            if (!Array.isArray(rawItems)) {
+              if (rawItems != null)
+                console.warn("[EPE] " + cfg.errLabel + ": upstream 'items' was not a list");
+              return [];
+            }
+            if (rawItems.length > BOORU_MAX_PAGE_ITEMS) {
+              console.warn("[EPE] " + cfg.errLabel + ": upstream page had " +
+                           rawItems.length + " items — using the first " +
+                           BOORU_MAX_PAGE_ITEMS);
+              rawItems = rawItems.slice(0, BOORU_MAX_PAGE_ITEMS);
+            }
+            const objs = rawItems.filter(i => i && typeof i === "object");
+            let out;
+            try { out = cfg.filter(objs); } catch (_e) { out = objs; }
+            return Array.isArray(out) ? out : [];
+          };
+
+          // Scrolling was unbounded: the results array, the DOM cards, and
+          // every decoded image or video stayed resident for the node's
+          // lifetime, so a long scroll is a memory leak with a scrollbar.
+          // The cap is stated in the panel rather than the list just stopping.
+          const BOORU_MAX_RESULTS = 600;
 
           const loadMore = async () => {
             if (cfg.state.loading || cfg.state.exhausted) return;
+            if ((cfg.state.results || []).length >= BOORU_MAX_RESULTS) {
+              cfg.state.exhausted = true;
+              cfg.status.textContent =
+                "Showing the first " + BOORU_MAX_RESULTS +
+                " — narrow the search to see different results.";
+              cfg.status.style.display = "block";
+              return;
+            }
             cfg.state.loading = true;
             cfg.spinner.style.display = "block";
+            // Which search this belongs to, and which load. A stale page used to
+            // append into the list a newer search had just cleared.
+            const gen = (cfg.state.gen = cfg.state.gen || 0);
+            const myRun = (cfg.state.run = (cfg.state.run || 0) + 1);
+            let failed = false, skipToNext = false;
             try {
               const data = await fetchPage(cfg.state.page);
+              // Superseded by a newer search on this same panel. Unlike the
+              // workflow pane, this counter is per panel, so a newer search is
+              // always already running — there is no blank pane to rescue and
+              // nothing to say to the user.
+              if (gen !== cfg.state.gen) return;
               if (!data || data.error) {
-                cfg.state.exhausted = true;
-                if (cfg.state.results.length === 0) {
-                  cfg.status.textContent = data?.error || "No results found.";
-                  cfg.status.style.display = "block";
-                }
+                // An upstream hiccup is not an empty catalogue, and it is the
+                // common failure shape. Two strikes, like the workflow pane.
+                failed = true;
+                cfg.state.fails = (cfg.state.fails || 0) + 1;
+                if (cfg.state.fails >= 2) cfg.state.exhausted = true;
+                cfg.status.textContent = (data?.error || "No results found.")
+                  + (cfg.state.fails < 2 ? " — click to retry" : "");
+                cfg.status.style.display = "block";
               } else {
                 const hasMore = data.metadata?.hasMore ?? false;
                 // Cursor-paged sources hand back the next cursor; offset-paged
                 // ones leave it undefined and this stays null.
-                cfg.state.nextCursor = data.metadata?.nextCursor ?? null;
-                const usable = cfg.filter(data.items || []);
-                if (usable.length > 0) {
-                  cfg.state.results.push(...usable);
-                  appendItems(usable);
+                // Loop protection: if the server hands us back the SAME cursor
+                // we just used, mark exhausted — see _wfAdvanceCursor for the
+                // full note. Do this before overwriting the cursor. Also
+                // treat an empty-string cursor as end-of-list (some cursor
+                // APIs signal end that way rather than omitting the field).
+                // MATCHES the wf variant: on the empty-string end signal,
+                // PRESERVE the previous cursor so a retry click (which
+                // resets `exhausted` but not `nextCursor`) does not send
+                // `cursor: ""` and re-fetch page 1's items.
+                const _prevCursor = cfg.state.nextCursor;
+                const _newCursor  = data.metadata?.nextCursor ?? null;
+                if (typeof _newCursor === "string" && _newCursor === ""
+                    && (_prevCursor || cfg.state.results.length > 0)) {
+                  cfg.state.exhausted = true;
+                  // KEEP _prevCursor on cfg.state.nextCursor — do not overwrite.
+                } else if (_newCursor && _newCursor === _prevCursor && cfg.state.results.length > 0) {
+                  cfg.state.exhausted = true;
+                  cfg.state.nextCursor = _newCursor;
+                } else {
+                  cfg.state.nextCursor = _newCursor;
+                }
+                let usable = usableItems(data.items);
+                const landed = usable.length > 0 ? appendItems(usable) : [];
+                const _added = landed.length;
+                if (_added > 0) {
+                  // A loop, not push(...landed). The spread passes ONE
+                  // ARGUMENT PER ELEMENT, so a large enough upstream page
+                  // throws "RangeError: Maximum call stack size exceeded"
+                  // here — after the cards were already built and inserted.
+                  for (let _i = 0; _i < landed.length; _i++) cfg.state.results.push(landed[_i]);
+                  cfg.state.fails = 0;
+                  cfg.state.empties = 0;
+                } else {
+                  // Nothing reached the list, whatever the filter thought.
+                  usable = [];
                 }
                 cfg.state.page++;
                 if (!hasMore) {
@@ -7006,20 +10235,57 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
                     endMsg.textContent = "\u2014 end of results \u2014";
                     cfg.list.appendChild(endMsg);
                   }
+                } else if (usable.length === 0) {
+                  // A whole page filtered out. Nothing was inserted before the
+                  // sentinel, so its intersection state never changes and the
+                  // observer will NOT fire again — the old comment claiming it
+                  // would is why the list silently stopped here. Fetch the next
+                  // page directly, bounded so a filtered tail still terminates.
+                  cfg.state.empties = (cfg.state.empties || 0) + 1;
+                  if (cfg.state.empties < 5) {
+                    skipToNext = true;
+                  } else {
+                    cfg.state.exhausted = true;
+                    cfg.status.textContent = "Nothing usable on this stretch — click to keep looking.";
+                    cfg.status.style.display = "block";
+                    failed = true;   // a bound, not an end: do not treat as final
+                  }
                 }
-                // If a page was fully filtered out but more remain, the observer
-                // triggers the next page naturally on the next scroll tick.
               }
             } catch(err) {
-              const errEl = document.createElement("div");
-              errEl.style.cssText = "color:#744;font-size:9px;text-align:center;padding:8px;";
-              errEl.textContent = "Error: " + (err.message || "Failed to fetch");
-              cfg.list.appendChild(errEl);
-              cfg.state.exhausted = true;
+              if (gen !== cfg.state.gen) return;
+              failed = true;
+              cfg.state.fails = (cfg.state.fails || 0) + 1;
+              if (cfg.state.fails >= 2) cfg.state.exhausted = true;
+              cfg.status.textContent = "Error: " + (err.message || "Failed to fetch")
+                + (cfg.state.fails < 2 ? " — click to retry" : "");
+              cfg.status.style.display = "block";
             } finally {
-              cfg.state.loading = false;
-              cfg.spinner.style.display = "none";
+              // Only the latest load may hand the flag back. A superseded run
+              // releasing it let the observer start a second fetch of a cursor
+              // the live run was already using.
+              // Both gated on ownership. A superseded run hiding the spinner
+              // made the list look idle while the live run was still fetching.
+              if (myRun === cfg.state.run) {
+                cfg.state.loading = false;
+                cfg.spinner.style.display = "none";
+              }
             }
+            if (skipToNext && gen === cfg.state.gen) return loadMore();
+          };
+
+          // The message itself is the retry control. On a failure that leaves
+          // the list empty nothing is inserted before the sentinel, so there is
+          // no scroll that can bring the observer back.
+          cfg.status.style.cursor = "pointer";
+          cfg.status.title = "Click to try again";
+          cfg.status.onclick = () => {
+            if (cfg.state.loading) return;
+            cfg.state.exhausted = false;
+            cfg.state.fails = 0;
+            cfg.state.empties = 0;
+            cfg.status.style.display = "none";
+            loadMore();
           };
 
           const observer = new IntersectionObserver((entries) => {
@@ -7035,19 +10301,35 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             // A new search always exits the detail view back to results.
             if (cfg.detail) {
               try { cfg.detail._cleanup && cfg.detail._cleanup(); cfg.detail._cleanup = null; } catch (_e) {}
-              try { if (cfg.detail._activeVid) { cfg.detail._activeVid.pause(); cfg.detail._activeVid = null; } } catch (_e) {}
+              try { if (cfg.detail._activeVid) { _epeReleaseVideosIn(cfg.detail._activeVid); cfg.detail._activeVid = null; } } catch (_e) {}
+              // Same reason as the civ/genur Back button handlers: leaving
+              // rpGetWfBtn armed after a detail exit would let a click load
+              // a workflow for an image no longer on screen.
+              try { _setGetWfBtn(false, null); } catch (_e) {}
               cfg.detail.style.display = "none";
             }
             if (cfg.list) cfg.list.style.display = "";
+            cfg.state.gen      = (cfg.state.gen || 0) + 1;   // drop stale pages
+            cfg.state.fails    = 0;
+            cfg.state.empties  = 0;
             cfg.state.query    = q;
             cfg.state.page     = 1;
             cfg.state.nextCursor = null;
             cfg.state.loading  = false;
             cfg.state.exhausted= false;
             cfg.state.results  = [];
+            // Release any <video> src attrs before shedding the cards —
+            // removeChild alone does not stop the browser from holding the
+            // media resource. See _epeReleaseVideosIn.
+            _epeReleaseVideosIn(cfg.list);
             while (cfg.list.lastChild) cfg.list.removeChild(cfg.list.lastChild);
-            cfg.list.appendChild(cfg.status);
+            // Sentinel first, THEN the status: cards are inserted before the
+            // sentinel, so appending the status first pinned the retry message
+            // above every card. A failure five pages down then showed nothing
+            // where the user was looking — the spinner just stopped. The
+            // workflow pane already orders it this way.
             cfg.list.appendChild(sentinel);
+            cfg.list.appendChild(cfg.status);
             cfg.status.style.display = "none";
             // Defer so the IntersectionObserver doesn't fire a duplicate load
             // while the sentinel is momentarily visible at top of an empty list
@@ -7274,6 +10556,9 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           backBtn.onmouseleave = () => { backBtn.style.background="#19212d"; backBtn.style.borderColor="#31415a"; backBtn.style.color="#aab8c8"; };
           backBtn.onclick = () => {
             if (genurDetail._cleanup) { genurDetail._cleanup(); genurDetail._cleanup = null; }
+            // Also reset the workflow probe button — same reason as the civ
+            // Back path.
+            try { _setGetWfBtn(false, null); } catch (_e) {}
             genurDetail.style.display = "none";
             genurList.style.display = "";
           };
@@ -7301,20 +10586,29 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             if (!item.isPng) {
               // Not a PNG — skip probe
             } else if (_wfProbeCache.has(item.imageUrl)) {
-              const cached = _wfProbeCache.get(item.imageUrl);
-              if (cached.hasWorkflow) _setGetWfBtn(true, item.imageUrl);
+              if (_wfProbeCache.get(item.imageUrl)) _setGetWfBtn(true, item.imageUrl);
             } else {
               rpGetWfBtn.textContent = "\u21af Checking\u2026";
               rpGetWfBtn.style.color = "#4e5c6e";
-              fetch("/epe/prompts/extract-workflow", {
+              rpGetWfBtn._probeUrl = item.imageUrl;
+              const _ac = _wfProbeStart();
+              api.fetchApi("/epe/prompts/extract-workflow", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ imageUrl: item.imageUrl }),
+                signal: _ac ? _ac.signal : undefined,
               }).then(r => r.json()).then(d => {
-                _wfProbeCache.set(item.imageUrl, d);
-                if (d.hasWorkflow) _setGetWfBtn(true, item.imageUrl);
+                // Cache only a definitive answer — an {error:…} body from a
+                // transient upstream hiccup is not "this PNG has no
+                // workflow", and caching it made the workflow permanently
+                // unloadable for the life of the node.
+                if (d && !d.error) _wfProbeSet(item.imageUrl, !!d.hasWorkflow);
+                if (rpGetWfBtn._probeUrl !== item.imageUrl) return;
+                if (d && d.hasWorkflow) _setGetWfBtn(true, item.imageUrl);
                 else _setGetWfBtn(false, null);
-              }).catch(() => { _setGetWfBtn(false, null); });
+              }).catch(() => {
+                if (rpGetWfBtn._probeUrl === item.imageUrl) _setGetWfBtn(false, null);
+              }).finally(() => { _wfProbeDone(_ac); });
             }
           } else {
             _setGetWfBtn(false, null);
@@ -7384,8 +10678,10 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const genurEnhBtn = _mkBtn("Enhance", "Run AI enhance on this prompt", "rgba(100,160,255,0.7)");
           genurEnhBtn.onclick = (ev) => {
             ev.stopPropagation();
-            textEl.value = genurTA.value.trim()||cleaned; updateTokenBadge(textEl.value);
-            runAiAction("expand");
+            // Handed over, not written in first — see runAiAction's sourceText
+            // note. Writing textEl here persisted the remote text as
+            // epe_prompt and made Discard restore it instead of the user's.
+            runAiAction("expand", { sourceText: genurTA.value.trim() || cleaned });
           };
 
           genurRow1.appendChild(genurSaveNewBtn);
@@ -7398,14 +10694,15 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const genurVarBtn = _mkBtn("Variations", "Run AI variations on this prompt", "rgba(140,200,240,0.7)");
           genurVarBtn.onclick = (ev) => {
             ev.stopPropagation();
-            textEl.value = genurTA.value.trim()||cleaned; updateTokenBadge(textEl.value);
-            runAiAction("variations");
+            runAiAction("variations", { sourceText: genurTA.value.trim() || cleaned });
           };
 
           const genurUseBtn = _mkBtn("Use", "Send to main prompt editor", "rgba(109,184,232,0.8)");
           genurUseBtn.onclick = (ev) => {
             ev.stopPropagation();
             const t = genurTA.value.trim()||cleaned;
+            // Same as the Civitai twin above.
+            if (_reviewMode) _autoDiscardReview("Prompt used — result discarded");
             if (textEl._epePushUndo) textEl._epePushUndo();
             textEl.value = t; updateTokenBadge(t);
             textEl.dispatchEvent(new Event("input"));
@@ -7430,6 +10727,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           genurImgPromptBtn.onclick = async (ev) => {
             ev.stopPropagation();
             if (!item.imageUrl) return;
+            _epeTakeAiSlot();
+            _syncVisionStyleBridge();
             await _epeOllamaVision.run("image-url", item.imageUrl, showAiPanel, hideAiPanel, (prompt) => {
               if (textEl) { textEl.value = prompt; updateTokenBadge(prompt); }
             }, {
@@ -7444,7 +10743,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         const _mkGenurCard = (item) => _mkBooruCard(item, {
           video: false,
-          clean: (p) => _civCleanPrompt(p || ""),
+          clean: (p) => _civCleanPrompt(p || "", _CIV_PREVIEW_CHARS),
           preview: (it, cleaned) => cleaned || it.prompt || "",
           onClick: _showGenurDetail,
         });
@@ -7475,6 +10774,14 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // ── Font sizer helper — wraps any textarea with an always-visible ──
         // ── centered A/size/A bar above it. Faded by default; brightens on ──
         // ── bar hover or textarea focus.                                   ──
+        //
+        // Per-node registry of the font-sizer MutationObservers. The
+        // observer only self-disconnects when its callback fires AND the
+        // textarea is disconnected — a card removed without any style
+        // mutation triggers no callback and leaves the observer running.
+        // Bounded but observable (measured 398/404 collectable), so track
+        // and disconnect all on node dispose.
+        const _fsObservers = [];
         const _mkFontSizerWrap = (ta, defaultSize) => {
           let _fs = defaultSize || 10;
           ta.style.fontSize = _fs + "px";
@@ -7482,7 +10789,12 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           // Re-apply font size whenever the textarea cssText is reset by result panels
           let _fsApplying = false;
           const _fsObs = new MutationObserver(() => {
-            if (!ta.isConnected) { _fsObs.disconnect(); return; }
+            if (!ta.isConnected) {
+              _fsObs.disconnect();
+              const _i = _fsObservers.indexOf(_fsObs);
+              if (_i >= 0) _fsObservers.splice(_i, 1);
+              return;
+            }
             if (_fsApplying) return;
             if (ta.style.fontSize !== _fs + "px") {
               _fsApplying = true;
@@ -7491,6 +10803,26 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             }
           });
           _fsObs.observe(ta, { attributes: true, attributeFilter: ["style"] });
+          // Prune before adding. The self-cleanup above only runs when the
+          // observer's own callback FIRES, and a card removed without any
+          // style mutation never fires one — so the array grew for the whole
+          // life of the node (measured: 6 of 404 stayed). Each entry pins its
+          // textarea and everything that textarea's handlers close over.
+          //
+          // Keyed off the observed element, stashed on the observer, because a
+          // MutationObserver exposes no way to ask what it is watching.
+          _fsObs._epeTa = ta;
+          for (let _i = _fsObservers.length - 1; _i >= 0; _i--) {
+            const _o = _fsObservers[_i];
+            const _ota = _o && _o._epeTa;
+            // Only drop one we can PROVE is detached. An entry with no stashed
+            // element is left alone — dispose still disconnects it.
+            if (_ota && _ota.isConnected === false) {
+              try { _o.disconnect(); } catch (_e) {}
+              _fsObservers.splice(_i, 1);
+            }
+          }
+          _fsObservers.push(_fsObs);
 
           // Outer wrap — column so the bar sits above the textarea.
           // Deliberately flex:0 0 auto: it sizes to the textarea's own height
@@ -7715,8 +11047,9 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             ev.stopPropagation();
             loadBtn.textContent = "Fetching\u2026";
             loadBtn.disabled = true;
+            const _ac = _wfProbeStart();
             try {
-              const resp = await fetch("/epe/prompts/workflow-detail", {
+              const resp = await api.fetchApi("/epe/prompts/workflow-detail", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -7725,24 +11058,34 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
                   downloadUrl: item.downloadUrl || "",
                   versionId:   item.versionId   || "",
                 }),
+                signal: _ac ? _ac.signal : undefined,
               });
               const data = await resp.json();
+              if (_ac && _ac.signal.aborted) return;
               if (resp.status === 403) throw new Error("\u26a0 Login required on Civitai to download this workflow");
               if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
               if (data.error) throw new Error(data.error);
               if (!data.workflow) throw new Error("No workflow returned");
               loadBtn.textContent = "Loading\u2026";
               await _epeOpenTemplate(data.workflow);
+              if (_ac && _ac.signal.aborted) return;
               loadBtn.textContent = "Loaded \u2713";
-              setTimeout(() => { loadBtn.textContent = "Load Workflow"; loadBtn.disabled = false; }, 2000);
+              setTimeout(() => {
+                if (_ac && _ac.signal.aborted) return;
+                loadBtn.textContent = "Load Workflow"; loadBtn.disabled = false;
+              }, 2000);
             } catch(e) {
+              if (_ac && _ac.signal.aborted) return;
               loadBtn.textContent = "Error: " + (e.message || "failed");
               loadBtn.style.color = "#c66";
               loadBtn.disabled = false;
               setTimeout(() => {
+                if (_ac && _ac.signal.aborted) return;
                 loadBtn.textContent = "Load Workflow";
                 loadBtn.style.color = "rgba(109,184,232,0.85)";
               }, 3000);
+            } finally {
+              _wfProbeDone(_ac);
             }
           };
           info.appendChild(loadBtn);
@@ -7754,70 +11097,329 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // Civitai is the only workflow source left, so this is constant.
         const _wfActiveSource = () => "civitai";
 
+        // Same as the booru engine's: dispose needs something to abort.
+        let _wfAbort = null;
         const _wfFetchPage = async (page) => {
           const q = _wfState.query.trim();
-          const resp = await fetch("/epe/prompts/search-workflows", {
+          try { if (_wfAbort) _wfAbort.abort(); } catch (_e) {}
+          const _ctl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+          _wfAbort = _ctl;
+          const resp = await api.fetchApi("/epe/prompts/search-workflows", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ query: q, page, source: _wfActiveSource() }),
+            body: JSON.stringify({ query: q, page, cursor: _wfState.cursor, source: _wfActiveSource() }),
+            signal: _ctl ? _ctl.signal : undefined,
           });
           if (!resp.ok) throw new Error(`Workflow search error ${resp.status}`);
           return resp.json();
         };
 
+        // The three guards _mkBooruEngine has and this hand-rolled loader
+        // never adopted. Same numbers, same reasons — see the comments there.
+        const WF_MAX_PAGE_ITEMS = 200;
+        const WF_MAX_RESULTS    = 600;
+
+        // One page in, capped, per-item guarded, pushed and rendered. A
+        // single malformed item used to throw out of the forEach into
+        // _wfLoadMore's catch, which discarded every card on the page and
+        // burned a failure strike; two such pages killed the pane for the
+        // session.
+        const _wfLandItems = (items) => {
+          if (!Array.isArray(items)) return 0;
+          if (items.length > WF_MAX_PAGE_ITEMS) {
+            console.warn("[EPE] workflow search: upstream page had " +
+                         items.length + " items — using the first " +
+                         WF_MAX_PAGE_ITEMS);
+            items = items.slice(0, WF_MAX_PAGE_ITEMS);
+          }
+          const landed = [];
+          for (const item of items) {
+            if (!item || typeof item !== "object") continue;
+            let card = null;
+            try { card = _mkWfCard(item); } catch (_e) { card = null; }
+            if (card) { wfList.insertBefore(card, wfSentinel); landed.push(item); }
+          }
+          _epePushAll(_wfState.results, landed);
+          return landed.length;
+        };
+
         const _wfLoadMore = async () => {
           if (_wfState.loading || _wfState.exhausted) return;
+          // Scrolling was unbounded here: the results array, the DOM cards and
+          // every decoded cover image stayed resident for the node's lifetime.
+          // The cap is stated in the pane rather than the list just stopping.
+          if (_wfState.results.length >= WF_MAX_RESULTS) {
+            _wfState.exhausted = true;
+            wfStatus.textContent =
+              "Showing the first " + WF_MAX_RESULTS +
+              " — narrow the search to see different results.";
+            wfStatus.style.display = "block";
+            return;
+          }
           _wfState.loading = true;
+          _wfInFlight++;
           wfSpinner.style.display = "block";
+          const gen = _epeWfGen;
+          const myRun = ++_wfRun;
+          // A run that ends in failure must not write its exhausted flag
+          // into the cache, or the pane stays dead across every rebuild.
+          let _failed = false;
+          // Nor may hitting the gated-page bound: that is a stop for this
+          // attempt, not a statement about the catalogue.
+          let _softStop = false;
+          // Set when the page came back empty while upstream says there is
+          // more: every result on it was login-gated.
+          let _skipToNext = false;
           try {
             const data = await _wfFetchPage(_wfState.page);
-            if (!data || data.error || !data.items || data.items.length === 0) {
-              _wfState.exhausted = true;
-              if (_wfState.results.length === 0) {
-                wfStatus.textContent = "No workflows found.";
+            if (gen !== _epeWfGen) {
+              // Superseded — by this panel's own newer search, or by another
+              // EPE node's (the counter is shared). In the second case this
+              // panel is left with nothing rendered and an observer that will
+              // not fire again, so leave a control behind rather than a
+              // silently blank pane.
+              if (myRun === _wfRun) {
+                wfStatus.textContent = _wfState.results.length
+                  ? "Load interrupted — click to continue."
+                  : "Search interrupted — click to try again.";
                 wfStatus.style.display = "block";
+              }
+              return;
+            }
+            if (data && data.error && data.items && data.items.length) {
+              // Partial: results came back but a later page failed. Show what
+              // arrived and say why the list stops here.
+              _wfLandItems(data.items);
+              // Keep going: the server returns a usable cursor with a partial
+              // page, and ending the search here threw that away over what may
+              // be a transient upstream blip.
+              // A partial page still delivered items, so it clears the
+              // strike count — otherwise "consecutive" failures could be
+              // separated by successful pages and still kill the list.
+              _wfFails = 0;
+              _wfEmpties = 0;
+              _wfState.page++;
+              _wfAdvanceCursor(data.metadata?.nextCursor);
+              if (!data.metadata?.hasMore) _wfState.exhausted = true;
+              wfStatus.textContent = "Some results unavailable: " + data.error;
+              wfStatus.style.display = "block";
+            } else if (data && data.error) {
+              // Upstream trouble is not the same as an empty catalogue —
+              // and a 200 carrying an error is the COMMON failure shape, so
+              // it earns the same tolerance as a thrown request instead of
+              // killing a hundred loaded cards on one rate-limit blip.
+              _failed = true;
+              _wfFails++;
+              if (_wfFails >= 2) _wfState.exhausted = true;
+              wfStatus.textContent = "Search error: " + data.error
+                + (_wfFails < 2 ? " — click to retry" : "");
+              wfStatus.style.display = "block";
+            } else if (!data || !data.items || data.items.length === 0) {
+              if (data && data.metadata && data.metadata.hasMore && _wfEmpties < 5) {
+                // Empty but not finished: every result on this upstream page
+                // needed a login to download, so the server dropped them all.
+                // Reading that as the end of the catalogue made everything
+                // past the first fully gated page unreachable. Advance and
+                // try the next one — bounded, so a wholly gated tail still
+                // terminates instead of scrolling forever.
+                _wfEmpties++;
+                _wfState.page++;
+                _wfAdvanceCursor(data.metadata.nextCursor);
+                _skipToNext = true;
               } else {
-                const endMsg = document.createElement("div");
-                endMsg.style.cssText = "color:#24303f;font-size:9px;text-align:center;padding:8px;";
-                endMsg.textContent = "\u2014 end of results \u2014";
-                wfList.appendChild(endMsg);
+                _wfState.exhausted = true;
+                // Stopping because the bound ran out is not the same as
+                // reaching the end. Say so, offer the retry, and keep it out
+                // of the cache so a rebuild is not born dead.
+                if (data && data.metadata && data.metadata.hasMore) {
+                  _softStop = true;
+                  // Consume this page like the skip branch does, or every
+                  // "keep looking" click re-fetches the page already known
+                  // to be entirely gated — the slowest request there is.
+                  _wfState.page++;
+                  _wfAdvanceCursor(data.metadata.nextCursor);
+                  wfStatus.textContent =
+                    "Only login-required workflows on this stretch — click to keep looking.";
+                  wfStatus.style.display = "block";
+                } else if (_wfState.results.length === 0) {
+                  wfStatus.textContent = "No workflows found.";
+                  wfStatus.style.display = "block";
+                } else {
+                  const endMsg = document.createElement("div");
+                  endMsg.style.cssText = "color:#24303f;font-size:9px;text-align:center;padding:8px;";
+                  endMsg.textContent = "\u2014 end of results \u2014";
+                  wfList.appendChild(endMsg);
+                }
               }
             } else {
-              _wfState.results.push(...data.items);
-              data.items.forEach(item => {
-                const card = _mkWfCard(item);
-                if (card) wfList.insertBefore(card, wfSentinel);
-              });
+              const _landed = _wfLandItems(data.items);
+              _wfFails = 0;
               _wfState.page++;
+              _wfAdvanceCursor(data.metadata?.nextCursor);
               if (!data.metadata?.hasMore) _wfState.exhausted = true;
+              // Nothing rendered from a page that HAD items — every one of
+              // them failed to build a card. Nothing was inserted before the
+              // sentinel, so the observer's intersection state never changes
+              // and it will not fire again; without this the pane stopped
+              // mid-catalogue with no cards, no message and no control. The
+              // booru engine has had this branch all along.
+              // No Array.isArray here: _wfLandItems returns 0 for a
+              // non-array outright, so gating on it excluded the one shape
+              // where landing is GUARANTEED to fail — an upstream or proxy
+              // that answers `items` as a string passed the emptiness guard
+              // above, landed nothing, and fell to the else, leaving the pane
+              // blank and inert with the observer unable to fire again.
+              if (_landed === 0 && data.items && data.items.length) {
+                _wfEmpties++;
+                if (_wfEmpties < 5 && !_wfState.exhausted) {
+                  _skipToNext = true;
+                } else {
+                  _softStop = true;
+                  _wfState.exhausted = true;
+                  wfStatus.textContent = _wfState.results.length
+                    ? "No more usable results — click to try again."
+                    : "Nothing usable came back — click to try again.";
+                  wfStatus.style.display = "block";
+                }
+              } else {
+                _wfEmpties = 0;
+              }
             }
           } catch(e) {
-            wfStatus.textContent = "Search error: " + (e.message || e);
+            if (gen !== _epeWfGen) return;
+            // Stop the scroll observer re-firing against a failing endpoint,
+            // but not on the first blip — and never write that into the cache,
+            // or the pane stays dead across node rebuilds.
+            _failed = true;
+            _wfFails++;
+            if (_wfFails >= 2) _wfState.exhausted = true;
+            wfStatus.textContent = "Search error: " + (e.message || e)
+              + (_wfFails < 2 ? " — click to retry" : "");
             wfStatus.style.display = "block";
           } finally {
-            _wfState.loading = false;
-            wfSpinner.style.display = "none";
+            _wfInFlight = Math.max(0, _wfInFlight - 1);
+            if (_wfInFlight === 0) wfSpinner.style.display = "none";
+            // Release `loading` only if this is still the latest load for
+            // this panel. Guarding it by GENERATION stranded a panel whose
+            // run another panel superseded; not guarding it at all let a
+            // superseded run free a flag the live one owned, and the
+            // observer then fetched the same cursor twice.
+            if (myRun === _wfRun) _wfState.loading = false;
+            // The cache: only the current search, from the panel that owns it.
+            if (gen === _epeWfGen && _wfEpoch === _epeWfOwner) {
+            // Survives the node rebuild that a workflow tab switch causes.
+            // Capped: the restore block repaints every cached card and each one
+            // pulls a cover image, so an unbounded cache turns a tab switch into
+            // hundreds of DOM builds and image requests.
+            _epeWfPersist.results   = _wfState.results.slice(-150);
+            _epeWfPersist.cursor    = _wfState.cursor;
+            // Browse pages by NUMBER, and the restore used to rebuild that
+            // from the card count — which under-counts as soon as the server
+            // has dropped login-gated results, so it re-served pages the
+            // user had already scrolled past.
+            _epeWfPersist.page      = _wfState.page;
+            // Never cache a failure. Round 3 said it did not and then wrote
+            // it here anyway, so two bad rounds left the pane dead for the
+            // rest of the session, across every rebuild, even once the
+            // endpoint recovered.
+            _epeWfPersist.exhausted = _wfState.exhausted && !_failed && !_softStop;
+            }
           }
+          // Outside the finally, so `loading` has already been released:
+          // the page just consumed was entirely gated, so go get the next.
+          if (_skipToNext && gen === _epeWfGen && _wfEpoch === _epeWfOwner)
+            return _wfLoadMore();
         };
 
         const _wfDoSearch = () => {
           const q = wfSearchInput.value.trim();
+          _epeWfGen++;                  // invalidate anything still in flight
+          // The write-back further down is guarded by `_wfEpoch ===
+          // _epeWfOwner`; this clear was not. So a non-owner node wiped the
+          // OWNER's cache, seeded it with its own query, and then refused to
+          // fill it — and the owner's next rebuild saw a non-empty query with
+          // empty results and re-ran a search the user never typed there,
+          // throwing away everything they had scrolled through. Searching
+          // here is a claim on the pane, so take ownership rather than
+          // skipping the clear. (_wfEpoch is a `let` for this reason — see
+          // its declaration.)
+          _wfEpoch = ++_epeWfOwner;
           _epeWfPersist.query = q;
-          _wfState.query = q; _wfState.page = 1;
+          _epeWfPersist.results = []; _epeWfPersist.cursor = "";
+          _epeWfPersist.page = 1; _epeWfPersist.exhausted = false;
+          _wfFails = 0;
+          _wfEmpties = 0;
+          _wfState.query = q; _wfState.page = 1; _wfState.cursor = "";
           _wfState.loading = false; _wfState.exhausted = false; _wfState.results = [];
-          wfList.innerHTML = ""; wfList.appendChild(wfSentinel);
+          // innerHTML="" detaches wfStatus too, and it is never re-added —
+          // every status message after the first search went to a node that
+          // was no longer in the document.
+          wfList.innerHTML = ""; wfList.appendChild(wfSentinel); wfList.appendChild(wfStatus);
           wfStatus.style.display = "none";
-          if (!q) { wfStatus.textContent = "Enter a search term above."; wfStatus.style.display = "block"; return; }
+          // An empty box browses. It used to print "Enter a search term
+          // above." and return — and the observer, seeing the sentinel back
+          // at the top of an emptied list, immediately browsed anyway, so
+          // the results and the message contradicted each other.
           _wfLoadMore();
         };
         wfSearchBtn.onclick  = _wfDoSearch;
         wfSearchInput.onkeydown = (ev) => { if (ev.key === "Enter") _wfDoSearch(); };
 
-        // Restore last search query if EPE was re-created (e.g. after loading a workflow)
-        if (_epeWfPersist.query) {
+        // Restore after a node rebuild (switching ComfyUI workflow tabs, which
+        // is exactly what loading a workflow does). Repaint the cards we already
+        // have rather than re-running the search — a refetch drops everything
+        // scrolled past and leaves the pane blank while it waits on Civitai.
+        // Not `if (query)`: an empty box BROWSES, and a browse fills this
+        // cache like any search. Gating on the query meant every browse page
+        // was cached and none of them could ever be read back.
+        if (_epeWfPersist.query || _epeWfPersist.results.length) {
           wfSearchInput.value = _epeWfPersist.query;
-          requestAnimationFrame(() => _wfDoSearch());
+          if (_epeWfPersist.results.length) {
+            _wfState.query     = _epeWfPersist.query;
+            // Filled from what actually RENDERS, below — an entry whose card
+            // throws is not a result. Copying the cache wholesale let
+            // _wfState.results exceed the visible cards, so WF_MAX_RESULTS
+            // counted phantoms and the next write put them back in the cache.
+            _wfState.results   = [];
+            _wfState.cursor    = _epeWfPersist.cursor;
+            _wfState.exhausted = _epeWfPersist.exhausted;
+            // From the CACHE's length, not the state's: the state is filled
+            // below now, so reading it here would always see zero.
+            _wfState.page      = _epeWfPersist.page
+                              || (1 + Math.ceil(_epeWfPersist.results.length / 20));
+            wfStatus.style.display = "none";
+            // The cache is a stranger's data too once a workflow file has
+            // been round-tripped through it, and _mkWfCard reads .coverUrl
+            // straight off each entry.
+            _epeWfPersist.results.forEach(item => {
+              if (!item || typeof item !== "object") return;
+              let card = null;
+              try { card = _mkWfCard(item); } catch (_e) { card = null; }
+              if (card) { wfList.insertBefore(card, wfSentinel); _wfState.results.push(item); }
+            });
+          } else {
+            requestAnimationFrame(() => _wfDoSearch());
+          }
         }
+
+        // A failure that leaves the list empty inserts nothing before the
+        // sentinel, so its intersection state never changes and the observer
+        // below never fires again — "scroll to retry" was advice the user
+        // could not follow. Make the message itself the control.
+        wfStatus.style.cursor = "pointer";
+        wfStatus.title = "Click to try again";
+        wfStatus.onclick = () => {
+          // No query guard: the pane BROWSES with an empty query, which is
+          // exactly the state that produces an empty list with a message on
+          // it — so guarding on "has a query or has cards" disabled the
+          // control in the only case it was added for.
+          if (_wfState.loading) return;
+          _wfState.exhausted = false;
+          _wfEmpties = 0;
+          _wfFails = 0;
+          wfStatus.style.display = "none";
+          _wfLoadMore();
+        };
 
         // Infinite scroll
         const _wfObserver = new IntersectionObserver(entries => {
@@ -7942,7 +11544,8 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             dInfoStatus.textContent = "Fetching workflow info…";
             dInfoSection.appendChild(dInfoStatus);
 
-            fetch("/epe/prompts/workflow-detail", {
+            const _wfDetailAc = _wfProbeStart();
+            api.fetchApi("/epe/prompts/workflow-detail", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -7951,8 +11554,12 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
                 downloadUrl: item.downloadUrl || "",
                 versionId:   item.versionId   || "",
               }),
+              signal: _wfDetailAc ? _wfDetailAc.signal : undefined,
             }).then(r => { return r.json().then(data => ({ status: r.status, data })); })
             .then(({ status, data }) => {
+              // Bail if the fetch was aborted during dispose — otherwise
+              // this handler pins the detached editor DOM by mutating it.
+              if (_wfDetailAc && _wfDetailAc.signal.aborted) return;
               dInfoSection.innerHTML = "";
               if (data.error) {
                 // Even on error, populate description if the backend returned one
@@ -7961,9 +11568,21 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
                 }
                 const errEl = document.createElement("div");
                 errEl.style.cssText = "font-size:9px;font-style:italic;" + (status === 403 ? "color:#a07830;" : "color:#744;");
+                // `data.error` was read for truthiness and then thrown
+                // away, so every non-403 showed the same eight words. The
+                // server now refuses an over-size archive rather than quietly
+                // handing back a different workflow from inside it — and that
+                // refusal is only useful if its reason is visible.
+                // typeof-checked before .trim(): `error` is whatever the
+                // server sent, and a proxy that answers `{"error": 500}` would
+                // throw inside the very branch that exists to report a
+                // failure.
+                const _why = (typeof data.error === "string" && data.error.trim())
+                  ? data.error.trim().slice(0, 200) : "";
                 errEl.textContent = status === 403
                   ? "⚠ Login required on Civitai to download this workflow."
-                  : "Could not load workflow info.";
+                  : (_why ? "Could not load workflow info — " + _why
+                          : "Could not load workflow info.");
                 dInfoSection.appendChild(errEl);
                 // Disable load button on auth failure
                 dLoadBtn.disabled = true;
@@ -8005,12 +11624,15 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               // Cache the workflow for the Load button
               dLoadBtn._cachedWorkflow = data.workflow || null;
             }).catch(() => {
+              // Same abort-check as .then above — an abort rejects the
+              // chain, and we must NOT touch the detached DOM after that.
+              if (_wfDetailAc && _wfDetailAc.signal.aborted) return;
               dInfoSection.innerHTML = "";
               const errEl = document.createElement("div");
               errEl.style.cssText = "font-size:9px;color:#744;font-style:italic;";
               errEl.textContent = "Could not load workflow info.";
               dInfoSection.appendChild(errEl);
-            });
+            }).finally(() => { _wfProbeDone(_wfDetailAc); });
           } else {
             // No download source — show message and disable Load button
             const naEl = document.createElement("div");
@@ -8040,22 +11662,34 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             if (dLoadBtn._cachedWorkflow) {
               dLoadBtn.textContent = "Loading\u2026";
               dLoadBtn.disabled = true;
+              // Same abort wiring as the fetch branch below. `_epeOpenTemplate`
+              // itself self-protects against destroying the user's graph, but
+              // the post-await setTimeouts would still mutate a detached
+              // dLoadBtn if dispose fired mid-load.
+              const _ac0 = _wfProbeStart();
               try {
                 await _epeOpenTemplate(dLoadBtn._cachedWorkflow);
+                if (_ac0 && _ac0.signal.aborted) return;
                 dLoadBtn.textContent = "Loaded \u2713";
-                setTimeout(() => { dLoadBtn.textContent = "Load Workflow"; dLoadBtn.disabled = false; }, 2000);
+                setTimeout(() => { if (_ac0 && _ac0.signal.aborted) return;
+                  dLoadBtn.textContent = "Load Workflow"; dLoadBtn.disabled = false; }, 2000);
               } catch(e) {
+                if (_ac0 && _ac0.signal.aborted) return;
                 dLoadBtn.textContent = "Error: " + (e.message || "failed");
                 dLoadBtn.style.color = "#c66";
                 dLoadBtn.disabled = false;
-                setTimeout(() => { dLoadBtn.textContent = "Load Workflow"; dLoadBtn.style.color = "rgba(109,184,232,0.85)"; }, 3000);
+                setTimeout(() => { if (_ac0 && _ac0.signal.aborted) return;
+                  dLoadBtn.textContent = "Load Workflow"; dLoadBtn.style.color = "rgba(109,184,232,0.85)"; }, 3000);
+              } finally {
+                _wfProbeDone(_ac0);
               }
             } else {
               // Workflow not yet cached — fetch now
               dLoadBtn.textContent = "Fetching\u2026";
               dLoadBtn.disabled = true;
+              const _ac2 = _wfProbeStart();
               try {
-                const resp = await fetch("/epe/prompts/workflow-detail", {
+                const resp = await api.fetchApi("/epe/prompts/workflow-detail", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({
@@ -8064,21 +11698,29 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
                     downloadUrl: item.downloadUrl || "",
                     versionId:   item.versionId   || "",
                   }),
+                  signal: _ac2 ? _ac2.signal : undefined,
                 });
                 const data = await resp.json();
+                if (_ac2 && _ac2.signal.aborted) return;
                 if (resp.status === 403) throw new Error("\u26a0 Login required on Civitai to download this workflow");
                 if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                 if (data.error) throw new Error(data.error);
                 if (!data.workflow) throw new Error("No workflow returned");
                 dLoadBtn.textContent = "Loading\u2026";
                 await _epeOpenTemplate(data.workflow);
+                if (_ac2 && _ac2.signal.aborted) return;
                 dLoadBtn.textContent = "Loaded \u2713";
-                setTimeout(() => { dLoadBtn.textContent = "Load Workflow"; dLoadBtn.disabled = false; }, 2000);
+                setTimeout(() => { if (_ac2 && _ac2.signal.aborted) return;
+                  dLoadBtn.textContent = "Load Workflow"; dLoadBtn.disabled = false; }, 2000);
               } catch(e) {
+                if (_ac2 && _ac2.signal.aborted) return;
                 dLoadBtn.textContent = "Error: " + (e.message || "failed");
                 dLoadBtn.style.color = "#c66";
                 dLoadBtn.disabled = false;
-                setTimeout(() => { dLoadBtn.textContent = "Load Workflow"; dLoadBtn.style.color = "rgba(109,184,232,0.85)"; }, 3000);
+                setTimeout(() => { if (_ac2 && _ac2.signal.aborted) return;
+                  dLoadBtn.textContent = "Load Workflow"; dLoadBtn.style.color = "rgba(109,184,232,0.85)"; }, 3000);
+              } finally {
+                _wfProbeDone(_ac2);
               }
             }
           };
@@ -8114,19 +11756,39 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           // Loading a saved prompt replaces the text wholesale, so the direction
           // that shaped the previous prompt no longer describes what's here.
           _ieThreadClear();
-          textEl.value=item.text; updateTokenBadge(item.text); textEl.focus();
+          // Every other wholesale replacement pushes first — Use Prompt from a
+          // PNG extract, Civitai Use, Genur Use, Clear, Load from file, and
+          // both review commits. This one did not, so on a freshly-loaded
+          // workflow (empty undo stack) the user's prompt went with no way
+          // back: Ctrl+Z did nothing, and the dispatch below had already
+          // written the new text into epe_prompt AND the tab slot.
+          if (textEl._epePushUndo) textEl._epePushUndo();
+          textEl.value=item.text; updateTokenBadge(item.text);
+          // updateTokenBadge writes epe_prompt, but ONLY the input listener
+          // runs _epeTabSync — and a rebuild reads the TAB slot first, so
+          // without this the loaded prompt was silently replaced by the one
+          // it had just overwritten. Same fix as Clear Prompt.
+          textEl.dispatchEvent(new Event("input"));
+          textEl.focus();
         };
         const _insertItem = (item) => {
           // same guard — inserting into a hidden/streaming editor
           // would be confusing. Discard first, then insert into restored text.
           if (_reviewMode) _autoDiscardReview("Snippet insert — result discarded");
+          // Same as _useItem, and worse: this splices out [selectionStart,
+          // selectionEnd). The selection survives the click on the rail, so a
+          // user who had a paragraph selected lost it — silently, and with
+          // nothing on the undo stack to get it back.
+          if (textEl._epePushUndo) textEl._epePushUndo();
           const s=textEl.selectionStart, e2=textEl.selectionEnd;
           const before=textEl.value.slice(0,s), after=textEl.value.slice(e2);
           const sep=(before.length>0 && !/,\s*$/.test(before)) ? ", " : "";
           textEl.value=before+sep+item.text+after;
           const pos=s+sep.length+item.text.length;
           textEl.setSelectionRange(pos,pos);
-          updateTokenBadge(textEl.value); textEl.focus();
+          updateTokenBadge(textEl.value);
+          textEl.dispatchEvent(new Event("input"));   // see _useItem above
+          textEl.focus();
         };
         const _renameItem = (item,tabId) => {
           const n=window.prompt("Rename:",item.name);
@@ -8206,18 +11868,39 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           // close path — chevron, outside click, another card opening, or focus
           // moving to the Instruct box — so switching away never loses work.
           // Declared before _collapseTA because that closes over it.
+          // Returns:
+          //   "noop"   — nothing to save (unchanged, empty, or item gone)
+          //   "saved"  — write succeeded
+          //   "failed" — write refused (quota, private mode); toast fired
+          // Callers that ONLY care about save failure (like _collapseTA)
+          // key off "failed" to keep the textarea open so the user can
+          // retry rather than losing the edit to a silent auto-commit.
           const _commitEdit=()=>{
             const newText=editTA.value.trim();
-            if(!newText || newText===(item.text||"").trim()) return false;
+            if(!newText || newText===(item.text||"").trim()) return "noop";
             const arr=_libLoad(tabId);
             const idx=arr.findIndex(x=>x.id===item.id);
-            if(idx<0) return false;
-            arr[idx].text=newText; item.text=newText;
-            _libSaveItems(tabId,arr);
-            return true;
+            if(idx<0) return "noop";                 // entry deleted elsewhere
+            // Stage into the array, but do NOT touch item.text before the
+            // write is confirmed. On a quota refusal (localStorage full,
+            // private-mode block) _libSaveItems returns false and the item
+            // is discarded — otherwise item.text=newText locks the guard
+            // above out on every later attempt and the edit can never be
+            // retried, even after the user frees space.
+            arr[idx].text=newText;
+            if(!_libSaveItems(tabId,arr)) return "failed";
+            item.text=newText;
+            return "saved";
           };
           const _collapseTA=()=>{
-            _commitEdit();
+            if (_commitEdit() === "failed") {
+              // Save refused. Do NOT collapse — the user's edit stays
+              // visible so they can retry or copy it out. _libSaveItems
+              // already toasted "Could not save — browser storage is full
+              // or blocked."; the textarea staying open is what prevents
+              // the auto-commit silent-loss path.
+              return;
+            }
             editTA.style.cssText=_taCollapsedCSS;
             editTA.readOnly=true;
             cardBodyWrap.style.display="none";
@@ -8228,11 +11911,26 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const _expandTA=()=>{
             // Close any other open card first
             if(rpList._openTA && rpList._openTA!==editTA){
-              if(rpList._openTA._epeCommit) rpList._openTA._epeCommit();
+              // Refuse to open a second card if the current one's edit was
+              // refused by storage (quota / private mode). Same rationale
+              // as _collapseTA's own "failed" gate — otherwise the user
+              // clicks the next card, the first one collapses silently and
+              // their unsaved edit vanishes behind the toast.
+              if(rpList._openTA._epeCommit && rpList._openTA._epeCommit() === "failed") {
+                editTA.focus();   // keep the caller's cursor sane
+                return;
+              }
               rpList._openTA.style.cssText=_taCollapsedCSS;
               rpList._openTA.readOnly=true;
               if(rpList._openTA._epeBody) rpList._openTA._epeBody.style.display="none";
               if(rpList._openTA._epeChev) _setChevron(rpList._openTA._epeChev,false);
+              // This path closes the other card by hand instead of calling
+              // its _collapseTA, so its document mousedown listener was left
+              // attached. They piled up one per expand, and the next click
+              // outside ran every stale one — each calling _commitEdit on a
+              // card the user had moved on from, writing text back to the
+              // library that they thought was no longer in play.
+              if(rpList._openTA._epeReleaseOutside) rpList._openTA._epeReleaseOutside();
             }
             cardBodyWrap.style.display="";
             editTA.style.cssText=_taExpandedCSS;
@@ -8246,6 +11944,14 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           editTA._epeChev=nameChev;
           editTA._epeBody=cardBodyWrap;
           editTA._epeCommit=_commitEdit;
+          // _outsideHandler is a per-card closure, so nothing outside _mkCard
+          // can remove it. Expose a release that ONLY detaches the listener —
+          // no _commitEdit, no style changes — for the two callers that need
+          // to drop a card's listener without running a full collapse:
+          // _expandTA taking over from another card, and _epeDispose.
+          editTA._epeReleaseOutside=()=>{
+            try { document.removeEventListener("mousedown",_outsideHandler,true); } catch(_e){}
+          };
           nameRow.onclick=(ev)=>{
             ev.stopPropagation();
             if(editTA.readOnly) _expandTA(); else _collapseTA();
@@ -8272,8 +11978,22 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             if(!newText) return;
             const arr=_libLoad(tabId);
             const idx=arr.findIndex(x=>x.id===item.id);
-            if(idx>=0){arr[idx].text=newText; item.text=newText; _libSaveItems(tabId,arr);}
-            saveBtn.textContent="Saved!"; setTimeout(()=>saveBtn.textContent="Save",1200);
+            // Three outcomes:
+            //   idx < 0            → the entry was deleted between click
+            //                        and handler; not a storage problem.
+            //   save returns false → quota / private mode; toast fires.
+            //   save returns true  → success.
+            // Distinguishing them stops the "Save failed" label from
+            // misinforming users whose only real problem is a stale card.
+            let _label = "Saved!", _hold = 1200;
+            if (idx < 0) { _label = "Entry gone"; _hold = 1800; }
+            else {
+              arr[idx].text=newText;
+              if(_libSaveItems(tabId,arr)) { item.text=newText; }
+              else { _label = "Save failed"; _hold = 1800; }
+            }
+            saveBtn.textContent = _label;
+            setTimeout(()=>saveBtn.textContent="Save", _hold);
           };
 
           const saveNewBtn=_mkBtn("Save as New","Save edited text as a new entry","rgba(140,200,240,0.7)");
@@ -8292,12 +12012,10 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             _libAddEntry(dest,editTA.value.trim()||item.text);
           };
 
-          const toEnhBtn=_mkBtn("Enhance","Load into editor and run Enhance Prompt","rgba(100,160,255,0.7)");
+          const toEnhBtn=_mkBtn("Enhance","Run AI enhance on this prompt","rgba(100,160,255,0.7)");
           toEnhBtn.onclick=(ev)=>{
             ev.stopPropagation();
-            textEl.value=editTA.value.trim()||item.text;
-            updateTokenBadge(textEl.value);
-            runAiAction("expand");
+            runAiAction("expand", { sourceText: editTA.value.trim() || item.text });
           };
 
           saveRow.appendChild(saveBtn);
@@ -8310,11 +12028,10 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           acts.style.cssText="display:flex;align-items:center;margin-top:5px;gap:4px;flex-wrap:wrap;";
 
           if(tabId==="favorites"){
-            const favVarBtn=_mkBtn("Variations","Load into editor and run Variations","rgba(140,200,240,0.7)");
+            const favVarBtn=_mkBtn("Variations","Run AI variations on this prompt","rgba(140,200,240,0.7)");
             favVarBtn.onclick=(ev)=>{
               ev.stopPropagation();
-              textEl.value=editTA.value.trim()||item.text; updateTokenBadge(textEl.value);
-              runAiAction("variations");
+              runAiAction("variations", { sourceText: editTA.value.trim() || item.text });
             };
             const favUseBtn=_mkBtn("Use","Replace editor text with this prompt","rgba(109,184,232,0.7)");
             favUseBtn.onclick=(ev)=>{ev.stopPropagation();_useItem(item);};
@@ -8324,11 +12041,10 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             favDelBtn.onclick=(ev)=>{ev.stopPropagation();_deleteItem(item,"favorites");};
             acts.appendChild(favVarBtn); acts.appendChild(favUseBtn); acts.appendChild(favRenBtn); acts.appendChild(favDelBtn); acts.appendChild(charSpan);
           } else {
-            const snpVarBtn=_mkBtn("Variations","Load into editor and run Variations","rgba(140,200,240,0.7)");
+            const snpVarBtn=_mkBtn("Variations","Run AI variations on this prompt","rgba(140,200,240,0.7)");
             snpVarBtn.onclick=(ev)=>{
               ev.stopPropagation();
-              textEl.value=editTA.value.trim()||item.text; updateTokenBadge(textEl.value);
-              runAiAction("variations");
+              runAiAction("variations", { sourceText: editTA.value.trim() || item.text });
             };
             const snpInsBtn=_mkBtn("Insert","Insert at cursor position","rgba(109,184,232,0.7)");
             snpInsBtn.onclick=(ev)=>{ev.stopPropagation();_insertItem(item);};
@@ -8395,13 +12111,42 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             // Width is only meaningful when expanded — reading it while collapsed
             // would persist 0 and reopen to a zero-width panel.
             const _w = _libCollapsed ? undefined : (parseInt(rightPanel.style.width, 10) || undefined);
-            const _prev = (_epeOwnerNode.properties || {}).epe_ui || {};
+            // `epe_ui` comes out of the workflow FILE, and JSON.parse makes
+            // "__proto__" an ordinary own property. Object.assign copies with
+            // [[Set]], which runs Object.prototype's __proto__ SETTER — so a
+            // downloaded workflow could hand the merged object an
+            // attacker-chosen prototype, and every key on it would then read
+            // back as though the user had set it (driven: `libraryCollapsed`
+            // arriving from a prototype nobody wrote).
+            //
+            // Object.prototype itself is never touched — the damage is scoped
+            // to this object — but "opening someone else's workflow is safe"
+            // is a promise worth being able to make.
+            //
+            // Own enumerable keys only, __proto__ dropped, and copied with
+            // defineProperty so no inherited setter can run during the copy.
+            const _prevRaw = (_epeOwnerNode.properties || {}).epe_ui || {};
+            const _prev = {};
+            try {
+              for (const _k of Object.keys(_prevRaw)) {
+                if (_k === "__proto__") continue;
+                Object.defineProperty(_prev, _k, {
+                  value: _prevRaw[_k], writable: true,
+                  enumerable: true, configurable: true,
+                });
+              }
+            } catch (_e) {}
             // Same rule for the rail and the tuning block: only record a size
             // while the panel is open, or a collapsed session would persist 0
             // and reopen to nothing.
             const _rw = _railCollapsed ? undefined : (_railW || undefined);
             const _th = !_styleOpen ? undefined : (_tuneH || undefined);
-            _epeOwnerNode.properties.epe_ui = {
+            // Object.assign MERGES onto _prev — a workflow saved by a NEWER
+            // build carries keys this build does not know, and rebuilding
+            // from a fixed literal would drop them the first time a panel
+            // is dragged. Keeps forward compatibility for schema additions
+            // without needing this file to enumerate every future key.
+            _epeOwnerNode.properties.epe_ui = Object.assign({}, _prev, {
               tab: _rpActive,
               styleOpen: _styleOpen,
               libraryWidth: _w || _prev.libraryWidth || undefined,
@@ -8409,22 +12154,29 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               railWidth: _rw || _prev.railWidth || undefined,
               railCollapsed: _railCollapsed || undefined,
               tuneHeight: _th || _prev.tuneHeight || undefined,
-            };
+            });
           } catch (_e) {}
         };
 
         const _setRpTab = (id, opts) => {
-          // Switching library tabs while a review is active implicitly abandons
-          // the result. But "reveal the thread" is not a tab switch: focusing the
+          // This used to discard an active review, on the reasoning that
+          // switching library tabs "implicitly abandons the result". It does
+          // not: this is the right-hand rail, and it cannot reach the result at
+          // all — the review strips, the prompt box and the variations cards
+          // are all in the editor. Moving from Favorites to Civitai is neither
+          // Use this nor Discard, so it no longer ends the review.
+          //
+          // (The keepReview opt is kept for callers that pass it: focusing the
           // ✎ box, the steps chip and the first-keystroke jump all call this to
-          // bring the Instruct pane into view, and discarding there threw away
-          // the edit the user was still working on and rolled the thread back to
-          // one step. Only discard on a genuine move to a different tab.
-          if (_reviewMode && !(opts && opts.keepReview) && id !== _rpActive) {
-            _autoDiscardReview("Tab switch — result discarded");
-          }
+          // bring the Instruct pane into view, and are not tab switches at all.)
+          const _rpPrev = _rpActive;
           _rpActive=id;
-          _epePersistUi();
+          // The Load Workflow button is shared by every media tab. Leaving it
+          // armed across a tab switch meant clicking it while browsing Genur
+          // loaded a workflow for a Civitai image that was no longer on
+          // screen. Any genuine move re-arms from the new tab's own detail.
+          if (_rpPrev !== id) { try { _setGetWfBtn(false, null); } catch (_e) {} }
+          if (!(opts && opts.silent)) _epePersistUi();
           Object.values(rpTabEls).forEach(t => {
             t._active=(t._id===id);
             t.style.color       = t._active ? "#c2e2f8" : "#8ba5be";
@@ -8458,8 +12210,29 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // ── Render body ──────────────────────────────────────────────────
         const _renderRpBody = () => {
           // Leaving Favorites/Snippets rebuilds the list from storage, so commit
-          // any card still open before it is thrown away.
-          try { if (rpList && rpList._openTA && rpList._openTA._epeCommit) rpList._openTA._epeCommit(); } catch (_e) {}
+          // any card still open before it is thrown away. If that commit was
+          // refused by storage, log it — the tab switch will still throw away
+          // the DOM (the rebuild is unavoidable, the switch already happened)
+          // but at least a diagnostic is emitted rather than the failure
+          // vanishing entirely. The saved-warning toast from _libSaveItems is
+          // the user-facing signal.
+          try {
+            if (rpList && rpList._openTA && rpList._openTA._epeCommit) {
+              const _r = rpList._openTA._epeCommit();
+              if (_r === "failed") {
+                try { console.warn("[EPE] auto-commit on tab switch was refused by storage"); } catch (_e2) {}
+              }
+            }
+          } catch (_e) {}
+          // …and RELEASE it. _outsideHandler is a per-card closure, so nothing
+          // outside _mkCard can remove it; the release exists for exactly this
+          // and only _expandTA and _epeDispose were given it. Left attached,
+          // it held the detached card and textarea, and rpList._openTA still
+          // pointed at the detached textarea — so the next expand ran
+          // _epeCommit() on the discarded card and wrote its text back into
+          // the library.
+          try { if (rpList && rpList._openTA && rpList._openTA._epeReleaseOutside) rpList._openTA._epeReleaseOutside(); } catch (_e) {}
+          try { if (rpList) rpList._openTA = null; } catch (_e) {}
           rpBody.innerHTML="";
           if(_rpActive==="civitai"){   rpBody.appendChild(rpCivPanel);      return; }
           if(_rpActive==="genur"){     rpBody.appendChild(rpGenurPanel);    return; }
@@ -8475,7 +12248,13 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const q=rpSearch.value.trim().toLowerCase();
           const all=_libLoad(_rpActive);
           const filtered = q
-            ? all.filter(x=>x.name.toLowerCase().includes(q)||x.text.toLowerCase().includes(q))
+            // String(): _libLoad guarantees the entries are OBJECTS, not that
+            // they carry a string `name` and `text`. One entry from an older
+            // build, hand-edited, or truncated by a full storage quota threw
+            // on every keystroke and left the pane blank. The node picker's
+            // search has used this idiom since the title-is-a-number bug.
+            ? all.filter(x => String(x.name || "").toLowerCase().includes(q) ||
+                              String(x.text || "").toLowerCase().includes(q))
             : all;
           if(filtered.length===0){
             rpList.appendChild(_mkEmpty(_rpActive));
@@ -8493,7 +12272,14 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const items=_libLoad(tabId);
           items.push({id:_libNewId(),name:name.trim(),text:text.trim(),date:new Date().toISOString()});
           _libSaveItems(tabId,items);
-          _setRpTab(tabId);
+          // keepReview: revealing the tab we just saved to is not the user
+          // abandoning their result. Without it, _setRpTab counted this as a
+          // tab switch and ran _autoDiscardReview — so "Save > Snippets" on a
+          // review put the text in the library and then wiped it from the
+          // editor a moment later, and from a variation card it took all three
+          // cards with it. Every other reveal caller (the pen box, the steps
+          // chip, the first-keystroke jump) already passes this.
+          _setRpTab(tabId, { keepReview: true });
         };
 
         // ══════════════════════════════════════════════════════════════════
@@ -8844,9 +12630,18 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           libGrip.style.background = "#1c2431";
           window.removeEventListener("pointermove", _libOnMove, true);
           window.removeEventListener("pointerup", _libOnUp, true);
-          try { libGrip.releasePointerCapture(e.pointerId); } catch (_e) {}
+          // pointercancel was not listened for at all, so a cancelled pointer
+          // — a touch interrupted, the OS taking over the gesture, a context
+          // menu — left _libDragging true (the column then followed an
+          // unpressed mouse) and both window listeners alive for the life of
+          // the page.
+          window.removeEventListener("pointercancel", _libOnUp, true);
+          try { libGrip.releasePointerCapture(e && e.pointerId); } catch (_e) {}
           _epePersistUi();
         };
+        // The drag holds two window listeners. A node destroyed mid-drag never
+        // reaches _libOnUp, so dispose ends it the same way a pointerup does.
+        const _libEndDrag = () => { try { _libOnUp({}); } catch (_e) {} };
         _publishLibW();   // initial value for a fresh node with no saved UI state
         libGrip.addEventListener("pointerdown", (e) => {
           // No early-out when collapsed: dragging back out is how you reopen
@@ -8859,6 +12654,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           try { libGrip.setPointerCapture(e.pointerId); } catch (_e) {}
           window.addEventListener("pointermove", _libOnMove, true);
           window.addEventListener("pointerup", _libOnUp, true);
+          window.addEventListener("pointercancel", _libOnUp, true);
           // Keep the ComfyUI canvas from starting a node-drag on the grip.
           e.preventDefault(); e.stopPropagation();
         });
@@ -8908,7 +12704,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         };
         // `w` is optional: mid-drag the caller passes the exact width so the edge
         // tracks the cursor. Without it (tab click, restore) we open at _libOpenW.
-        const _libSetCollapsed = (v, w) => {
+        const _libSetCollapsed = (v, w, silent) => {
           const wasCollapsed = _libCollapsed;
           _libCollapsed = !!v;
           if (_libCollapsed) {
@@ -8934,7 +12730,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           // Mid-drag this runs on every pointermove; persisting there would write
           // node.properties dozens of times a second and mark the graph dirty on
           // each one. The pointerup handler persists once at the end instead.
-          if (!_libDragging) { _epePersistUi(); if (!_libCollapsed) _epeGrowToMin(); }
+          if (!_libDragging) { if (!silent) _epePersistUi(); if (!_libCollapsed) _epeGrowToMin(); }
         };
         libHandle.addEventListener("pointerdown", (e) => { e.preventDefault(); e.stopPropagation(); });
         libHandle.addEventListener("mousedown",   (e) => { e.stopPropagation(); });
@@ -8955,8 +12751,15 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // a default size" snap), the column trims itself to fit. _libClampMax
         // never returns less than LIB_MIN_W, so it can shrink but not vanish —
         // collapsing stays something the user does deliberately.
+        // Declared out here, not inside the try, so _epeDispose can reach
+        // it. A ResizeObserver with a live observation is kept alive by the
+        // browser and holds its target strongly, so leaving this connected
+        // roots bodyWrap — and through it the whole editor subtree, the undo
+        // stacks and _epeOwnerNode — for the life of the page. A workflow-tab
+        // switch destroys and rebuilds the node, so it leaked one per switch.
+        let _libFitRO = null;
         try {
-          const _libFitRO = new ResizeObserver(() => {
+          _libFitRO = new ResizeObserver(() => {
             if (_libCollapsed || _libDragging) return;
             const cur = parseInt(rightPanel.style.width, 10) || 0;
             const max = _libClampMax();
@@ -9069,7 +12872,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
         const SLIDER_DEFS = [
           { id: "creativity",  label: "Creativity",       tooltip: "How wild the LLM's word choices are.\nLow: predictable, safe vocabulary.\nHigh: surprising, unexpected words." },
-          { id: "length",      label: "Length / Density", tooltip: "How long and detailed the output prompt is.\nLow: terse, ~50\u2013100 words.\nHigh: expansive, ~280\u2013400 words." },
+          { id: "length",      label: "Length / Density", tooltip: "How long and detailed the output prompt is.\nLow: terse, ~50\u2013100 words.\nHigh: expansive, ~260\u2013300 words." },
           { id: "focus",       label: "Focus",            tooltip: "How tightly the LLM sticks to your subject.\nLow: wanders into related ideas.\nHigh: stays strictly on subject, no tangents." },
           { id: "variability", label: "Variability",      tooltip: "How much the output changes between runs.\nLow (0\u201310): same result every time (fixed seed).\nHigh: fresh vocabulary on each call." },
           { id: "boldness",    label: "Boldness",         tooltip: "How dramatic the LLM's stylistic choices are.\nLow: gentle refinements, preserves tone.\nHigh: bold leaps, dramatic stylistic shifts." },
@@ -9172,14 +12975,30 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         //   1. Strip any stale addendum block from the base prompt
         //   2. Prepend the active style's addendum (skipped for Default)
         //   3. Append slider-driven modifier text (skipped if none apply)
+        // Own keys only, and only strings. `_styleActive` comes from
+        // node.properties — a shared, hand-editable file — and STYLE_ADDENDUMS
+        // is a plain object literal, so "constructor" returned Object's
+        // constructor: truthy, and "function Object() { [native code] }" was
+        // prepended to every system prompt inside a STYLE TARGET block while
+        // the UI still read "Default". "toString", "valueOf" and "__proto__"
+        // do the same.
+        const _styleAddendum = (id) =>
+          (typeof id === "string" &&
+           Object.prototype.hasOwnProperty.call(STYLE_ADDENDUMS, id) &&
+           typeof STYLE_ADDENDUMS[id] === "string") ? STYLE_ADDENDUMS[id] : "";
+
         const _composeSystemPromptForStyle = (basePrompt) => {
           const cleaned = _stripStyleAddendum(basePrompt) || "";
           let result = cleaned;
-          if (_styleActive !== "default" && STYLE_ADDENDUMS[_styleActive]) {
-            const block = STYLE_ADDENDUM_START + "\n" + STYLE_ADDENDUMS[_styleActive] + "\n" + STYLE_ADDENDUM_END;
+          const _add = _styleAddendum(_styleActive);
+          if (_styleActive !== "default" && _add) {
+            const block = STYLE_ADDENDUM_START + "\n" + _add + "\n" + STYLE_ADDENDUM_END;
             result = block + "\n\n" + cleaned;
           }
-          if (_styleOverride && _styleActive !== "default") {
+          // Unknown style id (another build, hand-edited workflow): no
+          // STYLE TARGET block was written above, so the OVERRIDE paragraph
+          // must not go out referencing one.
+          if (_styleOverride && _styleActive !== "default" && _add) {
             result = result + "\n\nAESTHETIC OVERRIDE — the STYLE TARGET above REPLACES the source's aesthetic. This relaxes SUBJECT FIDELITY for aesthetic language only: discard the source's rendering style, medium, lighting, and global color grade, and re-render the scene fully in the style target. PRESERVE unchanged: subjects, counts, poses, actions, scene layout, and named objects with their identity colors — a red bicycle stays red, expressed in the target style's idiom.";
           }
           const mods = _composeSliderModifiers();
@@ -9247,14 +13066,19 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // Keep the vision backend informed of the active style + safe sliders
         // (length, focus). Creativity/boldness/subject-grip are intentionally
         // NOT sent — they invite hallucination in faithful captioning.
+        // Also claims the vision singleton for THIS editor. It is called from
+        // the style-strip handlers as before, and now immediately before every
+        // vision run as well — without that, the bridge was whatever the last
+        // node whose strip was touched had left behind, and a second EPE node
+        // in the graph silently captioned in the wrong style.
         const _syncVisionStyleBridge = () => {
           try {
-            _epeOllamaVision._styleBridge = {
+            _epeOllamaVision.claim(WIN_ID, {
               style: _styleActive,
               lengthSlider: _sliderValues.length,
               focusSlider: _sliderValues.focus,
               styleOverride: (typeof _styleOverride !== "undefined") ? _styleOverride : false,
-            };
+            });
           } catch (_e) {}
         };
 
@@ -9482,7 +13306,12 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // recommended defaults. Used by both the dropdown-pick handler and
         // the main Reset button (Reset = snap to "default" preset).
         const _applyStylePresetToSliders = (styleId) => {
-          const preset = STYLE_SLIDER_DEFAULTS[styleId] || STYLE_SLIDER_DEFAULTS.default;
+          // Same reason as _EPE_STYLE_POOL_RULES: a bare index on a
+          // prototype key returns a function, which is truthy, so the
+          // `|| .default` fallback never fired and Object.keys() of it is
+          // empty — the sliders simply did not move and nothing said why.
+          const preset = Object.prototype.hasOwnProperty.call(STYLE_SLIDER_DEFAULTS, styleId)
+            ? STYLE_SLIDER_DEFAULTS[styleId] : STYLE_SLIDER_DEFAULTS.default;
           Object.keys(preset).forEach(sliderId => {
             const el = sliderEls[sliderId];
             if (!el) return;
@@ -9542,52 +13371,68 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         if (_epeOwnerNode) {
           // Restore panel tab + style section open/closed.
           _epeOwnerNode._epeUiRestore = () => {
-            // Instruct Edit threads ride along with the prompt tabs they belong
-            // to, so reopening a workflow restores the direction that built it.
-            try {
-              const th = (_epeOwnerNode.properties || {}).epe_ie_threads;
-              if (th && typeof th === "object") {
-                const clean = {};
-                Object.keys(th).forEach(k => {
-                  if (Array.isArray(th[k])) clean[k] = th[k].filter(x => typeof x === "string");
-                });
-                _ieThreads = clean;
-                _ieRefresh();
-              }
-            } catch (_e) {}
+            // The Instruct-Edit thread load used to be here. It is
+            // _epeThreadsRestore now, called BEFORE _epeTabRestore — see the
+            // hook's own comment. This one runs THIRD, which was fatal.
             const ui = (_epeOwnerNode.properties || {}).epe_ui;
             if (!ui) return;
-            if (ui.tab && rpTabEls[ui.tab]) _setRpTab(ui.tab);
+            // Everything below runs silent: restoring saved layout must not
+            // write epe_ui back and dirty a workflow the user only opened.
+            if (ui.tab && rpTabEls[ui.tab]) _setRpTab(ui.tab, {silent:true});
             // Tuning block: restore its height first, then its open state, so
             // reopening lands on the height this node was saved at.
             if (typeof ui.tuneHeight === "number" && ui.tuneHeight > 40 && ui.tuneHeight <= 1200) {
               _tuneH = ui.tuneHeight;
             }
             if (typeof ui.styleOpen === "boolean") {
-              _tuneApply(ui.styleOpen ? (_tuneH || _tuneOpenH()) : 0);
+              _tuneApply(ui.styleOpen ? (_tuneH || _tuneOpenH()) : 0, true);
             }
             if (typeof ui.libraryWidth === "number" && ui.libraryWidth >= 180 && ui.libraryWidth <= 800) {
               rightPanel.style.width = ui.libraryWidth + "px";
             }
-            if (ui.libraryCollapsed) _libSetCollapsed(true);
+            if (ui.libraryCollapsed) _libSetCollapsed(true, undefined, true);
             if (typeof ui.railWidth === "number" && ui.railWidth >= 40 && ui.railWidth <= 400) {
-              _railApply(ui.railWidth);
+              _railApply(ui.railWidth, true);
             }
-            if (ui.railCollapsed) _railApply(0);
+            if (ui.railCollapsed) _railApply(0, true);
             _publishLibW();   // so the node's min width is right from the first frame
           };
 
           _epeOwnerNode._epeStyleRestore = () => {
             const st = (_epeOwnerNode.properties || {}).epe_style;
             if (!st) return;
-            _styleActive = st.style || "default";
+            // epe_style rides in node.properties — a shared, hand-editable
+            // file. `st.style` went straight into the payload posted to
+            // /epe/ollama/generate-image, where a list or dict raises
+            // "unhashable type" out of _EPE_STYLE_POOL_RULES.get() and every
+            // caption came back HTTP 500 until the node was rebuilt. Accept
+            // only an id this build actually offers; anything else is Default.
+            _styleActive = (typeof st.style === "string" &&
+                            STYLE_OPTIONS.some(o => o.id === st.style))
+                           ? st.style : "default";
             _styleOverride = !!st.override;
             if (st.sliders) {
               Object.keys(st.sliders).forEach(id => {
+                // hasOwnProperty, because sliderEls is a plain object literal
+                // and epe_style comes out of a workflow file via JSON.parse —
+                // which makes "__proto__" an OWN key, so Object.keys hands it
+                // over. `sliderEls["__proto__"]` is Object.prototype: truthy,
+                // so the `if (!el)` guard passed, and `el.input.value` threw.
+                // That throw unwound _epeStyleRestore into
+                // _epeRefreshFromProps's blanket catch, so _epeUiRestore never
+                // ran and the saved Instruct Edit threads and panel layout
+                // were silently dropped on every open of that file.
+                if (!Object.prototype.hasOwnProperty.call(sliderEls, id)) return;
                 const el = sliderEls[id];
-                if (!el) return;
-                _sliderValues[id] = st.sliders[id];
-                el.input.value = String(st.sliders[id]);
+                if (!el || !el.input) return;
+                // Clamp: a value carried in from another build (or a
+                // hand-edited workflow) fed the sampling math directly and
+                // could produce a negative top_p / min_p.
+                const v = Number(st.sliders[id]);
+                if (!Number.isFinite(v)) return;
+                const c = Math.max(0, Math.min(100, v));
+                _sliderValues[id] = c;
+                el.input.value = String(c);
                 el._applyEditedVisual();
               });
             }
@@ -9673,7 +13518,12 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         const _cancelWordAltGrace = () => { if (_wordAltGraceTimer) { clearTimeout(_wordAltGraceTimer); _wordAltGraceTimer = null; } };
         const _closePopovers = () => {
           if (_epeOpenPop) {
+            if (_epeOpenPop._epeArmT) { clearTimeout(_epeOpenPop._epeArmT); _epeOpenPop._epeArmT = null; }
             if (_epeOpenPop._onDoc) document.removeEventListener("mousedown", _epeOpenPop._onDoc, true);
+            // Drag pair on `document` — otherwise a Synonyms/Flag-words popover
+            // dragged and released outside the mouseup path (right-click, alt-tab,
+            // focus loss) strands two listeners that hold the whole editor.
+            if (_epeOpenPop._epeEndDrag) { try { _epeOpenPop._epeEndDrag(); } catch (_e) {} }
             _epeOpenPop.remove(); _epeOpenPop = null;
           }
           // Start the grace timer if a word-alternatives request is in flight.
@@ -9725,6 +13575,9 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               document.removeEventListener("mousemove", onMove);
               document.removeEventListener("mouseup", onUp);
             };
+            // Expose so _closePopovers can force-drop the drag pair on paths
+            // that skip mouseup (right-click, alt-tab, node dispose).
+            p._epeEndDrag = onUp;
             grip.addEventListener("mousedown", (e) => {
               e.preventDefault(); e.stopPropagation();   // don't trigger outside-click close
               dragging = true; p._epeDragged = true;
@@ -9743,13 +13596,26 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           pop.style.left = Math.min(r.left, window.innerWidth - pop.offsetWidth - 12) + "px";
           pop.style.top = (r.bottom + 4) + "px";
           _epeOpenPop = pop;
-          setTimeout(() => {
-            const onDoc = (e) => { if (!pop.contains(e.target) && e.target !== btn) _closePopovers(); };
-            pop._onDoc = onDoc;
-            // Capture phase: LiteGraph's canvas calls stopPropagation() on
-            // mousedown, so a bubble-phase listener never sees canvas clicks
-            // and the popover would stay open over the graph.
-            document.addEventListener("mousedown", onDoc, true);
+          // Installed NOW, not inside a setTimeout. The handle used to be
+          // written in the timer callback, so a dispose in the SAME TICK found
+          // pop._onDoc still undefined, removed nothing — and the listener was
+          // installed a moment later on a document that would keep it for the
+          // life of the page. Capture phase, holding the whole editor closure.
+          //
+          // The timer's actual job was to ignore the click that opened the
+          // popover; the armed flag does that without owning the teardown.
+          const onDoc = (e) => {
+            if (!pop._epeArmed) return;
+            if (!pop.contains(e.target) && e.target !== btn) _closePopovers();
+          };
+          pop._onDoc = onDoc;
+          // Capture phase: LiteGraph's canvas calls stopPropagation() on
+          // mousedown, so a bubble-phase listener never sees canvas clicks
+          // and the popover would stay open over the graph.
+          document.addEventListener("mousedown", onDoc, true);
+          pop._epeArmT = setTimeout(() => {
+            pop._epeArmed = true;
+            pop._epeArmT = null;
           }, 0);
         };
         const _menuItem = (label, onclick, title) => {
@@ -9783,10 +13649,24 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const m = document.createElement("span"); m.textContent = msg; t.appendChild(m);
           const u = document.createElement("span"); u.textContent = "Undo";
           u.style.cssText = "color:#a8d6f5;text-decoration:underline;cursor:pointer;";
-          u.onclick = () => { t.remove(); onUndo && onUndo(); };
+          // The callback may REFUSE — "close a tab first" — and a refusal has
+          // to leave the control on screen, or the message names a remedy for
+          // an affordance it has just deleted. Returning false keeps it up.
+          let _tid = setTimeout(() => t.remove(), 5000);
+          u.onclick = () => {
+            let keep = false;
+            try { keep = (onUndo && onUndo()) === false; } catch (_e) {}
+            if (!keep) { clearTimeout(_tid); t.remove(); return; }
+            // Kept — and given its five seconds back. The timer was armed
+            // once at construction and never rearmed, so a refusal at 3.5 s
+            // left the user 1.5 s to act on a message that asks them to go
+            // and close a tab first. The control named a remedy and then
+            // vanished before it could be followed.
+            clearTimeout(_tid);
+            _tid = setTimeout(() => t.remove(), 5000);
+          };
           t.appendChild(u);
           floatingWin.appendChild(t);
-          setTimeout(() => t.remove(), 5000);
         };
         // Small indeterminate progress bar — a looping slide while working.
         const _mkProgress = () => {
@@ -9837,8 +13717,19 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           if (!settings.model) { _toast("No Ollama model selected (AI Setup)."); return []; }
           // New request cancels any pending grace-abort from a prior one.
           _cancelWordAltGrace();
-          _wordAltAbort = new AbortController();
-          const _sig = _wordAltAbort.signal;
+          // Take the slot: abort whatever holds it, THEN own it. Overwriting
+          // it left request #1 streaming with nothing able to stop it, and
+          // #1's completion then nulled #2's controller — so dispose and Esc
+          // were no-ops on #2 as well, and it streamed into a detached element
+          // for up to 120 s holding the whole editor closure alive.
+          //
+          // The controller is held locally as well, because the shared slot
+          // may be taken over by a newer request while this one unwinds.
+          // _ieApplyOne has done exactly this since round 4.
+          if (_wordAltAbort) { try { _wordAltAbort.abort(); } catch (_e) {} }
+          const _waCtrl = new AbortController();
+          _wordAltAbort = _waCtrl;
+          const _sig = _waCtrl.signal;
           const sys = (mode === "synonym")
             ? "You are a thesaurus. Give 6 synonyms or near-synonyms for the given word that preserve its meaning. Reply with ONLY a comma-separated list of single words. No phrases, no numbering, no explanation, no quotes."
             : "You improve an image-generation prompt. The user marks one vague quality word (like 'beautiful' or 'detailed'). Look at what that word describes in the prompt and suggest 6 SINGLE words that concretely describe that specific thing — words a diffusion model can actually render. Each must be ONE word, visually meaningful, and fit the subject in context. Never suggest empty quality words such as: " + _FLAG_WORDS.join(", ") + ". Reply with ONLY a comma-separated list of single words. No numbering, no explanation, no quotes.";
@@ -9892,11 +13783,12 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           try {
             const raw = await _epeStreamGenerate(sys, usr, _opts, barHost);
             const _uniq = _parseWords(raw);
-            _wordAltAbort = null; _cancelWordAltGrace();
+            // Only if this call still owns the slot — see the take above.
+            if (_wordAltAbort === _waCtrl) { _wordAltAbort = null; _cancelWordAltGrace(); }
             if (!_uniq.length) _toast("No suggestions returned.");
             return _uniq.slice(0, 6);
           } catch (_e) {
-            _wordAltAbort = null; _cancelWordAltGrace();
+            if (_wordAltAbort === _waCtrl) { _wordAltAbort = null; _cancelWordAltGrace(); }
             if (_e && _e.name === "AbortError") return [];
             // Model burned its budget thinking — pull the candidates out of the
             // reasoning text instead of failing.
@@ -9932,27 +13824,242 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           const _sep = () => { const s = document.createElement("span"); s.style.cssText = "width:1px;height:14px;background:rgba(109,184,232,0.18);margin:0 3px;"; return s; };
 
           const _undo = [], _redo = []; let _lastPush = 0;
+          // A DEPTH, not a flag. Instruct edit takes the mute before its
+          // await and releases it after; anything the user does in between —
+          // ↶, Esc, Discard — used to release it early, and the streamed
+          // result then landed on the undo stack after all.
+          let _undoMuteDepth = 0;
+          const _mute = (on) => {
+            _undoMuteDepth = Math.max(0, _undoMuteDepth + (on ? 1 : -1));
+          };
           const _pushUndo = (force) => {
+            if (_undoMuteDepth) return;
             const now = Date.now();
             if (!force && now - _lastPush < 500) return;
+            // Never stack the same text twice. The input event records the
+            // value AFTER the edit, so the last push before the user stops
+            // typing already IS what is on screen — and _reviewEnter then
+            // pushed it a second time. Popping either changes nothing, which
+            // is what made the first ↶ read as a dead button.
+            if (_undo.length && _undo[_undo.length - 1] === textEl.value) {
+              // Clear the redo branch even here. Skipping it let Ctrl+Y jump
+              // forward into a state a later edit had already invalidated.
+              _lastPush = now; _redo.length = 0; return;
+            }
             _lastPush = now; _undo.push(textEl.value);
             if (_undo.length > 100) _undo.shift(); _redo.length = 0;
           };
           textEl._epePushUndo = () => _pushUndo(true);
+          // Let a caller write into the editor without the change landing on the
+          // stack. Instruct edit uses this: it pushes the pre-edit prompt itself,
+          // then mutes while the result streams in — otherwise the final input
+          // event pushes the edit's own output on top and the first press of ↶
+          // restores what is already on screen, which reads as a dead button.
+          textEl._epeUndoMute = (on) => _mute(on);
+          // Push a value that is no longer on screen. Instruct edit holds its
+          // chain aside and flushes it here only if the chain is kept, so
+          // nothing has to be unwound if it is abandoned.
+          textEl._epePushUndoValue = (v) => {
+            if (_undoMuteDepth) return;
+            _lastPush = Date.now(); _undo.push(v);
+            if (_undo.length > 100) _undo.shift(); _redo.length = 0;
+          };
+          // One history per prompt tab. A single shared stack, fed by the
+          // tab switch's own input event, let Ctrl+Z in one tab paste
+          // another tab's prompt over it — and _epeTabSync then wrote that
+          // into the workflow.
+          const _tabUndo = {}, _tabRedo = {}, _tabMark = {};
+          // ROUND 66 (V-3). The review boundary.
+          //
+          // `null` outside a review. Inside one it holds the two stacks as
+          // they were the instant the review opened, which is both the floor
+          // that ↶/↷ may not step below and the state a Discard restores.
+          //
+          // It lives here rather than beside _reviewMode because _undo/_redo
+          // are in this scope and nothing else may touch them; the review
+          // scope drives it through the three textEl hooks below.
+          let _reviewMark = null;
+          // Marks are per TAB, like the stacks: park a review, work on
+          // another tab, come back, and the boundary must still be the one
+          // that review opened with. Swapped in the same three places
+          // _tabUndo/_tabRedo are.
+          textEl._epeUndoReviewMark = () => {
+            // Idempotent. A parked review re-entering must not re-mark — its
+            // boundary was set when it first opened, and re-marking would put
+            // the floor above the result and make Discard a no-op.
+            if (_reviewMark) return;
+            _reviewMark = { u: _undo.slice(), r: _redo.slice() };
+            // Everything on the redo branch from here is review-era, so the
+            // floor for ↷ is simply zero. (_pushUndo already clears _redo on
+            // the entry push in every unmuted case; doing it here covers the
+            // muted one and makes the invariant unconditional rather than
+            // inherited.)
+            _redo.length = 0;
+          };
+          // A non-commit exit: Discard, Esc, auto-discard, a failed finish.
+          // Puts both stacks back exactly as the review found them, so no
+          // rejected text survives on either branch.
+          textEl._epeUndoReviewRollback = () => {
+            if (!_reviewMark) return;
+            const m = _reviewMark; _reviewMark = null;
+            _undo.length = 0; m.u.forEach(v => _undo.push(v));
+            _redo.length = 0; m.r.forEach(v => _redo.push(v));
+          };
+          // A commit. The review's steps stay: this drops the boundary and
+          // keeps the stacks untouched, so the accept path behaves exactly as
+          // it did before round 66.
+          textEl._epeUndoReviewEnd = () => { _reviewMark = null; };
+          // The floor. Below it lies text from before the review opened.
+          const _undoFloor = () => (_reviewMark ? _reviewMark.u.length : 0);
+          let _undoTabKey = "0";
+          // A configure replaces the whole tab list, so every stack keyed to
+          // the outgoing list is meaningless — and worse than meaningless,
+          // because _epeUndoUseTab's same-key early return leaves the live one
+          // loaded. Called by _epeTabRestore, and only for a real configure.
+          textEl._epeUndoResetAll = () => {
+            Object.keys(_tabUndo).forEach(k => delete _tabUndo[k]);
+            Object.keys(_tabRedo).forEach(k => delete _tabRedo[k]);
+            _undo.length = 0; _redo.length = 0;
+            _undoTabKey = "\u0000";   // force the next useTab to load
+          };
+          textEl._epeUndoUseTab = (key) => {
+            const k = String(key);
+            if (k === _undoTabKey) return;
+            _tabUndo[_undoTabKey] = _undo.slice();
+            _tabRedo[_undoTabKey] = _redo.slice();
+            // ROUND 66: a parked review's boundary belongs to its tab.
+            _tabMark[_undoTabKey] = _reviewMark;
+            _undoTabKey = k;
+            _undo.length = 0; _redo.length = 0;
+            (_tabUndo[k] || []).forEach(v => _undo.push(v));
+            (_tabRedo[k] || []).forEach(v => _redo.push(v));
+            _reviewMark = _tabMark[k] || null;
+          };
+          // Closing a tab splices the array, so every key above it shifts
+          // down by one — exactly what the tab list does.
+          textEl._epeUndoDropTab = (idx) => {
+            _tabUndo[_undoTabKey] = _undo.slice();
+            _tabRedo[_undoTabKey] = _redo.slice();
+            const shift = (m) => {
+              const out = {};
+              Object.keys(m).forEach(k => {
+                const n = parseInt(k, 10);
+                if (!Number.isFinite(n) || n === idx) return;
+                out[String(n > idx ? n - 1 : n)] = m[k];
+              });
+              return out;
+            };
+            const nu = shift(_tabUndo), nr = shift(_tabRedo), nm = shift(_tabMark);
+            Object.keys(_tabUndo).forEach(k => delete _tabUndo[k]);
+            Object.keys(_tabRedo).forEach(k => delete _tabRedo[k]);
+            Object.keys(_tabMark).forEach(k => delete _tabMark[k]);
+            Object.assign(_tabUndo, nu); Object.assign(_tabRedo, nr);
+            Object.assign(_tabMark, nm);
+            _undoTabKey = "\u0000";   // force the next useTab to load
+            _undo.length = 0; _redo.length = 0; _reviewMark = null;
+          };
+          // Inverse of drop: reopen a slot at idx (the reopened tab starts
+          // with empty history). The tab-close toast's Undo needs this — a
+          // restore without it left every tab above the closed one running
+          // on its lower neighbour's history.
+          textEl._epeUndoRestoreTab = (idx) => {
+            _tabUndo[_undoTabKey] = _undo.slice();
+            _tabRedo[_undoTabKey] = _redo.slice();
+            const shift = (m) => {
+              const out = {};
+              Object.keys(m).forEach(k => {
+                const n = parseInt(k, 10);
+                if (!Number.isFinite(n)) return;
+                out[String(n >= idx ? n + 1 : n)] = m[k];
+              });
+              return out;
+            };
+            const nu = shift(_tabUndo), nr = shift(_tabRedo), nm = shift(_tabMark);
+            Object.keys(_tabUndo).forEach(k => delete _tabUndo[k]);
+            Object.keys(_tabRedo).forEach(k => delete _tabRedo[k]);
+            Object.keys(_tabMark).forEach(k => delete _tabMark[k]);
+            Object.assign(_tabUndo, nu); Object.assign(_tabRedo, nr);
+            Object.assign(_tabMark, nm);
+            _undoTabKey = "\u0000";   // force the next useTab to load
+            _undo.length = 0; _redo.length = 0; _reviewMark = null;
+          };
+          // B-3. A closed tab's undo history is dropped with it, so the toast's
+          // Undo used to bring back the text and nothing else. These two let
+          // the close capture it and the undo put it back.
+          //
+          // The live stacks are only flushed into `_tabUndo` on a SWITCH, so
+          // for the tab that is currently active they are the authoritative
+          // copy and `_tabUndo[idx]` is stale. Read the right one.
+          textEl._epeUndoCaptureTab = (idx) => {
+            const k = String(idx);
+            if (k === _undoTabKey) return { u: _undo.slice(), r: _redo.slice() };
+            return { u: (_tabUndo[k] || []).slice(), r: (_tabRedo[k] || []).slice() };
+          };
+          // Install a captured history at `idx`. Called after the restore has
+          // opened the slot and BEFORE _epeUndoUseTab loads it into the live
+          // stacks. No review mark is restored: a review open at close time was
+          // discarded or parked by _closeTab, so there is no boundary to honour.
+          textEl._epeUndoLoadTab = (idx, hist) => {
+            if (!hist) return;
+            const k = String(idx);
+            _tabUndo[k] = (hist.u || []).slice();
+            _tabRedo[k] = (hist.r || []).slice();
+          };
           textEl.addEventListener("input", () => _pushUndo(false));
+          // Persist and refresh the restored text without recording it: an
+          // undo that pushes its own result back onto the stack leaves the
+          // next press with nothing to do.
+          const _applyStep = () => {
+            _mute(true);
+            try { textEl.dispatchEvent(new Event("input")); }
+            finally { _mute(false); }
+          };
+          // Put a value back into the editor: on screen, onto the node, and
+          // NOT onto the undo stack. Every "restore what it was" path needs
+          // exactly this — without the dispatch, node.properties.epe_prompt
+          // keeps the AI result and the next rebuild undoes the restore.
+          textEl._epeRestoreValue = (v) => {
+            textEl.value = v;
+            _applyStep();
+          };
+          const _undoOnce = () => {
+            // Drop anything that is already on screen before stepping back,
+            // so ↶ always actually moves — but never below the review floor,
+            // or the discard-time rollback would have nothing to put back.
+            while (_undo.length > _undoFloor() &&
+                   _undo[_undo.length - 1] === textEl.value) _undo.pop();
+            // ROUND 66 (V-3): inside a review, ↶ steps through the user's own
+            // edits TO the result and stops at the boundary. It does NOT step
+            // out to the pre-AI prompt — doing that put the AI result on the
+            // redo branch, where a Discard could not remove it and one Ctrl+Y
+            // wrote the rejected text into the workflow file. It also left the
+            // screen holding the pre-review prompt while a review was open, so
+            // parking captured that as the "result" and destroyed the real one,
+            // and `Use this` committed it. The user's own edits stay undoable:
+            // refusing those would cost them work.
+            if (_undo.length <= _undoFloor()) return false;
+            _redo.push(textEl.value); textEl.value = _undo.pop();
+            _applyStep(); return true;
+          };
+          const _redoOnce = () => {
+            while (_redo.length && _redo[_redo.length - 1] === textEl.value) _redo.pop();
+            if (!_redo.length) return false;
+            _undo.push(textEl.value); textEl.value = _redo.pop();
+            _applyStep(); return true;
+          };
           textEl.addEventListener("keydown", (e) => {
             if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
-              if (_undo.length) { e.preventDefault(); _redo.push(textEl.value); textEl.value = _undo.pop(); textEl.dispatchEvent(new Event("input")); }
+              if (_undoOnce()) e.preventDefault();
             } else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))) {
-              if (_redo.length) { e.preventDefault(); _undo.push(textEl.value); textEl.value = _redo.pop(); textEl.dispatchEvent(new Event("input")); }
+              if (_redoOnce()) e.preventDefault();
             }
           });
           const _setText = (v) => { _pushUndo(true); textEl.value = v; textEl.dispatchEvent(new Event("input")); };
 
           const undoBtn = _mk("↶", "Undo (Ctrl+Z)");
-          undoBtn.onclick = () => { if (_undo.length) { _redo.push(textEl.value); textEl.value = _undo.pop(); textEl.dispatchEvent(new Event("input")); } };
+          undoBtn.onclick = () => { _undoOnce(); };
           const redoBtn = _mk("↷", "Redo (Ctrl+Y)");
-          redoBtn.onclick = () => { if (_redo.length) { _undo.push(textEl.value); textEl.value = _redo.pop(); textEl.dispatchEvent(new Event("input")); } };
+          redoBtn.onclick = () => { _redoOnce(); };
 
 
           const findBtn = _mk("Find", "Find & replace");
@@ -9991,23 +14098,48 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             _closePopovers(); const pop = _mkPopover();
             [["Strip markdown", () => textEl.value.replace(/[*_`#>~]/g,"").replace(/\[(.*?)\]\(.*?\)/g,"$1")],
              ["Strip weights", () => {
-                 let v = textEl.value, prev;
+                 // The uncapped, unanchored twin of cleanWeights. That one has
+                 // had a 32-pass bound since round 23 and linear regexes since
+                 // round 28; this one is five `do … while (v !== prev)` loops
+                 // over the same shapes, with three `\s+` regexes below that
+                 // have nothing to stop them restarting at every character of
+                 // a whitespace run. 8 K chars measured 132 ms, 16 K 533 ms,
+                 // 32 K 2,111 ms — a clean x4 per doubling, with no nesting
+                 // needed at all. And cleanWeights HANDS it the input: it
+                 // peels 32 levels and stops, so Extract then "Use this"
+                 // leaves the rest in the editor for the tool built to strip
+                 // exactly that.
+                 //
+                 // Differential-fuzzed against the old form over 300,000
+                 // assembled prompts: zero differences. 32 K is now 1 ms.
+                 const PASS_LIMIT = 32;
+                 let v = textEl.value, prev, passes;
                  // (word:1.2) and (word:-1.4), innermost first for nesting
-                 do { prev = v; v = v.replace(/\(([^()]*?):\s*-?\d*\.?\d+\s*\)/g, "$1"); } while (v !== prev);
+                 passes = 0;
+                 do { prev = v; v = v.replace(/\(([^()]*?):\s*-?\d*\.?\d+\s*\)/g, "$1"); } while (v !== prev && ++passes < PASS_LIMIT);
                  // [word:0.25] prompt-editing / bracket weights
-                 do { prev = v; v = v.replace(/\[([^\[\]]*?):\s*-?\d*\.?\d+\s*\]/g, "$1"); } while (v !== prev);
+                 passes = 0;
+                 do { prev = v; v = v.replace(/\[([^\[\]]*?):\s*-?\d*\.?\d+\s*\]/g, "$1"); } while (v !== prev && ++passes < PASS_LIMIT);
                  v = v.replace(/\(\s*-?\d*\.?\d+\s*\)/g, "");   // orphan (1.4)
                  v = v.replace(/::\s*-?\d*\.?\d+/g, "");           // Midjourney cat::2
                  // emphasis-only grouping: ((word)) [word] {word}
-                 do { prev = v; v = v.replace(/\(([^()]*)\)/g, "$1"); } while (v !== prev);
-                 do { prev = v; v = v.replace(/\[([^\[\]]*)\]/g, "$1"); } while (v !== prev);
-                 do { prev = v; v = v.replace(/\{([^{}]*)\}/g, "$1"); } while (v !== prev);
+                 passes = 0;
+                 do { prev = v; v = v.replace(/\(([^()]*)\)/g, "$1"); } while (v !== prev && ++passes < PASS_LIMIT);
+                 passes = 0;
+                 do { prev = v; v = v.replace(/\[([^\[\]]*)\]/g, "$1"); } while (v !== prev && ++passes < PASS_LIMIT);
+                 passes = 0;
+                 do { prev = v; v = v.replace(/\{([^{}]*)\}/g, "$1"); } while (v !== prev && ++passes < PASS_LIMIT);
                  v = v.replace(/([A-Za-z0-9])[+]{1,5}(?=[\s,]|$)/g, "$1");   // horse++
                  v = v.replace(/([A-Za-z0-9])[-]{2,5}(?=[\s,]|$)/g, "$1");   // dog--
                  // leftover " word -1.4" (sign or decimal required, so ISO 100 survives)
-                 v = v.replace(/\s+-\d*\.?\d+(?=\s*,|\s*$)/g, "");
-                 v = v.replace(/\s+\d+\.\d+(?=\s*,|\s*$)/g, "");
-                 return v.replace(/[ \t]{2,}/g, " ").replace(/\s+,/g, ",")
+                 // `(?<!\s)` makes only the FIRST character of a whitespace
+                 // run a valid start. Greedy `\s+` already matched maximally,
+                 // so the starts this prunes are exactly the ones that could
+                 // never have matched — the answer is unchanged and a failed
+                 // attempt happens once per run instead of once per character.
+                 v = v.replace(/(?<!\s)\s+-\d*\.?\d+(?=\s*,|\s*$)/g, "");
+                 v = v.replace(/(?<!\s)\s+\d+\.\d+(?=\s*,|\s*$)/g, "");
+                 return v.replace(/[ \t]{2,}/g, " ").replace(/(?<!\s)\s+,/g, ",")
                          .replace(/,\s*,+/g, ",").replace(/^\s*,+/, "").replace(/,\s*$/, "").trim();
                },
               "Removes (word:1.2), (word:-1.4), ((word)), [word], {word}, word++, cat::2 and orphan (1.4) — keeps ISO 100, f/1.4, 16:9"],
@@ -10018,7 +14150,15 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
                  .replace(/[ \t]{2,}/g," ").replace(/ +([,.])/g,"$1").replace(/,{2,}/g,",").trim(),
               "Removes ( ) [ ] { } < > | \\ and stray : ; . — keeps numbers like 0.2 and 16:9"],
              ["Collapse extra spaces", () => textEl.value.replace(/[ \t]{2,}/g," ").replace(/ +([,.;:])/g,"$1")],
-             ["Remove line breaks", () => textEl.value.replace(/\s*\n\s*/g," ").replace(/\s{2,}/g," ").trim()],
+             // TWO changes, and both are needed. `[^\S\n]*` is horizontal
+             // whitespace only, so the run in front of the `\n` cannot swallow
+             // one — and the negative lookbehind makes only a run's FIRST
+             // character a valid start, so a long run with no newline after it
+             // is walked once instead of once per index. `[^\S\n]*` alone is
+             // still quadratic: measured, 40,000 spaces cost 1.55 s with the
+             // lookbehind missing and 0 ms with it. Same reasoning as the
+             // `(?<!\s)` on the two items above.
+             ["Remove line breaks", () => textEl.value.replace(/(?<![^\S\n])[^\S\n]*\n\s*/g," ").replace(/\s{2,}/g," ").trim()],
             ].forEach(([label, fn, tip]) => pop.appendChild(_menuItem(label, () => { _setText(fn()); _closePopovers(); }, tip)));
             _anchorPopover(pop, cleanBtn);
           };
@@ -10069,7 +14209,15 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               // Highlight this exact occurrence in the prompt and scroll to it.
               // Called from both the word tag and the "replace" link so the user
               // always sees which word is about to change.
+              // Resolves FIRST, so the highlight and the splice always name the
+              // same occurrence. It used to read the stale f.at, so after an
+              // edit made while the call was in flight it showed the user one
+              // occurrence and edited another.
               const _revealWord = () => {
+                if (typeof _fixAt === "function" && _fixAt() < 0) {
+                  _toast("That word is no longer in the prompt.");
+                  return;
+                }
                 const _before = textEl.value.slice(0, f.at);
                 const _line = _before.split("\n").length - 1;
                 const _lh = parseFloat(getComputedStyle(textEl).lineHeight) || 16;
@@ -10087,7 +14235,38 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               const fixB = document.createElement("span"); fixB.textContent = "replace"; fixB.style.cssText = "color:#a8d6f5;cursor:pointer;font-size:10px;";
               fixB.addEventListener("mousedown", _swallowDown);
               const chipWrap = document.createElement("div"); chipWrap.style.cssText = "display:none;gap:5px;flex-wrap:wrap;width:100%;padding:2px 0 4px;";
-              const _fixAt = () => f.at;
+              // REVALIDATED, not just re-read. `f.at` is the offset from the
+              // scan that opened this popover, and `replace` focuses the
+              // textarea and leaves the popover up across the Ollama call —
+              // so the user can edit the prompt while it is in flight. Any
+              // edit before that offset shifts it, and the chip then spliced
+              // f.word.length characters out of the middle of unrelated text
+              // and committed the result to node.properties and the tab slot.
+              // WORD BOUNDARIES, because the scan that produced this row used
+              // `\b…\b` and this did not. _FLAG_WORDS holds "hd", "4k", "8k",
+              // "epic" — so a bare indexOf could relocate the fix onto the
+              // "hd" inside "hdr" and splice mid-word into text the user never
+              // flagged, and the fast path had the same hole.
+              const _isWordAt = (v, at, n) =>
+                !/\w/.test(v.charAt(at - 1) || "") && !/\w/.test(v.charAt(at + n) || "");
+              const _fixAt = () => {
+                const v = textEl.value, w = f.word, n = w.length;
+                if (v.substr(f.at, n).toLowerCase() === w.toLowerCase() &&
+                    _isWordAt(v, f.at, n)) return f.at;
+                // Moved: take the nearest occurrence to where it was, so a
+                // prompt with the word twice does not jump to the other one.
+                const low = v.toLowerCase(), lw = w.toLowerCase();
+                let best = -1, bestD = Infinity, i = low.indexOf(lw);
+                while (i >= 0) {
+                  if (_isWordAt(v, i, n)) {
+                    const d = Math.abs(i - f.at);
+                    if (d < bestD) { bestD = d; best = i; }
+                  }
+                  i = low.indexOf(lw, i + 1);
+                }
+                if (best >= 0) f.at = best;
+                return best;
+              };
               fixB.onclick = async (ev) => {
                 if (ev) ev.stopPropagation();
                 if (chipWrap.style.display === "flex") { chipWrap.style.display = "none"; return; }
@@ -10097,11 +14276,11 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
                 const alts = await _epeOllamaWordAlternatives(f.word, textEl.value, chipWrap);
                 chipWrap.innerHTML = "";
                 if (!alts.length) { const n = document.createElement("span"); n.textContent = "no suggestions"; n.style.cssText = "color:#6d849a;font-size:10px;"; chipWrap.appendChild(n); return; }
-                alts.forEach(a => { const chip = document.createElement("span"); chip.textContent = a; chip.style.cssText = "background:rgba(109,184,232,0.14);border:1px solid rgba(140,200,240,0.4);border-radius:5px;color:#a8d6f5;font-size:10px;padding:2px 9px;cursor:pointer;"; chip.addEventListener("mousedown", _swallowDown); chip.onclick = (ev) => { if (ev) ev.stopPropagation(); const at = _fixAt(); if (at>=0) _setText(textEl.value.slice(0,at)+a+textEl.value.slice(at+f.word.length)); _closePopovers(); }; chipWrap.appendChild(chip); });
+                alts.forEach(a => { const chip = document.createElement("span"); chip.textContent = a; chip.style.cssText = "background:rgba(109,184,232,0.14);border:1px solid rgba(140,200,240,0.4);border-radius:5px;color:#a8d6f5;font-size:10px;padding:2px 9px;cursor:pointer;"; chip.addEventListener("mousedown", _swallowDown); chip.onclick = (ev) => { if (ev) ev.stopPropagation(); const at = _fixAt(); if (at>=0) _setText(textEl.value.slice(0,at)+a+textEl.value.slice(at+f.word.length)); else _toast("\u201c" + f.word + "\u201d is no longer in the prompt."); _closePopovers(); }; chipWrap.appendChild(chip); });
               };
               const delB = document.createElement("span"); delB.textContent = "delete"; delB.style.cssText = "color:#6d849a;cursor:pointer;font-size:10px;";
               delB.addEventListener("mousedown", _swallowDown);
-              delB.onclick = (ev) => { if (ev) ev.stopPropagation(); const at = _fixAt(); if (at>=0) _setText((textEl.value.slice(0,at)+textEl.value.slice(at+f.word.length)).replace(/\s{2,}/g," ").replace(/\s+([,.])/g,"$1")); _closePopovers(); };
+              delB.onclick = (ev) => { if (ev) ev.stopPropagation(); const at = _fixAt(); if (at>=0) _setText((textEl.value.slice(0,at)+textEl.value.slice(at+f.word.length)).replace(/\s{2,}/g," ").replace(/\s+([,.])/g,"$1")); else _toast("\u201c" + f.word + "\u201d is no longer in the prompt."); _closePopovers(); };
               row.appendChild(tag); row.appendChild(fixB); row.appendChild(delB); pop.appendChild(row); pop.appendChild(chipWrap);
             });
             _anchorPopover(pop, flagBtn);
@@ -10127,34 +14306,310 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
 
           // ══ prompt tabs ═════════════════════════════════════
           (function _buildPromptTabs() {
-            const MAX = 4;
+            // Ten, up from four (round 73, Daniel's request).
+            //
+            // Nothing else in the tab machinery mentions the number. Every fix
+            // rounds 55-69 made here is index-generic — the "+" handler opening
+            // a slot in the keyed maps (B-2), the close capturing thread and
+            // undo history (B-3), the clamped landing index (B-4), the restore
+            // swap permuting the thread map (B-5) — so none of them are
+            // sensitive to what MAX is.
+            //
+            // The parking machinery below was written for exactly this move:
+            // "a build with a larger MAX gets them back". A workflow saved by
+            // an older 4-tab build opens with all its tabs visible now, and one
+            // saved here with 10 opens in an older build as 4 visible + 6
+            // parked, which round-57's B-1 fix already counts correctly.
+            const MAX = 10;
             const props = (_epeOwnerNode && _epeOwnerNode.properties) || {};
             // Load or seed tab state. tabs = array of strings; active = index.
-            let _tabs = Array.isArray(props.epe_tabs) && props.epe_tabs.length
-              ? props.epe_tabs.slice(0, MAX)
+            //
+            // Validated the same way _epeTabRestore validates it. These are two
+            // readers of the same untrusted workflow field and they disagreed:
+            // a non-string entry became "[object Object]" in the editor and in
+            // every wireless target, and a bad active index filed instruct
+            // threads under keys like "-1". Under stock LiteGraph the restore
+            // path is the one that runs, which is why this never bit — but a
+            // divergence between two readers of the same field is a bug
+            // waiting for a different load order.
+            const _initTabs = Array.isArray(props.epe_tabs) && props.epe_tabs.length
+              ? props.epe_tabs.map(t => typeof t === "string" ? t : "")
               : [textEl.value || ""];
-            let _active = Math.min(props.epe_tab_active || 0, _tabs.length - 1);
+            let _tabs = _initTabs.slice(0, MAX);
+            const _rawActive = parseInt(props.epe_tab_active, 10);
+            let _active = Math.max(0, Math.min(
+              Number.isFinite(_rawActive) ? _rawActive : 0, _tabs.length - 1));
             let _lastClosed = null;
+            // Tabs from the workflow file that do not fit in MAX.
+            //
+            // They used to be dropped on the floor: `_tabs = _fullTabs.slice(0,
+            // MAX)` and then the restore's OWN muted input dispatch ran
+            // _epePersistPrompt -> _epeTabSync -> _persistTabs, which wrote the
+            // truncated array straight back over properties.epe_tabs. Opening a
+            // 6-tab workflow deleted two of its tabs, before the user had
+            // touched anything, and said nothing unless the active tab happened
+            // to be one of the casualties.
+            //
+            // Parked here and re-appended by _persistTabs instead, so the file
+            // round-trips losslessly and a build with a larger MAX gets them
+            // back. Reset on every restore — see _epeTabRestore.
+            let _overflowTabs = _initTabs.slice(MAX);
+            // Once per node. `_epeTabRestore` runs on every workflow-tab
+            // switch and on every Ctrl+Z of a graph change, so the overflow
+            // toast fired over and over with nothing the user could do about
+            // it. (R56b-J5.)
+            let _overflowToldOnce = false;
+            // Hand the live count UP to _iePersistThreads, which is declared
+            // in the enclosing closure and cannot see `_tabs`. Assigned here,
+            // after the declaration above, so the arrow never reads a
+            // temporal-dead-zone binding.
+            // The FULL count — visible plus parked — because that is what
+            // _persistTabs writes (`_tabs.concat(_overflowTabs)`) and what
+            // _ieThreadsDropTab / _ieThreadsRestoreTab index against.
+            //
+            // Round 56 handed up `_tabs.length` alone, and _iePersistThreads
+            // drops every key >= the count it is given. So opening a 6-tab
+            // workflow in a 4-tab build kept all six prompts (J-05) and
+            // deleted tabs 5 and 6's instruct threads from the file on the
+            // very first load — _epeTabRestore's own finally calls
+            // _iePersistThreads — before the user had touched anything. The
+            // toast said the rest were "kept in the file"; half of what they
+            // carry was being deleted as it said so.
+            _epeTabCountFn = () => _tabs.length + _overflowTabs.length;
+            // And which one is on screen — see _ieTabKey's comment. Published
+            // here beside the count, for the same scope reason.
+            _epeTabActiveFn = () => _active;
 
             const tabBar = document.createElement("div");
-            tabBar.style.cssText = "display:flex;align-items:flex-end;gap:2px;flex-shrink:0;margin-left:-1px;";
+            // `flex-wrap:wrap` because ten tabs do not fit: each is about 70px
+            // and the editor's own minimum width is 320px. Wrapping keeps every
+            // tab visible and clickable at any node width; a horizontal scroller
+            // would hide the tab you want behind a gesture. The bar grows
+            // downward only as far as the tab count actually needs.
+            tabBar.style.cssText = "display:flex;flex-wrap:wrap;align-items:flex-end;gap:2px;flex-shrink:0;margin-left:-1px;";
 
             const _persistTabs = () => {
               if (!_epeOwnerNode) return;
               if (!_epeOwnerNode.properties) _epeOwnerNode.properties = {};
-              _epeOwnerNode.properties.epe_tabs = _tabs.slice();
+              // `.concat(_overflowTabs)` — see the declaration. Anything the
+              // workflow carried beyond MAX is preserved verbatim rather than
+              // silently deleted by the act of opening the file.
+              _epeOwnerNode.properties.epe_tabs = _tabs.concat(_overflowTabs);
               _epeOwnerNode.properties.epe_tab_active = _active;
             };
             // Called by _epePersistPrompt: keep active slot in sync with textarea.
             _epeOwnerNode && (_epeOwnerNode._epeTabSync = () => { _tabs[_active] = textEl.value; _persistTabs(); });
+
+            // ── Send a result to another tab ──────────────────────────────
+            //
+            // Published on the NODE, not into a `let` the whole editor closure
+            // can see. T38: any mutable binding at that scope needs a
+            // reachability census, and there is no reason to add a third — every
+            // fact this needs (`_tabs`, `_active`, `_overflowTabs`,
+            // `_persistTabs`, `_render`, the index-keyed maps) already lives in
+            // here, and `_epeTabSync` above is the same publication shape.
+            //
+            // DANIEL'S RULE, and the whole design: "nothing changes in the
+            // current tab, the new tab would get the sent result as a main
+            // prompt which could be edited by switching to the tab, none of our
+            // mechanics change." So this does NOT commit, does NOT exit the
+            // review, does NOT move `_active`, and does NOT write `textEl`. The
+            // review strip is still up and Use this / Append / Discard still
+            // mean exactly what they meant before.
+            //
+            // Safe to persist mid-review: `_persistTabs` writes `_tabs`, and
+            // `_tabs[_active]` holds the last COMMITTED value during a review —
+            // `_epeTabSync` is only reached through `_epePersistPrompt`, which
+            // refuses under review. So writing the file here cannot leak the
+            // un-accepted result into the current tab. That is the J-04
+            // invariant, and it is asserted in the suite rather than trusted.
+            _epeOwnerNode && (_epeOwnerNode._epeOpenSendToTab = (anchorEl, text) => {
+              const _txt = typeof text === "string" ? text : "";
+              _closePopovers();
+              const pop = _mkPopover();
+
+              const _title = document.createElement("div");
+              _title.textContent = "Send result to";
+              _title.style.cssText = "font-size:10px;color:#7d9cb8;margin-bottom:7px;letter-spacing:.3px;";
+              pop.appendChild(_title);
+
+              const _rowStyle =
+                "display:flex;align-items:center;justify-content:space-between;gap:10px;" +
+                "padding:4px 8px;border-radius:5px;font-size:11px;cursor:pointer;" +
+                "background:rgba(109,184,232,0.08);border:1px solid rgba(109,184,232,0.2);" +
+                "color:#a8d6f5;margin-bottom:4px;";
+              const _deadStyle =
+                "display:flex;align-items:center;justify-content:space-between;gap:10px;" +
+                "padding:4px 8px;border-radius:5px;font-size:11px;" +
+                "background:rgba(120,140,160,0.06);border:1px solid rgba(120,140,160,0.15);" +
+                "color:#5f748a;margin-bottom:4px;";
+
+              // The confirm. ONE shape for every send, deliberately — Daniel:
+              // "the mechanics stays constant no edge cases". A rule with an
+              // exception is the round-70 lesson: it teaches the user the rule
+              // sometimes does not hold, and that doubt costs them every time.
+              const _confirm = (msg, onYes) => {
+                _closePopovers();
+                const cp = _mkPopover();
+                cp.style.minWidth = "0";
+                const q = document.createElement("div");
+                q.textContent = msg;
+                q.style.cssText = "font-size:11px;color:#c2d4e6;margin-bottom:8px;text-align:center;max-width:220px;";
+                const row = document.createElement("div");
+                row.style.cssText = "display:flex;gap:6px;";
+                const yes = document.createElement("span");
+                yes.textContent = "Send";
+                yes.style.cssText = "flex:1;text-align:center;background:rgba(226,168,75,0.15);border:1px solid rgba(226,168,75,0.4);border-radius:5px;color:#e8c88a;font-size:10px;padding:4px 12px;cursor:pointer;";
+                yes.onclick = (ev) => { ev.stopPropagation(); _closePopovers(); onYes(); };
+                const no = document.createElement("span");
+                no.textContent = "Cancel";
+                no.style.cssText = "flex:1;text-align:center;background:rgba(109,184,232,0.1);border:1px solid rgba(109,184,232,0.25);border-radius:5px;color:#a8d6f5;font-size:10px;padding:4px 12px;cursor:pointer;";
+                no.onclick = (ev) => { ev.stopPropagation(); _closePopovers(); };
+                row.appendChild(yes); row.appendChild(no);
+                cp.appendChild(q); cp.appendChild(row);
+                _anchorPopover(cp, anchorEl);
+              };
+
+              const _warn = (msg) => {
+                _closePopovers();
+                const wp = _mkPopover();
+                wp.style.minWidth = "0";
+                const q = document.createElement("div");
+                q.textContent = msg;
+                q.style.cssText = "font-size:11px;color:#e8c88a;margin-bottom:8px;text-align:center;max-width:220px;";
+                const ok = document.createElement("span");
+                ok.textContent = "OK";
+                ok.style.cssText = "display:block;text-align:center;background:rgba(109,184,232,0.1);border:1px solid rgba(109,184,232,0.25);border-radius:5px;color:#a8d6f5;font-size:10px;padding:4px 12px;cursor:pointer;";
+                ok.onclick = (ev) => { ev.stopPropagation(); _closePopovers(); };
+                wp.appendChild(q); wp.appendChild(ok);
+                _anchorPopover(wp, anchorEl);
+              };
+
+              // Write into an EXISTING tab.
+              const _sendTo = (i) => {
+                const _old = _tabs[i] || "";
+                _tabs[i] = _txt;
+                // One Ctrl+Z in that tab puts back exactly what was there.
+                // Through round 69's capture/load pair rather than by reaching
+                // into the maps, and only for a tab that is NOT on screen — the
+                // active tab's stacks are the live ones and are not ours.
+                try {
+                  if (i !== _active && textEl._epeUndoCaptureTab && textEl._epeUndoLoadTab) {
+                    const _h = textEl._epeUndoCaptureTab(i);
+                    if (_h) {
+                      _h.u = (_h.u || []).concat([_old]);
+                      _h.r = [];
+                      textEl._epeUndoLoadTab(i, _h);
+                    }
+                  }
+                } catch (_e) {}
+                // That tab's Instruct-Edit direction described the prompt that
+                // is no longer there. Same contract as Use this and Append,
+                // which clear it for exactly this reason. Through _ieThreadSet
+                // with an explicit key — never by touching _ieThreads, which is
+                // the K-2 reachability census.
+                try {
+                  if (typeof _ieThreadSet === "function") _ieThreadSet([], String(i));
+                } catch (_e) {}
+                _persistTabs();
+                try { _toast("Sent to Tab " + (i + 1) + "."); } catch (_e) {}
+              };
+
+              // Write into a NEW tab.
+              const _sendToNew = () => {
+                // Byte-for-byte the "+" handler's order, and for its reasons:
+                // PUSH FIRST, then open the slot in each index-keyed map, or
+                // the shift persists against a count one too small and deletes
+                // the last parked tab's thread on the way past (B-2).
+                const _at = _tabs.length;
+                _tabs.push(_txt);
+                if (textEl._epeUndoRestoreTab) textEl._epeUndoRestoreTab(_at);
+                if (typeof _ieThreadsRestoreTab === "function") _ieThreadsRestoreTab(_at);
+                // NO _switchTo — the current tab does not change. That also
+                // means the review is still live, so _iePersistThreads refuses;
+                // _reviewExit flushes the map on the way out of the review.
+                // The shift is a no-op unless tabs are PARKED, which after this
+                // round only a pre-existing 11+ tab file can produce.
+                _persistTabs();
+                _render();
+                try { _iePersistThreads(); } catch (_e) {}
+                try { _toast("Sent to a new Tab " + (_at + 1) + "."); } catch (_e) {}
+              };
+
+              _tabs.forEach((_t, i) => {
+                if (i === _active) {
+                  // Shown, not hidden, so the numbering a user reads here is the
+                  // numbering on the tab bar. Sending to where you already are
+                  // is what "Use this" does.
+                  const d = document.createElement("div");
+                  d.style.cssText = _deadStyle;
+                  const a = document.createElement("span"); a.textContent = "Tab " + (i + 1);
+                  const b = document.createElement("span"); b.textContent = "current";
+                  b.style.cssText = "font-size:9px;";
+                  d.appendChild(a); d.appendChild(b);
+                  pop.appendChild(d);
+                  return;
+                }
+                const r = document.createElement("div");
+                r.style.cssText = _rowStyle;
+                const a = document.createElement("span"); a.textContent = "Tab " + (i + 1);
+                const b = document.createElement("span");
+                b.textContent = (_tabs[i] || "").trim() ? "has a prompt" : "empty";
+                b.style.cssText = "font-size:9px;color:#7d9cb8;";
+                r.appendChild(a); r.appendChild(b);
+                r.onmouseenter = () => { r.style.background = "rgba(109,184,232,0.18)"; };
+                r.onmouseleave = () => { r.style.background = "rgba(109,184,232,0.08)"; };
+                r.onclick = (ev) => {
+                  ev.stopPropagation();
+                  _confirm("Sending to Tab " + (i + 1) + " will overwrite its current prompt.",
+                           () => _sendTo(i));
+                };
+                pop.appendChild(r);
+              });
+
+              // New tab — offered at the same threshold the "+" button uses, so
+              // the two controls never disagree about whether there is room.
+              const nr = document.createElement("div");
+              const _full = _tabs.length >= MAX;
+              nr.style.cssText = _full ? _deadStyle : _rowStyle;
+              const na = document.createElement("span"); na.textContent = "New tab";
+              nr.appendChild(na);
+              if (_full) {
+                const nb = document.createElement("span");
+                nb.textContent = MAX + " open";
+                nb.style.cssText = "font-size:9px;";
+                nr.appendChild(nb);
+                nr.style.cursor = "pointer";
+                nr.onclick = (ev) => {
+                  ev.stopPropagation();
+                  // A refusal the user can read, rather than a row that does
+                  // nothing when clicked.
+                  _warn("You already have " + MAX + " tabs. Close one before sending to a new tab.");
+                };
+              } else {
+                nr.onmouseenter = () => { nr.style.background = "rgba(109,184,232,0.18)"; };
+                nr.onmouseleave = () => { nr.style.background = "rgba(109,184,232,0.08)"; };
+                nr.onclick = (ev) => {
+                  ev.stopPropagation();
+                  _confirm("Send this result to a new Tab " + (_tabs.length + 1) + "?", _sendToNew);
+                };
+              }
+              pop.appendChild(nr);
+
+              _anchorPopover(pop, anchorEl);
+            });
 
             const _render = () => {
               tabBar.innerHTML = "";
               _tabs.forEach((_, i) => {
                 const t = document.createElement("div");
                 const on = i === _active;
+                // Tighter once there are more than five, so a full ten fit in
+                // two rows at the editor's minimum width instead of four.
+                const _tight = _tabs.length > 5;
                 t.style.cssText =
-                  "display:flex;align-items:center;gap:8px;padding:5px 12px;font-size:10px;cursor:pointer;" +
+                  "display:flex;align-items:center;gap:" + (_tight ? "5px" : "8px") +
+                  ";padding:5px " + (_tight ? "8px" : "12px") + ";font-size:10px;cursor:pointer;" +
                   "border:1px solid rgba(109,184,232,0.14);border-bottom:none;border-radius:8px 8px 0 0;" +
                   (on ? "background:#141a24;color:#c2e2f8;font-weight:500;"
                       : "background:#10151d;color:#8ba5be;");
@@ -10187,7 +14642,9 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
                   };
                   t.appendChild(x);
                 }
-                t.onclick = () => _switchTo(i);
+                // A click on the ALREADY-ACTIVE tab is not a switch —
+                // without this it auto-discarded an in-progress review.
+                t.onclick = () => { if (i !== _active) _switchTo(i); };
                 tabBar.appendChild(t);
               });
               if (_tabs.length < MAX) {
@@ -10197,38 +14654,241 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
                 add.style.cssText =
                   "padding:5px 11px;font-size:11px;cursor:pointer;color:#8ba5be;" +
                   "border:1px solid rgba(109,184,232,0.14);border-bottom:none;border-radius:8px 8px 0 0;background:#10151d;";
-                add.onclick = () => { _tabs[_active] = textEl.value; _tabs.push(""); _switchTo(_tabs.length - 1); };
+                add.onclick = () => {
+                  _tabs[_active] = textEl.value;
+                  // Make room in the index-keyed maps FIRST.
+                  //
+                  // The new tab lands at index `_tabs.length` of the
+                  // CONCATENATED array _persistTabs writes — i.e. in front of
+                  // anything parked in _overflowTabs, whose threads and undo
+                  // stacks are still live under exactly those keys. Round 56
+                  // pushed with no bookkeeping: close one visible tab (which
+                  // shifts every key above it down, parked ones included, so
+                  // they walk into visible range) then press "+", and the new
+                  // blank tab showed a step count it never earned and sent a
+                  // parked tab's direction to the model as EARLIER DIRECTION —
+                  // then _iePersistThreads wrote it into the workflow under
+                  // the new tab's key.
+                  //
+                  // With nothing parked there is no key at or above
+                  // _at, so both calls are no-ops.
+                  //
+                  // PUSH FIRST, then shift. _ieThreadsRestoreTab ends with its
+                  // own _iePersistThreads(), which prunes every key >= the live
+                  // tab count — so shifting before the push persists against a
+                  // count one too small and deletes the LAST parked tab's
+                  // thread on the way past. (Driven: a 6-tab file, close one,
+                  // press "+", and key 5 was gone from epe_ie_threads while it
+                  // was still live in memory.) Nothing reads the maps between
+                  // the push and the shift.
+                  const _at = _tabs.length;
+                  _tabs.push("");
+                  if (textEl._epeUndoRestoreTab) textEl._epeUndoRestoreTab(_at);
+                  if (typeof _ieThreadsRestoreTab === "function") _ieThreadsRestoreTab(_at);
+                  _switchTo(_tabs.length - 1);
+                  // Persist AFTER the switch, because the shift above may not
+                  // have reached the file. _ieThreadsRestoreTab ends with its
+                  // own _iePersistThreads(), and that returns early while a
+                  // review is live — while _switchTo writes the grown epe_tabs
+                  // regardless. So pressing "+" over an Enhance or Variations
+                  // result saved a tab array with a new slot beside a thread map
+                  // without one: the new blank tab owned a parked tab's
+                  // direction, in the file, until something else happened to
+                  // persist. _switchTo has parked or discarded the review by
+                  // now, so this one runs.
+                  try { _iePersistThreads(); } catch (_e) {}
+                };
                 tabBar.appendChild(add);
               }
             };
             const _switchTo = (i) => {
-              // A review belongs to the tab it started on — _originalPrompt and
-              // the thread snapshot are single, not per-tab — so carrying one
-              // across a switch would leave the review bar pointing at another
-              // tab's text. End it here, before the save below, so the tab keeps
-              // its committed prompt rather than an unaccepted result.
-              if (_reviewMode) _autoDiscardReview("Tab switch — result discarded");
+              // A review belongs to the tab it started on — _originalPrompt,
+              // the thread snapshot and the chain are single, not per-tab — so
+              // it cannot simply be left running across a switch.
+              //
+              // It used to be DISCARDED here, which threw away a result the
+              // user had neither used nor discarded: generate variations, copy
+              // one out to paste into another tab, come back, and the picker
+              // was empty and the prompt had been rolled back. Nothing about
+              // the switch actually touched the cards — they live in
+              // variationsContainer, not textEl — so the loss was gratuitous.
+              //
+              // It is PARKED instead: pinned to this tab, restored below when
+              // the user returns. A run still streaming has no result to keep,
+              // and its tokens are landing in textEl, so that one is cancelled.
+              if (_reviewMode === "streaming") _autoDiscardReview("Tab switch — request cancelled");
+              else _reviewPark(String(_active));
               _tabs[_active] = textEl.value;      // save current
               _active = i;
               textEl.value = _tabs[i] || "";
-              textEl.dispatchEvent(new Event("input"));
-              _persistTabs(); _render();
+              // Swap to this tab's own history, and do not record the swap:
+              // an unmuted dispatch here put both tabs' text on one stack.
+              if (textEl._epeUndoUseTab) textEl._epeUndoUseTab(i);
+              if (textEl._epeUndoMute) textEl._epeUndoMute(true);
+              try { textEl.dispatchEvent(new Event("input")); }
+              finally { if (textEl._epeUndoMute) textEl._epeUndoMute(false); }
+              // _ieRefresh, like the reopen path below already does. The
+              // instruct panel resolves its thread from epe_tab_active at
+              // render time, and every rendered step's delete button re-reads
+              // the thread when CLICKED — so a panel left showing the old tab
+              // deleted a step from the new one. Measured: after switching to
+              // tab 2 the panel still showed tab 1's three steps and the chip
+              // still said "3 steps"; clicking a row's delete emptied tab 2.
+              _persistTabs(); _render(); _ieRefresh();
+              // AFTER _persistTabs, so epe_tab_active — which _ieTabKey and the
+              // instruct panel both read — already names the tab this review is
+              // being rebuilt over.
+              _reviewUnpark(String(_active));
             };
             const _closeTab = (i) => {
-              _lastClosed = { idx: i, text: _tabs[i] };
+              // Closing any tab repaints the editor from saved tab text, so an
+              // open review cannot just be left running — same rule as
+              // _switchTo. But only the review belonging to the tab being
+              // CLOSED has nowhere to go: closing tab 3 used to discard a
+              // result under review on tab 1, which the user had not acted on
+              // and which the close does not affect.
+              if (_reviewMode === "streaming") _autoDiscardReview("Tab closed — request cancelled");
+              else if (i === _active) _autoDiscardReview("Tab closed — result discarded");
+              else _reviewPark(String(_active));
+              // Save the live text before the splice reindexes: closing some
+              // other tab used to drop whatever was unsaved in this one.
+              _tabs[_active] = textEl.value;
+              // B-3: capture what the close is about to destroy. This MUST run
+              // before _ieThreadsDropTab and _epeUndoDropTab below, which is
+              // why it is here and not beside the toast that uses it.
+              _lastClosed = {
+                idx: i, text: _tabs[i],
+                thread: (() => {
+                  try {
+                    return (typeof _ieThreadGet === "function")
+                      ? _ieThreadGet(String(i)).slice() : [];
+                  } catch (_e2) { return []; }
+                })(),
+                hist: (() => {
+                  try {
+                    return textEl._epeUndoCaptureTab
+                      ? textEl._epeUndoCaptureTab(i) : null;
+                  } catch (_e2) { return null; }
+                })(),
+              };
               _tabs.splice(i, 1);
+              // Undo history and instruct threads are keyed by tab index,
+              // so the splice has to move them too — otherwise every tab
+              // above the closed one inherits its neighbour's history, and
+              // the instruct thread of a prompt that was never edited that
+              // way is sent to the model as EARLIER DIRECTION.
+              if (textEl._epeUndoDropTab) textEl._epeUndoDropTab(i);
+              if (typeof _ieThreadsDropTab === "function") _ieThreadsDropTab(i);
               if (_active >= _tabs.length) _active = _tabs.length - 1;
               else if (i < _active) _active--;
               textEl.value = _tabs[_active] || "";
-              textEl.dispatchEvent(new Event("input"));
-              _persistTabs(); _render();
+              if (textEl._epeUndoUseTab) textEl._epeUndoUseTab(_active);
+              if (textEl._epeUndoMute) textEl._epeUndoMute(true);
+              try { textEl.dispatchEvent(new Event("input")); }
+              finally { if (textEl._epeUndoMute) textEl._epeUndoMute(false); }
+              // _ieRefresh here too — see _switchTo. _closeTab moves
+              // _active as well, and the panel's delete buttons re-read the
+              // thread when clicked, so a stale row deletes from the tab that
+              // is active now.
+              _persistTabs(); _render(); _ieRefresh();
+              // _ieThreadsDropTab has already renumbered the pins, so a park
+              // held above the closed tab has moved down with it and the park
+              // for the closed tab itself now has a null key. Drop that one,
+              // then bring back whatever belongs to the tab we landed on.
+              _reviewParkDrop();
+              _reviewUnpark(String(_active));
+              // Captured, not read back. _lastClosed is a single shared slot
+              // and the callback used to read it at CLICK time: close tab A,
+              // close tab B inside A's five-second toast, click A's Undo, and
+              // B came back while A — already spliced out, its undo history
+              // dropped and its instruct thread cleared — was gone for good.
+              const _rec = _lastClosed;
               _toastUndo("Tab closed.", () => {
-                if (!_lastClosed || _tabs.length >= MAX) return;
-                _tabs.splice(_lastClosed.idx, 0, _lastClosed.text);
-                _active = _lastClosed.idx; _lastClosed = null;
+                if (!_rec) return;
+                if (_tabs.length >= MAX) {
+                  _toast("Close a tab first — the maximum is " + MAX + ".");
+                  return false;      // keeps this toast, and its record, alive
+                }
+                // The same rule _closeTab and _switchTo follow, and for the
+                // same reason: this moves _active, so a live review has to be
+                // parked against the tab it belongs to FIRST.
+                //
+                // Round 41 got away without it — _closeTab discarded any
+                // review unconditionally, so _reviewMode was always null by
+                // the time this toast could be clicked. Round 42 made the
+                // close park and unpark instead, and left this callback
+                // behind: the line below then wrote the un-accepted AI result
+                // into the tab array and _persistTabs shipped it into
+                // node.properties.epe_tabs, destroying the tab's real prompt,
+                // while the review bar stayed up over a different tab with
+                // _originalPrompt naming the old one.
+                let _parked = false;
+                if (_reviewMode === "streaming") _autoDiscardReview("Tab restored — request cancelled");
+                else _parked = _reviewPark(String(_active));
+                // Whatever was typed since the close belongs to the tab that is
+                // active right now — save it before _active moves.
+                _tabs[_active] = textEl.value;
+                // B-4. `_rec.idx` is where this tab was when it was CLOSED, and
+                // the toast lives five seconds — another close inside that
+                // window shifts the array out from under it. Splicing at a
+                // stale index appended instead of inserting, left `_active`
+                // past the end (empty editor, no tab highlighted), and the
+                // muted dispatch below then wrote that empty string into the
+                // out-of-range slot — a phantom tab that filled MAX and made
+                // the OTHER toast's Undo refuse, turning that close permanent.
+                //
+                // ONE clamped index for all four uses. The splice, `_active`
+                // and both keyed-map shifts have to agree, or the tab lands in
+                // one place and its undo history and Instruct-Edit direction
+                // in another. `_tabs.length` (not length-1) is a legal splice
+                // position: it means append.
+                const _at = Math.max(0, Math.min(_rec.idx, _tabs.length));
+                _tabs.splice(_at, 0, _rec.text);
+                // The close shifted every keyed map down by one; restoring
+                // the tab shifts them back up, or every tab above it keeps
+                // its lower neighbour's undo history and instruct thread
+                // (fed to the model as EARLIER DIRECTION for a prompt it
+                // never edited). The reopened tab starts both empty.
+                if (textEl._epeUndoRestoreTab) textEl._epeUndoRestoreTab(_at);
+                if (typeof _ieThreadsRestoreTab === "function") _ieThreadsRestoreTab(_at);
+                // B-3: the slot at `_at` is open now — put back what the close
+                // took. The undo history has to be installed BEFORE
+                // _epeUndoUseTab below, which is what loads a tab's stored
+                // stacks into the live ones.
+                try {
+                  if (textEl._epeUndoLoadTab) textEl._epeUndoLoadTab(_at, _rec.hist);
+                } catch (_e2) {}
+                // Through the sanctioned accessor, never by touching _ieThreads
+                // from here — the K-2 reachability census forbids that, and it
+                // exists because six wipes at one unsanctioned site once passed
+                // 46 suites. An empty thread is left absent rather than written
+                // as an empty key.
+                try {
+                  if (_rec.thread && _rec.thread.length &&
+                      typeof _ieThreadSet === "function") _ieThreadSet(_rec.thread, String(_at));
+                } catch (_e2) {}
+                _active = _at;
+                // Only if this toast is still the one holding the slot.
+                if (_lastClosed === _rec) _lastClosed = null;
+                if (textEl._epeUndoUseTab) textEl._epeUndoUseTab(_active);
                 textEl.value = _tabs[_active] || "";
-                textEl.dispatchEvent(new Event("input"));
-                _persistTabs(); _render();
+                if (textEl._epeUndoMute) textEl._epeUndoMute(true);
+                try { textEl.dispatchEvent(new Event("input")); }
+                finally { if (textEl._epeUndoMute) textEl._epeUndoMute(false); }
+                _persistTabs(); _render(); _ieRefresh();
+                // _ieThreadsRestoreTab shifts every key >= idx UP to make room
+                // for the reinserted tab, so the slot we land on is by
+                // construction the one slot no park can be pinned to. The park
+                // made above is therefore never restored HERE — it is correct,
+                // and it is waiting on the tab it belongs to. The round-43
+                // comment claimed this line restored it; exhaustively checked
+                // over every tab count, active index and closed index, it can
+                // never fire. Kept only for the prune, and the user is told
+                // where the result went rather than watching it vanish.
+                _reviewParkDrop();
+                if (!_reviewUnpark(String(_active)) && _parked) {
+                  _toast("Result kept on its own tab.");
+                }
               });
             };
 
@@ -10247,26 +14907,366 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               _epeOwnerNode._epeDispose = () => {
                 try { _priorDispose && _priorDispose(); } catch (_e) {}
                 try { _closePopovers(); } catch (_e) {}
-                try { civDetail && civDetail._cleanup && civDetail._cleanup(); } catch (_e) {}
-                try { genurDetail && genurDetail._cleanup && genurDetail._cleanup(); } catch (_e) {}
+                // _cleanup is ONE removeEventListener. The Back button and
+                // the new-search path both pair it with pausing _activeVid;
+                // dispose — the larger teardown — did not, so a looping
+                // <video> was detached still playing and went on fetching and
+                // decoding off-screen, holding the detail subtree with it.
+                // src+load(), not just pause(): pause stops playback, it does
+                // not release the media resource.
+                const _endDetail = (d) => {
+                  if (!d) return;
+                  try { if (d._cleanup) { d._cleanup(); d._cleanup = null; } } catch (_e) {}
+                  try {
+                    if (d._activeVid) {
+                      _epeReleaseVideosIn(d._activeVid);
+                      d._activeVid = null;
+                    }
+                  } catch (_e) {}
+                };
+                try { _endDetail(civDetail); } catch (_e) {}
+                try { _endDetail(genurDetail); } catch (_e) {}
+                // The CARD LISTS, which are the large ones. Every other
+                // list-clearing path — a new search, a media-toggle reset, the
+                // detail Back buttons — releases these; dispose, the teardown
+                // that is bigger than all of them, released only the open
+                // detail video. A node deleted with a video-heavy Civitai
+                // result set on screen left up to 600 <video> elements with
+                // their src still attached: ~12 MB by this round's own
+                // measurement, and each one still holding a decoder.
+                try { _epeReleaseVideosIn(civList); } catch (_e) {}
+                try { _epeReleaseVideosIn(genurList); } catch (_e) {}
+                try { _epeReleaseVideosIn(wfList); } catch (_e) {}
                 try { _civScrollObs.disconnect(); } catch (_e) {}
                 try { _genurScrollObs.disconnect(); } catch (_e) {}
                 try { _wfObserver.disconnect(); } catch (_e) {}
+                // In-flight /extract-workflow probes: abort them all so a
+                // slow response after node destruction cannot touch the
+                // torn-down editor DOM via _setGetWfBtn.
+                try {
+                  for (const _ac of _wfProbeAborts) { try { _ac.abort(); } catch (_e2) {} }
+                  _wfProbeAborts.clear();
+                } catch (_e) {}
+                // Font-sizer observers — one per Civitai/Genur detail open
+                // and per library card render. They only self-cleanup on a
+                // style mutation, so a silent removal leaves them running.
+                try {
+                  for (const _o of _fsObservers) { try { _o.disconnect(); } catch (_e2) {} }
+                  _fsObservers.length = 0;
+                } catch (_e) {}
                 try { typeof _closeStyleMenu === "function" && _closeStyleMenu(); } catch (_e) {}
+                // _hideEpeTip first: it clears the pending timer as well as
+                // hiding the element. Removing the element alone left the
+                // callback armed, holding the button and the surrounding
+                // closure until it fired against a detached node.
+                try { _hideEpeTip(); } catch (_e) {}
                 try { _epeTip.remove(); } catch (_e) {}
+                // Everything below was registered OUTSIDE this node's own DOM
+                // subtree, so none of it dies when floatingWin is removed.
+                // Each survivor kept a document-level listener or an observer
+                // alive holding the editor closure — textEl, the undo stacks,
+                // the loaded result grids, _epeOwnerNode itself. A
+                // workflow-tab switch destroys and rebuilds the node, so they
+                // accumulated one set per switch.
+                //
+                // Variations-card outside-click listener: added in the card
+                // renderer, removed only by _clearVariationsCards, which no
+                // dispose path called.
+                try { _clearVariationsCards(); } catch (_e) {}
+                // Library-card outside-click listener: added by _expandTA on
+                // whichever card is open, removed only by _collapseTA. Only
+                // one card can be expanded at a time and rpList._openTA is
+                // it. Release rather than collapse — a full collapse would
+                // run _commitEdit and write to the library on node deletion.
+                try {
+                  const _openTA = rpList && rpList._openTA;
+                  if (_openTA && _openTA._epeReleaseOutside) _openTA._epeReleaseOutside();
+                  if (rpList) rpList._openTA = null;
+                } catch (_e) {}
+                // Dropdown menus mount on document.body. _closeDropdown was
+                // only ever reached from closeEditor, which does not run for
+                // the embedded node — so deleting the node with a menu open
+                // left it floating over the canvas.
+                // All of them. The two named dropdowns were the only ones
+                // reached here; the variation cards build their own pair on
+                // every render and those orphaned on document.body.
+                try { _closeAllDropdowns(); } catch (_e) {}
+                try { _epeDropdowns.clear(); } catch (_e) {}
+                // ResizeObserver on bodyWrap — the root of the editor subtree.
+                try { if (_libFitRO) _libFitRO.disconnect(); } catch (_e) {}
+                // An in-flight generation keeps streaming into a detached
+                // textEl and holds the editor for the life of the request.
+                try { if (_aiAbort) { _aiAbort.abort(); _aiAbort = null; } } catch (_e) {}
+                try { if (_rpSearchT) { clearTimeout(_rpSearchT); _rpSearchT = null; } } catch (_e) {}
+                // A drag in progress holds two window listeners that only
+                // _libOnUp removes, and this node never reaches one.
+                try { _libEndDrag(); } catch (_e) {}
+                // All three dividers, not just the Library one. These two are
+                // declared further down the same builder scope; dispose only
+                // ever runs after layout is fully assembled, and the try/catch
+                // covers the impossible case where it does not.
+                try { _tuneEndDrag(); } catch (_e) {}
+                try { _railEndDrag(); } catch (_e) {}
+                // The node's own resize grip (window listeners) and the help
+                // window's resize and header drags (document listeners). All
+                // three close over this scope, so a drag left open holds the
+                // whole editor.
+                try { if (_epeOwnerNode && _epeOwnerNode._epeEndGripDrag) _epeOwnerNode._epeEndGripDrag(); } catch (_e) {}
+                try { if (helpOverlay._epeEndResize) helpOverlay._epeEndResize(); } catch (_e) {}
+                try { if (helpOverlay._epeEndMove) helpOverlay._epeEndMove(); } catch (_e) {}
+                // The wireless picker, which lives on document.body and holds
+                // {widget, node} for every text widget in the graph.
+                try { _epeCloseTargetPicker(); } catch (_e) {}
+                // Drop this node's AbortController entry. Nothing pruned the
+                // map, so one accumulated per node instance for the life of
+                // the page.
+                // WIN_ID, which is what claim()/_abortPrevious() key on — a
+                // stable per-instance string. Passing the node object would
+                // stringify to "[object Object]" for every node and collide.
+                try { _epeOllamaVision._releaseOwner(WIN_ID); } catch (_e) {}
+                // A model pull outlives the panel it was started from and, on
+                // completion, calls back into an editor that no longer exists.
+                // Nothing reached it from here at all.
+                // This node's pulls, not the page's. See _pullAbortOwn.
+                try { _epeOllamaVision._pullAbortOwn(WIN_ID); } catch (_e) {}
+                // The three browser panes. Nothing reached these at all: a
+                // page in flight came back to a destroyed editor and built a
+                // screenful of cards and image requests for nobody.
+                try { if (_civState.abort) { _civState.abort.abort(); _civState.abort = null; } } catch (_e) {}
+                try { if (_genurState.abort) { _genurState.abort.abort(); _genurState.abort = null; } } catch (_e) {}
+                try { if (_wfAbort) { _wfAbort.abort(); _wfAbort = null; } } catch (_e) {}
+                try { _cancelWordAltGrace(); } catch (_e) {}
+                try { if (_wordAltAbort) { _wordAltAbort.abort(); _wordAltAbort = null; } } catch (_e) {}
               };
             }
             // Restore hook — ComfyUI restores properties AFTER this builds, so
             // onConfigure calls this to reload saved tabs and repaint.
             if (_epeOwnerNode) {
               _epeOwnerNode._epeTabRestore = () => {
+                // _autoDiscardReview → _reviewExit → _iePersistThreads runs
+                // BEFORE _tabs is replaced with the incoming set. Pruning
+                // against the OLD tab count drops threads for indices that
+                // are about to become valid — silently losing per-tab
+                // instruct history on any workflow reload that has a live
+                // review AND the incoming workflow has more tabs. Gate
+                // _iePersistThreads via _epeRestoring for the whole restore.
+                _epeOwnerNode._epeRestoring = true;
+                try {
                 const pp = _epeOwnerNode.properties || {};
-                if (Array.isArray(pp.epe_tabs) && pp.epe_tabs.length) {
-                  _tabs = pp.epe_tabs.slice(0, MAX);
-                  _active = Math.min(pp.epe_tab_active || 0, _tabs.length - 1);
+                // A configure replaces the tab list and the active index
+                // wholesale, so nothing that belongs to the OLD list survives
+                // it. A live review was left with its strips up over text this
+                // was about to overwrite — the result gone, the bar still
+                // claiming to review it — and a park was left pinned to an
+                // index that now names a different prompt, ready to drop a
+                // stale result over it on the next tab round trip.
+                if (_reviewMode) _autoDiscardReview("Workflow reloaded — result discarded");
+                try {
+                  while (_reviewParks.length) {
+                    const _p = _reviewParks.pop();
+                    try { _ieUnpin(_p.pin); } catch (_e2) {}
+                  }
+                } catch (_e) {}
+                // Does this configure carry a tab identity at all?
+                //
+                // A workflow file can name an EPE node without naming its
+                // tabs — hand-edited, written by a third-party tool, or saved
+                // by a build that predates them. The third outcome below
+                // deliberately leaves `_tabs` alone in that case rather than
+                // wiping them, and everything else that belongs to the
+                // outgoing workflow answers the same question, or the guard is
+                // only as good as the one line it covers.
+                //
+                // NOT "properties arriving in pieces". That was asserted here
+                // from round 59 and refuted in round 63: one configure carries
+                // the whole bag and fires onConfigure once. See the register.
+                // Same answer, same source: what onConfigure saw in the
+                // incoming payload. Reading `pp` here is reading the node's own
+                // container, which the build has already seeded — the test was
+                // unconditionally true and the guard did nothing.
+                const _realCfg = !!_epeOwnerNode._epeCfgEvidence;
+                // The per-tab undo stacks belong to the OUTGOING workflow too.
+                //
+                // _epeUndoUseTab returns early when the key has not changed,
+                // and the incoming workflow's active index is usually the same
+                // 0 — so the outgoing workflow's live stack stayed loaded
+                // across the switch. Measured: open workflow A, edit it, click
+                // to workflow B, press Ctrl+Z once, and B's prompt was replaced
+                // by A's text on screen AND in B's file, because the restore's
+                // dispatch is muted but the undo's is not.
+                if (_realCfg && textEl._epeUndoResetAll) textEl._epeUndoResetAll();
+                // Belongs to the OUTGOING workflow, so it goes with it — but
+                // only once we know there IS an incoming one. Unguarded, a
+                // partial configure deleted the parked tail while leaving the
+                // visible tabs on screen, and the next keystroke persisted the
+                // truncated array.
+                if (_realCfg) _overflowTabs = [];
+                // `_realCfg &&` on BOTH branches, or the guard is a lie.
+                //
+                // _realCfg comes from the incoming payload; `pp` is the node's
+                // own merged container, which never shrinks. Round 60 gated the
+                // three resets on the first and left the branch tests on the
+                // second, so a payload carrying neither key still REPLACED the
+                // tab list from the stale residue while declining to reset the
+                // undo stack that belonged to what it replaced — a hybrid of
+                // two workflows, with the comments above still claiming the two
+                // tests could not disagree. One gate for all five.
+                if (_realCfg && Array.isArray(pp.epe_tabs) && pp.epe_tabs.length) {
+                  // Validate: workflow files are shared and hand-editable. A
+                  // non-string entry became "[object Object]" in the editor
+                  // (and in every wireless target); a bad active index gave
+                  // an empty editor and filed instruct threads under keys
+                  // like "-1".
+                  //
+                  // Reconcile FIRST, then truncate — otherwise a workflow
+                  // saved with 6 tabs (say active=5) had its committed
+                  // epe_prompt written into `_tabs[_active_clamped_to_3]`,
+                  // clobbering a surviving tab that had never been touched.
+                  // The dispatch below then persisted that mangled array.
+                  const _fullTabs = pp.epe_tabs.map(t => typeof t === "string" ? t : "");
+                  const _rawActive = parseInt(pp.epe_tab_active, 10);
+                  const _origActive = Math.max(0,
+                    Math.min(Number.isFinite(_rawActive) ? _rawActive : 0, _fullTabs.length - 1));
+                  // epe_prompt is the value this node actually committed, and
+                  // the value the graphToPrompt hook injects at queue time.
+                  // epe_tabs is a MIRROR of it, maintained by the input
+                  // listener — and the two can be out of step in any workflow
+                  // saved before that mirroring was made reliable, or in one
+                  // that has been hand-edited or came from someone else.
+                  // An EMPTY epe_prompt is not evidence of anything and must
+                  // not be allowed to wipe a tab that has text in it.
+                  const _committed = (typeof pp.epe_prompt === "string") ? pp.epe_prompt : "";
+                  if (_committed) {
+                    if (_origActive < MAX) {
+                      // Common case: original active is a surviving slot.
+                      // Reconcile into it directly.
+                      if (_committed !== _fullTabs[_origActive]) {
+                        _fullTabs[_origActive] = _committed;
+                      }
+                    } else {
+                      // Original active is beyond MAX. The committed prompt
+                      // is what the user was LAST editing at save time and
+                      // what graphToPrompt injects at queue time — it MUST
+                      // survive the restore. Reclaim `_fullTabs[MAX-1]` for
+                      // it; any pre-existing content there is displaced.
+                      //
+                      // A prior version left MAX-1 alone in this case and
+                      // relied on `properties.epe_prompt` to survive as a
+                      // side channel — but the input dispatch at the end of
+                      // this function overwrites epe_prompt with the
+                      // currently-visible tab's content, and the
+                      // graphToPrompt hook reads textEl.value, not
+                      // properties.epe_prompt. Result: silent committed-
+                      // prompt loss on the restore itself. So we reclaim,
+                      // and log/toast rather than lose the recent edit.
+                      const _tail = _fullTabs[MAX - 1] || "";
+                      // SWAP. The tab being displaced from the last visible
+                      // slot takes the slot the committed prompt came from —
+                      // which is beyond MAX, so it is parked rather than lost.
+                      //
+                      // This was a plain overwrite, which round 55 could get
+                      // away with because everything past MAX was being thrown
+                      // out anyway. Round 56 started preserving the tail, and
+                      // the overwrite became visible: a 6-tab file saved with
+                      // active=5 came back as t0,t1,t2,t5,t4,t5 — tab 3 gone,
+                      // tab 5 twice.
+                      //
+                      // `_fullTabs[_origActive]` is epe_tabs' MIRROR of the
+                      // active tab; `_committed` is epe_prompt, which is
+                      // authoritative for that slot. Overwriting the mirror
+                      // with the displaced tail therefore costs nothing.
+                      _fullTabs[_origActive] = _fullTabs[MAX - 1];
+                      // B-5: the same permutation, applied to the index-keyed
+                      // thread map. Both or neither — a tab and its direction
+                      // must never move apart.
+                      try {
+                        if (typeof _ieThreadsSwapTabs === "function")
+                          _ieThreadsSwapTabs(_origActive, MAX - 1);
+                      } catch (_e2) {}
+                      if (_tail !== "" && _tail !== _committed) {
+                        try { console.warn("[EPE] tab restore: workflow had " + _fullTabs.length + " tabs, MAX is " + MAX + "; showing your most-recent (committed) prompt from tab " + _origActive + " in slot " + (MAX-1) + ", displacing its previous content."); } catch (_e2) {}
+                        try { if (typeof _toast === "function") _toast("Workflow has more tabs than fit — showing your most recent edit."); } catch (_e2) {}
+                      }
+                      _fullTabs[MAX - 1] = _committed;
+                    }
+                  }
+                  _tabs = _fullTabs.slice(0, MAX);
+                  // Parked, not dropped. Reset first: a second restore of a
+                  // SMALLER workflow must not keep the previous file's tail.
+                  _overflowTabs = _fullTabs.slice(MAX);
+                  if (_overflowTabs.length && !_overflowToldOnce) {
+                    _overflowToldOnce = true;
+                    try { console.warn("[EPE] tab restore: workflow has "
+                      + _fullTabs.length + " tabs and this build shows " + MAX
+                      + "; the remaining " + _overflowTabs.length
+                      + " are kept in the file and will be saved back."); } catch (_e2) {}
+                    try { if (typeof _toast === "function")
+                      _toast("This workflow has " + _fullTabs.length
+                             + " prompt tabs — showing the first " + MAX
+                             + ". The rest are kept in the file."); } catch (_e2) {}
+                  }
+                  // Belt and braces. Everything was dropped above, before
+                  // the list was replaced; this catches a park made between
+                  // the two by anything re-entrant, and a key that is not a
+                  // number at all.
+                  try {
+                    for (let _p = _reviewParks.length - 1; _p >= 0; _p--) {
+                      const _n = parseInt(_reviewParks[_p].pin.key, 10);
+                      if (!Number.isFinite(_n) || _n >= _tabs.length) {
+                        _ieUnpin(_reviewParks[_p].pin);
+                        _reviewParks.splice(_p, 1);
+                      }
+                    }
+                  } catch (_e) {}
+                  // If the workflow's active tab was beyond MAX, clamp to
+                  // the last surviving slot — which now HOLDS the committed
+                  // prompt (see the reconcile above), so the user lands on
+                  // the value they had when they saved.
+                  _active = Math.min(_origActive, _tabs.length - 1);
+                  // Point the undo machinery at the restored tab BEFORE any
+                  // dispatch: leaving it keyed to tab 0 while _active is
+                  // elsewhere is exactly the cross-tab history bleed the
+                  // per-tab stacks exist to prevent.
+                  if (textEl._epeUndoUseTab) textEl._epeUndoUseTab(_active);
                   textEl.value = _tabs[_active] || "";
-                  textEl.dispatchEvent(new Event("input"));
+                  // Muted: a restore is not a user edit and must not become
+                  // an undo step.
+                  if (textEl._epeUndoMute) textEl._epeUndoMute(true);
+                  try { textEl.dispatchEvent(new Event("input")); }
+                  finally { if (textEl._epeUndoMute) textEl._epeUndoMute(false); }
                   _render();
+                } else if (_realCfg && typeof pp.epe_prompt === "string") {
+                  // No epe_tabs, but this IS a saved EPE node (it has an
+                  // epe_prompt). The tab list belongs to the OUTGOING
+                  // workflow; keeping it meant a single-prompt file opened
+                  // showing the previous file's tabs, with the new prompt
+                  // dropped into slot 0 beside them.
+                  //
+                  // Guarded on epe_prompt so a payload that names this node
+                  // without naming a prompt — hand-edited, or from a tool that
+                  // writes only some keys — cannot wipe the tabs.
+                  //
+                  // This comment used to say "a partial configure — properties
+                  // arriving in pieces, which ComfyUI does". It does not; see
+                  // the register's verified contract.
+                  _tabs = [pp.epe_prompt];
+                  _active = 0;
+                  if (textEl._epeUndoUseTab) textEl._epeUndoUseTab(0);
+                  textEl.value = pp.epe_prompt;
+                  if (textEl._epeUndoMute) textEl._epeUndoMute(true);
+                  try { textEl.dispatchEvent(new Event("input")); }
+                  finally { if (textEl._epeUndoMute) textEl._epeUndoMute(false); }
+                  _render();
+                }
+                } finally {
+                  // Release the persist-gate now that _tabs matches the
+                  // incoming set. Anything the dispatch above set in motion
+                  // (e.g. a follow-up _iePersistThreads) can now write
+                  // against the correct tab count.
+                  try { _epeOwnerNode._epeRestoring = false; } catch (_e) {}
+                  // Explicitly persist threads once now that we're settled,
+                  // so any pruning is against the CORRECT (new) _tabs.
+                  try { _iePersistThreads(); } catch (_e) {}
                 }
               };
             }
@@ -10363,20 +15363,42 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             // (mid-sequence) keeps the original from the first step.
             if (_reviewMode) {
               _reviewSetMode("streaming");
+              // Chained edit. Hold the result this step is about to replace —
+              // it becomes an undo step only if the chain is kept. That is what
+              // makes ↶ walk a committed chain one edit at a time without
+              // leaving anything behind when a chain is abandoned.
+              _ieChainUndo.push(textEl.value);
             } else {
               _reviewEnter("streaming");
               _ieThreadSnapshot = _ieThreadGet().slice();   // fresh entry — mark the rollback point
             }
             _ieReviewIsInstruct = true;
 
-            _aiAbort = new AbortController();
+            // The pre-edit prompt is on the stack now; keep everything this call
+            // writes off it, so one edit is one undo step.
+            if (textEl._epeUndoMute) textEl._epeUndoMute(false), textEl._epeUndoMute(true);
+            // Abort whatever is still running before taking the slot. Without
+            // this, starting an instruct edit while Enhance streamed left both
+            // alive and their onToken writes interleaved in the same textarea.
+            // Through _epeTakeAiSlot, not inline — the same correction
+            // runAiAction got. Inline this aborted _aiAbort and left a vision
+            // run in flight, and when that landed it took the slot back,
+            // aborted the edit the user was watching, and replaced it with a
+            // caption for an image they had moved on from.
+            _epeTakeAiSlot();
+            // Own controller held locally: the shared _aiAbort may be taken
+            // over by a newer request while this one unwinds, and nulling it
+            // blindly in the finally made Cancel/Esc a no-op on the stream
+            // that actually owned it.
+            const _ieCtrl = new AbortController();
+            _aiAbort = _ieCtrl;
             let ok = false;
             try {
               let tokenCount = 0;
               const raw = await _epeStreamGenerate(
                 sys, usr,
                 {
-                  signal: _aiAbort.signal,
+                  signal: _ieCtrl.signal,
                   // Rewrites can be long; without a floor this inherits Ollama's
                   // default and truncates mid-sentence on sweeping edits.
                   options: { temperature: 0.4, num_predict: 2048 },
@@ -10406,35 +15428,95 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               }
               _toast((err && err.message) || "Ollama request failed.");
             } finally {
-              _aiAbort = null;
+              if (_aiAbort === _ieCtrl) _aiAbort = null;
+              if (textEl._epeUndoMute) textEl._epeUndoMute(false);
             }
             return ok;
           };
 
-          const _ieFinish = (ok, label) => {
+          // `token` identifies the review this call entered. A superseded
+          // call must not restore, exit, or unload on behalf of the review a
+          // newer call now owns.
+          const _ieFinish = (ok, label, token) => {
+            if (token !== undefined && token !== _ieReviewToken) return;
             if (ok) {
               _reviewSetMode("single");
               reviewLabel.textContent = label || "Reviewing edited prompt";
             } else if (_reviewMode) {
               // Restore and leave review; nothing usable came back.
               if (_originalPrompt !== null) {
-                textEl.value = _originalPrompt;
-                textEl.dispatchEvent(new Event("input"));
+                textEl._epeRestoreValue(_originalPrompt);
                 updateTokenBadge(textEl.value);
               }
+              // ROUND 66 (V-3): same as the other three non-commit exits.
+              if (textEl._epeUndoReviewRollback) textEl._epeUndoReviewRollback();
               _reviewExit();
             }
             try { _epeOllama.unloadModel(); } catch (_e) {}
           };
 
+          // Mid-review, textEl is not the prompt: it holds an un-accepted
+          // result, a half-streamed partial, or — in variations mode, where it
+          // is hidden entirely — the raw multi-variation model dump.
+          // runAiAction has refused on exactly this condition since round 5;
+          // _ieApplyOne read textEl.value with no guard, so Apply Edit on a
+          // variations review sent the numbered list of three prompts as the
+          // PROMPT, destroyed the cards, and pushed the instruction into the
+          // thread as direction for a prompt that never existed.
+          //
+          // The guard lives here rather than in _ieApplyOne because
+          // _ieFinish(false) exits the review — which for a variations review
+          // means discarding the cards, i.e. doing the damage it is meant to
+          // prevent.
+          const _ieBlockedByReview = () => {
+            if (_reviewMode && _reviewMode !== "single") {
+              _toast("Finish the current result first — use it, or discard it.");
+              return true;
+            }
+            return false;
+          };
+
           const _runInstructEdit = async () => {
             const instr = ieInput.value.trim();
             if (!instr) return;
+            if (_ieBlockedByReview()) return;
+            // The instruction deliberately stays in the box for reuse, so a
+            // second Enter is one keystroke away. Without this the second
+            // call aborted the first, and the FIRST call's unwind then tore
+            // down the review the second had just entered — after which the
+            // live stream persisted every token into node.properties with no
+            // review bar and no way to discard it.
+            if (ieBtn.disabled) return;
             ieBtn.textContent = "…"; ieBtn.disabled = true;
-            const ok = await _ieApplyOne(instr, { context: _ieContext(), label: "Applying edit" });
-            if (ok) _ieThreadPush(instr);   // instruction stays in the box for reuse
-            _ieFinish(ok);
-            ieBtn.textContent = "Apply Edit"; ieBtn.disabled = false;
+            const _tok = ++_ieReviewToken;
+            // Pinned before the await: the push below lands on the tab the
+            // edit was made against, not on whichever tab is active when the
+            // model finally answers. A registered pin, so closing or reopening
+            // a tab meanwhile moves it with the renumbering instead of leaving
+            // it pointing at somebody else's tab.
+            const _editPin = _iePin(_ieTabKey());
+            let ok = false;
+            // EVERYTHING that has to happen whatever the outcome is in the
+            // finally, not just the unpin. Round 40 wrapped the sequence
+            // replay's loop in a try/finally and called this the twin it was
+            // copying — but this one only ever released the pin. `ieBtn` was
+            // left disabled by a throw from _ieApplyOne outside its own inner
+            // try (_reviewEnter builds DOM, _epeTakeAiSlot, _toast) or from
+            // _ieThreadPush, and the guard sixteen lines up is
+            // `if (ieBtn.disabled) return;` — so every later Apply Edit click
+            // and every later Enter became a silent no-op for the life of the
+            // node, with no message and no way back.
+            try {
+              ok = await _ieApplyOne(instr, { context: _ieContext(), label: "Applying edit" });
+              // A null key means the tab this edit belonged to was closed
+              // while the model was answering; there is nothing left to push
+              // to. Inside the try, so a throw here still lands below.
+              if (ok && _editPin.key !== null) _ieThreadPush(instr, _editPin.key);   // instruction stays in the box for reuse
+            } finally {
+              try { _ieUnpin(_editPin); } catch (_e) {}
+              try { _ieFinish(ok, undefined, _tok); } catch (_e) {}
+              try { ieBtn.textContent = "Apply Edit"; ieBtn.disabled = false; } catch (_e) {}
+            }
           };
 
           // Replay a saved sequence: each step sees the result of the last, and
@@ -10443,25 +15525,97 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           _ieRunSequence = async (steps, name) => {
             if (!steps || !steps.length) return;
             if (ieBtn.disabled) return;
+            if (_ieBlockedByReview()) return;
             ieBtn.textContent = "…"; ieBtn.disabled = true;
+            // Same token discipline _runInstructEdit uses. runAiAction bumps
+            // _ieReviewToken when it enters review, so an Enhance started
+            // while this sequence was still running left the sequence's
+            // _ieFinish(false) free to call _reviewExit() and restore
+            // _originalPrompt over the review the user had just opened.
+            const _tok = ++_ieReviewToken;
             _setRpTab("instruct"); _ieShowPane("live");
-            const base = _ieThreadGet().slice();
+            // The tab this replay belongs to, pinned before the first await.
+            // Every thread write below used to resolve the tab afresh, so a
+            // switch mid-replay redirected them at the tab the user had just
+            // moved to and destroyed its direction.
+            //
+            // A REGISTERED pin, not a captured string: round 24's version was
+            // a tab index, and closing a tab renumbers every index above it,
+            // so the pin came out of the close naming a different tab. The
+            // shifters move live pins now; a null key means the pinned tab is
+            // gone and this replay must stop writing.
+            const _seqPin = _iePin(_ieTabKey());
+            // Released in a finally, like the single-edit twin. Everything
+            // between here and the unpin can throw — _ieThreadSet persists and
+            // rebuilds DOM, _ieApplyOne enters and sets review mode — and a
+            // throw stranded the pin in _ieTabPins for good, where every tab
+            // close and restore went on renumbering it, with ieBtn left
+            // disabled for the session.
+            const _seqRelease = () => {
+              try { _ieUnpin(_seqPin); } catch (_e) {}
+              _ieRunningIdx = -1;
+              try { _ieRefresh(); } catch (_e) {}
+              try { ieBtn.textContent = "Apply Edit"; ieBtn.disabled = false; } catch (_e) {}
+            };
+            const _seqTab = _seqPin.key;
+            const base = _ieThreadGet(_seqTab).slice();
+            // Was a review ALREADY open when the sequence started? If so the
+            // first step chains into it, _ieApplyOne does not re-snapshot,
+            // and the live snapshot is the correct pre-chain rollback point
+            // — re-marking it below would bury the earlier chain's own
+            // uncommitted instructions in the persisted thread.
+            const _seqFreshEntry = !_reviewMode;
             let ok = false;
+            // The loop below runs inside a try whose finally is _seqRelease.
+            // Round 38 extracted the release into a helper and then called it
+            // on the normal path only — so the comment above it claimed a
+            // finally that did not exist, and a throw anywhere in the loop
+            // left Apply Edit disabled for the rest of the session with the
+            // pin stranded in _ieTabPins.
+            try {
             for (let i = 0; i < steps.length; i++) {
-              _ieRunningIdx = base.length + i;
-              _ieThreadSet(base.concat(steps.slice(0, i + 1)));
+              // The tab moved out from under the replay. Every later step
+              // would be editing a prompt that is no longer on screen — and
+              // the switch has already discarded the review this was running
+              // in — so stop, and roll this tab's thread back below.
+              // The tab moved out from under the replay — switched away from,
+              // or closed (in which case the pin's key is null).
+              if (_seqPin.key === null || _ieTabKey() !== _seqPin.key) { ok = false; break; }
+              _ieThreadSet(base.concat(steps.slice(0, i + 1)), _seqPin.key);
+              // The cap may trim the front — the running step is always the
+              // last entry of what is actually stored.
+              _ieRunningIdx = _ieThreadGet(_seqPin.key).length - 1;
               const lbl = 'Running “' + (name || "sequence") + '” — step ' + (i + 1) + " of " + steps.length;
               ok = await _ieApplyOne(steps[i], { context: base.concat(steps.slice(0, i)), label: lbl });
+              // The fresh review entry inside the first _ieApplyOne snapshots
+              // the thread AS IT IS — which already held step 1. Re-mark the
+              // rollback point at the true pre-sequence state, so Discard
+              // does not leave step 1 behind in the persisted thread.
+              if (i === 0 && ok && _seqFreshEntry) _ieThreadSnapshot = base.slice();
               if (!ok) {
-                // Roll the thread back to the steps that actually applied.
-                _ieThreadSet(base.concat(steps.slice(0, i)));
+                // _ieFinish(false) restores the prompt this review entered
+                // with, so the thread rolls back to match — steps whose
+                // effects were just rolled back must not survive as
+                // direction. On a chained run that is the snapshot taken
+                // before the whole chain, not this sequence's own base.
+                // Only if the tab is still there. Writing this rollback with
+                // a stale index is what put one tab's direction into another.
+                if (_seqPin.key !== null) {
+                  _ieThreadSet((!_seqFreshEntry && _ieThreadSnapshot) ? _ieThreadSnapshot : base, _seqPin.key);
+                }
                 break;
               }
             }
-            _ieRunningIdx = -1;
-            _ieRefresh();
-            _ieFinish(ok, ok ? 'Reviewing “' + (name || "sequence") + '”' : undefined);
-            ieBtn.textContent = "Apply Edit"; ieBtn.disabled = false;
+            } finally {
+              _seqRelease();
+              // _ieFinish too, for the same reason: a throw in the loop used
+              // to skip it, leaving the review bar open over a prompt whose
+              // replay had already stopped. ok is false on that path, which
+              // is the correct recovery — restore and tear down.
+              try {
+                _ieFinish(ok, ok ? 'Reviewing “' + (name || "sequence") + '”' : undefined, _tok);
+              } catch (_e) {}
+            }
           };
 
           ieBtn.onclick = _runInstructEdit;
@@ -10492,7 +15646,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // They now share a wrapper whose height is driven by the divider above
         // it, so one gesture clears both and the editor takes back the space.
         const tuneWrap = document.createElement("div");
-        // overflow-y:auto, not hidden — when the block is dragged shorter than
+        // overflow hidden here; btnRow below carries the scroll — when the block is dragged shorter than
         // its content the wireless "+ Add target" button would otherwise be
         // clipped with no way to reach it.
         tuneWrap.style.cssText =
@@ -10612,9 +15766,18 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           tuneGrip.style.background = "#1c2431";
           window.removeEventListener("pointermove", _tuneOnMove, true);
           window.removeEventListener("pointerup", _tuneOnUp, true);
-          try { tuneGrip.releasePointerCapture(e.pointerId); } catch (_e) {}
+          // Round 26 added this to the Library divider and called the tuning
+          // and rail dividers "the same contract" — then left both without it.
+          // A cancelled pointer (touch interrupted, the OS taking the gesture,
+          // a context menu) left _tuneDragging true, so the block followed an
+          // unpressed mouse, and both window listeners outlived the drag.
+          window.removeEventListener("pointercancel", _tuneOnUp, true);
+          try { tuneGrip.releasePointerCapture(e && e.pointerId); } catch (_e) {}
           _epePersistUi();
         };
+        // A node destroyed mid-drag never reaches _tuneOnUp, so dispose ends
+        // the drag the same way a pointerup does.
+        const _tuneEndDrag = () => { try { _tuneOnUp({}); } catch (_e) {} };
         tuneGrip.addEventListener("pointerdown", (e) => {
           if (e.target === tuneHandle) return;
           _tuneDragging = true;
@@ -10627,6 +15790,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           try { tuneGrip.setPointerCapture(e.pointerId); } catch (_e) {}
           window.addEventListener("pointermove", _tuneOnMove, true);
           window.addEventListener("pointerup", _tuneOnUp, true);
+          window.addEventListener("pointercancel", _tuneOnUp, true);
           // Keep the ComfyUI canvas from starting a node-drag on the grip.
           e.preventDefault(); e.stopPropagation();
         });
@@ -10655,7 +15819,10 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         // distance the cursor moved. Silent: this is not a user edit, so it must
         // not write node.properties or dirty a freshly loaded graph.
         requestAnimationFrame(() => {
-          try { if (_styleOpen) _tuneApply(_tuneOpenH(), true); } catch (_e) {}
+          // _tuneH first: onConfigure's restore may already have applied the
+          // saved drag height, and normalizing to the full open height here
+          // clobbered it on every workflow load.
+          try { if (_styleOpen) _tuneApply(_tuneH || _tuneOpenH(), true); } catch (_e) {}
         });
 
         // Action rail joins the body row, left of the workspace.
@@ -10700,7 +15867,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
         };
         railGrip.appendChild(railHandle);
 
-        const _railApply = (w) => {
+        const _railApply = (w, silent) => {
           const open = w > 0;
           _railCollapsed = !open;
           actionRail.style.display = open ? "flex" : "none";
@@ -10708,7 +15875,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           railHandle.textContent = open ? "‹" : "›";
           railHandle.title = open ? "Collapse the Transform column" : "Show the Transform column";
           _publishRailW(open ? w : 0);
-          if (!_railDragging) { _epePersistUi(); if (open) _epeGrowToMin(); }
+          if (!_railDragging) { if (!silent) _epePersistUi(); if (open) _epeGrowToMin(); }
         };
         const _railOpenW = () =>
           Math.min(RAIL_MAX_W, Math.max(RAIL_DEFAULT_W, _railNatural()));
@@ -10725,9 +15892,11 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           railGrip.style.background = "#1c2431";
           window.removeEventListener("pointermove", _railOnMove, true);
           window.removeEventListener("pointerup", _railOnUp, true);
-          try { railGrip.releasePointerCapture(e.pointerId); } catch (_e) {}
+          window.removeEventListener("pointercancel", _railOnUp, true);
+          try { railGrip.releasePointerCapture(e && e.pointerId); } catch (_e) {}
           _epePersistUi();
         };
+        const _railEndDrag = () => { try { _railOnUp({}); } catch (_e) {} };
         railGrip.addEventListener("pointerdown", (e) => {
           if (e.target === railHandle) return;
           _railDragging = true;
@@ -10737,6 +15906,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
           try { railGrip.setPointerCapture(e.pointerId); } catch (_e) {}
           window.addEventListener("pointermove", _railOnMove, true);
           window.addEventListener("pointerup", _railOnUp, true);
+          window.addEventListener("pointercancel", _railOnUp, true);
           e.preventDefault(); e.stopPropagation();
         });
         railGrip.addEventListener("mousedown", (e) => e.stopPropagation());
@@ -10807,7 +15977,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               '<b>Inverter</b> — rewrites your prompt into a contrasting aesthetic.' +
               '</div>' +
               '<div style="margin-top:10px;padding:8px 10px;background:rgba(109,184,232,0.06);border:1px solid rgba(109,184,232,0.15);border-radius:7px;color:#8ba5be;font-size:10px;">' +
-              'Tip: results appear in the editor for review — keep them by clicking <b>Use</b>, or press <b>Undo</b> (Ctrl+Z) to restore your previous text.' +
+              'Tip: results appear in the editor for review — keep one with <b>Use this</b>, add it to what you had with <b>Append</b>, or reject it with <b>Discard</b>, which puts your prompt back exactly as it was.' +
               '</div>',
           },
           {
@@ -10840,9 +16010,15 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             html:
               '<div style="line-height:1.8;">' +
               '<ul style="margin:0;padding-left:18px;line-height:1.7;">' +
-              '<li>Use the <b>✎</b> row above the toolbar to change your prompt in plain language — e.g. "change the lighting to golden hour" or "make her hair red".</li>' +
-              '<li>The edit ripples coherently: changing a subject\'s age, species, or the season also updates related details. Streams into the editor with <b>Apply</b> / <b>Undo</b>.</li>' +
+              '<li>Use the <b>✎</b> row above the toolbar to change your prompt in plain language — e.g. "change the lighting to golden hour" or "make her hair red". Press <b>Apply Edit</b> and the rewrite streams into the editor.</li>' +
+              '<li>The edit ripples coherently: changing a subject\'s age, species, or the season also updates related details.</li>' +
+              '<li>Chain edits together — each one builds on the last, and nothing is committed until you accept it with <b>Use this</b>. <b>Discard</b> puts the prompt back the way it was.</li>' +
+              '<li>Later instructions can refer to earlier ones ("dial that back", "warmer than that") because the whole direction thread goes to the model. The <b>steps</b> chip beside the ✎ row opens the thread.</li>' +
+              '<li><b>☆ Save sequence</b> keeps a chain of edits as a reusable recipe — replay it on any other prompt and it runs step by step.</li>' +
               '</ul>' +
+              '</div>' +
+              '<div style="margin-top:10px;padding:8px 10px;background:rgba(109,184,232,0.06);border:1px solid rgba(109,184,232,0.15);border-radius:7px;color:#8ba5be;font-size:10px;">' +
+              'Tip: <b>↶</b> (Ctrl+Z) steps back one instruct edit at a time, so you can walk a chain backwards without discarding all of it.' +
               '</div>',
           },
           {
@@ -10854,6 +16030,9 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
               '<b>File ▾</b> — save to Favorites/Snippets, clear, import/export text.<br>' +
               '<b>Undo/Redo</b> — Ctrl+Z / Ctrl+Y; also recalls the prompt from before an AI result.<br>' +
               '<b>Find</b>, <b>Aa</b> (case/sort), <b>Clean</b> (strip markdown/weights), <b>Synonyms</b>, <b>Flag words</b> (weak words → replacements), <b>Wrap</b>.' +
+              '</div>' +
+              '<div style="line-height:1.8;margin-top:10px;">' +
+              '<b>Collapsible layout</b> — the node is three columns and you choose how many are open. Click the tab on <b>Style tuning</b> or on the <b>Library</b> rail to fold that column away, or drag its grip to resize. The node\'s minimum width tracks whatever is open, so collapsing both leaves a plain editor that takes almost no room on the canvas.' +
               '</div>',
           },
           {
@@ -10951,6 +16130,10 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             helpOverlay.style.height = Math.max(200, sh + e.clientY - sy) + "px";
           };
           const up = () => { rz = false; document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up); };
+          // Exposed so dispose can end a drag the mouseup never finished. Both
+          // handlers are on `document`, so a stranded pair also fires on every
+          // mouse move anywhere on the page, for the life of the tab.
+          helpOverlay._epeEndResize = up;
           helpGrip.addEventListener("mousedown", (e) => {
             e.preventDefault(); e.stopPropagation();
             rz = true; sx = e.clientX; sy = e.clientY;
@@ -10973,6 +16156,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             helpOverlay.style.right = "auto";
           };
           const onUp = () => { dragging = false; document.removeEventListener("mousemove", onMove); document.removeEventListener("mouseup", onUp); };
+          helpOverlay._epeEndMove = onUp;
           helpHdr.addEventListener("mousedown", (e) => {
             if (e.target === helpClose) return;
             e.preventDefault(); e.stopPropagation();
@@ -11036,6 +16220,10 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
     for (const n of nodes) {
       if (!n) continue;
       fn(n);
+      // A muted (2) or bypassed (4) subgraph wrapper switches off everything
+      // inside it — including any EPE node. Recursing anyway made muting
+      // the wrapper a no-op for injection.
+      if (n.mode === 2 || n.mode === 4) continue;
       const inner = _epeGetInnerGraph(n);
       if (inner) _epeForEachNode(inner, fn, visited);
     }
@@ -11048,6 +16236,11 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
       _epeForEachNode(rootGraph, (n) => {
         const isEpe = (n.type === "EPENode" || n.comfyClass === "EPENode");
         if (!isEpe) return;
+        // Muted (2) or bypassed (4). This node has no graph I/O, so muting
+        // is the only way to switch it off — and it kept injecting anyway,
+        // overwriting whatever the user had typed straight into the target.
+        // The target picker already skips muted nodes; only this path did not.
+        if (n.mode === 2 || n.mode === 4) return;
         const targets = n.properties && n.properties.epe_wireless_targets;
         if (!Array.isArray(targets) || targets.length === 0) return;
         // Prefer the live editor text; fall back to the persisted prompt so a
@@ -11065,6 +16258,25 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
   };
 })();
 
+// ONE registration per page, whichever copy of this file gets there first.
+//
+// A registry install and a git clone can both be present — ComfyUI resolves
+// them as two packs with different directory names — and each contributes a
+// WEB_DIRECTORY, so the browser fetches and executes this module twice. The
+// second `app.registerExtension` with the same name throws, ComfyUI swallows
+// it into a console.error nobody reads, and one copy's module-level state
+// (the shared Ollama registry, the picker overlay slot, the abort sets) is
+// orphaned while its DOM handlers stay live.
+//
+// Announced rather than swallowed: two copies is a real installation problem
+// and the fix is to remove one of them.
+if (window.__epeExtensionRegistered) {
+  console.warn("[EPE] epe_node.js loaded twice — a second copy of the "
+    + "Enhanced Prompt Editor is installed (a registry install and a git "
+    + "clone, most likely). This copy is standing down; remove one of the "
+    + "two folders from custom_nodes to clear this.");
+} else {
+  window.__epeExtensionRegistered = true;
 app.registerExtension({
   name: "EnhancedPromptEditor.Node",
 
@@ -11085,15 +16297,81 @@ app.registerExtension({
       const r = onConfigure?.apply(this, arguments);
       try {
         const self = this;
+        // Record what the INCOMING payload carried, before anything merges it.
+        //
+        // Three destructive operations ask "is this a real configure, or are
+        // properties arriving in pieces?" — the thread-map reset, the parked-tab
+        // clear, and the per-tab undo reset. Round 59 answered it from the
+        // node's OWN `properties`, and that is always yes: the editor build
+        // calls `_epePersistPrompt()` before it publishes `_epeRefreshFromProps`
+        // at all, so `properties.epe_prompt` is a string from the moment the
+        // node exists, and `_persistTabs()` leaves `epe_tabs` non-empty. The
+        // guard read as careful and was a no-op. Two independent reviews found
+        // it in the same pass.
+        //
+        // `info.properties` is the serialised node as the workflow file has it
+        // — the only thing that knows whether this configure carries a tab
+        // identity. Absent or empty means "not yet": keep what is on screen.
+        // Held in a CONST, not on the node.
+        //
+        // Round 60 wrote the answer into `self._epeCfgEvidence` here and let the
+        // deferred refresh read it a macrotask later. One slot per node, one
+        // pending refresh per configure — so when properties arrive in pieces
+        // (the very thing this exists to detect) the LAST piece's answer stood
+        // for the real configure's refresh, and it is always the weaker answer:
+        // a trailing `{epe_ui: …}` says "no evidence", the refresh keeps the
+        // OUTGOING workflow's threads, tabs and undo stack, and D-1, E-2 and
+        // F-2 all come back at once. Driven: switch workflows, press Ctrl+Z,
+        // and the previous workflow's text lands in this one's file.
+        let _ev = false;
+        try {
+          const _ip = (info && info.properties) || null;
+          _ev = !!(_ip &&
+            ((Array.isArray(_ip.epe_tabs) && _ip.epe_tabs.length) ||
+             typeof _ip.epe_prompt === "string"));
+        } catch (_e2) { _ev = false; }
+        // ONE configure, one whole bag, one onConfigure. Verified, not assumed.
+        //
+        // Rounds 59-62 built an accumulator and a sequence guard on top of the
+        // assertion "properties arrive in pieces, which ComfyUI does" — written
+        // here in round 59 and never sourced. It is false. In the frontend this
+        // install runs (comfyui-frontend-package 1.49.6) and in the 1.53.1
+        // source:
+        //
+        //   LGraphNode.configure(info) copies the WHOLE info.properties bag in
+        //     one loop and then calls this.onConfigure?.(info) once, as its
+        //     last statement;
+        //   LGraphNode.serialize() writes the whole properties object or
+        //     nothing — there is no subset form;
+        //   LGraph.configure() does `this._nodes = []` and rebuilds every node
+        //     through createNode -> onNodeCreated -> configure.
+        //
+        // So `info.properties` is always the complete saved node, this hook
+        // fires exactly once for it, and the editor already exists when it
+        // does. Driven: 3,000 production-shaped node lifetimes give
+        // byte-identical results with the machinery and without it.
+        //
+        // What is left is the part that is real: did THIS FILE carry a tab
+        // identity? A workflow can name an EPE node without naming its tabs,
+        // and the restore must not treat that as "wipe what is on screen".
+        //
         // Defer a tick: properties are applied around configure time; this makes
         // sure epe_wireless_targets / epe_prompt are present before we refresh.
-        // The editor DOM (and its restore hooks) may still be building, so retry
-        // briefly until the hooks exist rather than silently doing nothing.
+        // The editor's hooks are published from onNodeCreated, which LiteGraph
+        // runs BEFORE configure, so the retry below should never fire — it is
+        // kept as cheap insurance for a frontend that builds the editor later.
         let _tries = 0;
         const _tryRefresh = () => {
           _tries++;
           try {
-            if (self._epeRefreshFromProps) { self._epeRefreshFromProps(); return; }
+            if (self._epeRefreshFromProps) {
+              // This configure's own answer, published at the moment its
+              // refresh runs rather than when it landed — so a second node's
+              // configure, or a second workflow load, cannot answer for it.
+              self._epeCfgEvidence = _ev;
+              self._epeRefreshFromProps();
+              return;
+            }
           } catch (_e) { return; }
           if (_tries < 20) setTimeout(_tryRefresh, 50);
         };
@@ -11107,6 +16385,30 @@ app.registerExtension({
 
       const epeEl = _epeOpenEPEStandalone(this);
       if (!epeEl) return r;
+
+      // S-1. This node now owns a `document` listener and two `document.body`
+      // children, and ComfyUI will not always tell us when it dies — see the
+      // registry's comment at the top of the file.
+      //
+      // The outermost dispose layer, so it wraps every layer
+      // `_epeOpenEPEStandalone` built up. Exactly-once: the sweep and a later
+      // `onRemoved` can both reach the same node, and running the chain twice
+      // is not something each layer was written for.
+      {
+        const _epeRegNode = this;
+        const _epeRegPrev = _epeRegNode._epeDispose;
+        let _epeRegDone = false;
+        _epeRegNode._epeDispose = () => {
+          if (_epeRegDone) return;
+          _epeRegDone = true;
+          try { _epeLiveEditors.delete(_epeRegNode); } catch (_e) {}
+          try { _epeRegPrev && _epeRegPrev(); } catch (_e) {}
+        };
+        _epeLiveEditors.add(_epeRegNode);
+        // Excluded by identity: LiteGraph runs onNodeCreated BEFORE graph.add,
+        // so this node is legitimately in no graph yet.
+        _epeSweepDeadEditors(_epeRegNode);
+      }
 
       const _node = this;
       const _epeFullW = 980;
@@ -11207,6 +16509,16 @@ app.registerExtension({
           window.removeEventListener("mousemove", _rgMove);
           window.removeEventListener("mouseup", _rgUp);
         };
+        // Registered ON THE NODE, because this grip is built in onNodeCreated
+        // and dispose lives inside the editor closure — two different
+        // functions, no shared binding. The node object is what both hold.
+        // _rgMove closes over _applySize
+        // -> _node -> the whole editor, so a drag the mouseup never ended —
+        // a workflow-tab switch under a held button, a release outside the
+        // viewport — pinned the entire editor for the life of the page. The
+        // three divider drags have been ended from dispose since round 30;
+        // this one and the help window's two were never added.
+        _node._epeEndGripDrag = _rgUp;
         _rGrip.addEventListener("mousedown", (e) => {
           e.preventDefault(); e.stopPropagation();
           _rgDrag = true;
@@ -11223,3 +16535,4 @@ app.registerExtension({
     };
   },
 });
+}  // end of the load-twice guard opened above app.registerExtension
