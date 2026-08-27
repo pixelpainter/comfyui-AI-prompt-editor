@@ -65,7 +65,7 @@ Pick a **Style** (Midjourney, DALL·E, Anime, Cinematic…) to have the AI creat
 
 ## Editor tools
 
-**Tabs** — up to 4 prompts side by side, saved with your workflow.  
+**Tabs** — up to 10 prompts side by side, saved with your workflow.  
 **File ▾** — save to Favorites/Snippets, clear, import/export text.  
 **Undo/Redo** — Ctrl+Z / Ctrl+Y; also recalls the prompt from before an AI result.  
 **Find**, **Aa** (case/sort), **Clean** (strip markdown/weights), **Synonyms**, **Flag words** (weak words → replacements), **Wrap**.

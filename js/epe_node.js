@@ -16026,7 +16026,7 @@ function _epeOpenEPEStandalone(_epeOwnerNode) {
             label: "Editor tools",
             html:
               '<div style="line-height:1.8;">' +
-              '<b>Tabs</b> — up to 4 prompts side by side, saved with your workflow.<br>' +
+              '<b>Tabs</b> — up to 10 prompts side by side, saved with your workflow.<br>' +
               '<b>File ▾</b> — save to Favorites/Snippets, clear, import/export text.<br>' +
               '<b>Undo/Redo</b> — Ctrl+Z / Ctrl+Y; also recalls the prompt from before an AI result.<br>' +
               '<b>Find</b>, <b>Aa</b> (case/sort), <b>Clean</b> (strip markdown/weights), <b>Synonyms</b>, <b>Flag words</b> (weak words → replacements), <b>Wrap</b>.' +

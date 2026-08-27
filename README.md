@@ -28,7 +28,15 @@ EPE replaces the humble prompt textbox with a complete writing environment. Writ
 
 ## Features
 
-**Editor** — Multi-tab prompt editor (up to 4 tabs, persistent across restarts) with undo/redo, version history, find & replace, case/sort/dedupe/trim, cleanup (strip markdown, weights, extra spaces), word wrap, and live word + token counts. **Synonyms** suggests plain and creative alternatives for any selected word; **Flag words** highlights empty quality words ("beautiful", "4k", "masterpiece") and offers one-click replacements.
+> **New in 1.0.20** — 26 August 2026
+>
+> - **Ten prompt tabs**, up from four — each with its own prompt, direction thread and undo history.
+> - **Send to tab** — put any result into another tab, open or new, without leaving the one you're on. The review stays up, so you can park a promising Enhance in tab 3, try a different style on the same prompt, and compare before choosing.
+> - **What's in the prompt box is what renders**, in every state.
+>
+> Full list in the [changelog](#changelog).
+
+**Editor** — Multi-tab prompt editor (up to 10 tabs, persistent across restarts) with undo/redo, version history, find & replace, case/sort/dedupe/trim, cleanup (strip markdown, weights, extra spaces), word wrap, and live word + token counts. **Synonyms** suggests plain and creative alternatives for any selected word; **Flag words** highlights empty quality words ("beautiful", "4k", "masterpiece") and offers one-click replacements.
 
 **AI transforms** — **Enhance** expands a short idea into a rich prompt. **Variations** writes three distinct aesthetic takes on the same subject. **Inverter** rewrites the prompt into a contrasting aesthetic.
 
