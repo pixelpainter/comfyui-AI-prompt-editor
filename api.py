@@ -186,9 +186,184 @@ def _epe_ip_is_local_network(ip) -> bool:
                 or (ip.version == 4 and ip in _EPE_CGNAT_NET))
 
 
+# ── The Ollama destination allow-list ────────────────────────────────────
+#
+# Loopback needs no configuration. Anything else must be named explicitly, by
+# someone with access to the machine, in the environment or in ComfyUI's user
+# directory — never over HTTP, because a list a caller can add itself to is not
+# a list.
+_EPE_ALLOW_ENV = "EPE_OLLAMA_ALLOWED_HOSTS"
+_EPE_DEFAULT_OLLAMA_PORT = 11434
+
+# Cached after the first consult. `None` means "not read yet"; the lock stops
+# two concurrent requests both seeding the file.
+_EPE_ALLOW_CACHE = None
+_EPE_ALLOW_LOCK = threading.Lock()
+
+_EPE_CONFIG_README = (
+    "Ollama running on another machine? Add each one as host:port in "
+    "ollamaAllowedHosts below, then restart ComfyUI. "
+    "Example: [\"192.168.1.50:11434\"]. "
+    "Leave the list empty to allow only this computer. "
+    "EPE never writes to this file again once it exists, so your edits are safe. "
+    "Any key EPE does not recognise is ignored, so notes can live here too."
+)
+
+
+def _epe_config_path():
+    """<ComfyUI user dir>/epe/config.json, or None if it cannot be located.
+
+    NOT the node's own folder: `custom_nodes/EPE/` is replaced on every update,
+    so a user's allow-list would silently vanish and present as "EPE stopped
+    seeing my Ollama". The user directory is what survives an update.
+    """
+    try:
+        base = folder_paths.get_user_directory()
+        if not base:
+            return None
+        return os.path.join(base, "epe", "config.json")
+    except Exception:
+        return None
+
+
+def _epe_norm_hostport(text, default_port=_EPE_DEFAULT_OLLAMA_PORT):
+    """'HOST:PORT' -> 'host:port', or '' if it is not one.
+
+    Accepts a bare host (the default Ollama port is assumed) and bracketed
+    IPv6. Rejects anything carrying a scheme, path, credentials or query: an
+    entry is a destination, not a URL, and quietly accepting a URL-shaped entry
+    would mean the user thinks they listed something they did not.
+    """
+    try:
+        s = str(text or "").strip().lower()
+    except Exception:
+        return ""
+    if not s or "/" in s or "@" in s or "?" in s or "#" in s or "\\" in s:
+        return ""
+    host = s
+    port = default_port
+    if s.startswith("["):                       # [::1]:11434
+        end = s.find("]")
+        if end < 0:
+            return ""
+        host = s[1:end]
+        rest = s[end + 1:]
+        if rest:
+            if not rest.startswith(":"):
+                return ""
+            port = rest[1:]
+    elif s.count(":") == 1:                     # host:port
+        host, port = s.split(":", 1)
+    elif s.count(":") > 1:                      # bare IPv6, no brackets
+        host = s
+    if not host:
+        return ""
+    try:
+        port = int(port)
+    except Exception:
+        return ""
+    if not (0 < port < 65536):
+        return ""
+    return "%s:%d" % (host, port)
+
+
+def _epe_seed_config(path):
+    """Write the starter config if — and only if — it is not already there.
+
+    Never at import: an `os.makedirs` against a dead mount blocks the whole
+    ComfyUI start, which is why this is reached from the first consult and not
+    from module scope. Failure is logged and ignored; loopback still works.
+    """
+    try:
+        if os.path.exists(path):
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # x mode: if another process won the race between the exists() above
+        # and here, theirs stands and ours raises rather than overwriting it.
+        with io.open(path, "x", encoding="utf-8") as fh:
+            json.dump({"_readme": _EPE_CONFIG_README,
+                       "ollamaAllowedHosts": []}, fh, indent=2)
+        logger.info("EPE: wrote starter config to %s", path)
+    except FileExistsError:
+        pass
+    except Exception as exc:                                    # noqa: BLE001
+        logger.info("EPE: could not write starter config to %s (%s) — "
+                    "Ollama on this machine still works", path, exc)
+
+
+def _epe_read_allowed_hosts():
+    """The allow-list, as a set of 'host:port'. Loopback is not in it — that is
+    handled by the address check and needs no configuration.
+
+    NEVER FAILS OPEN. A malformed file, an unreadable directory or a garbage
+    env var all leave the list EMPTY, which means loopback-only. It must not be
+    possible to widen the allow-list by corrupting the file.
+    """
+    out = set()
+    raw = ""
+    try:
+        raw = os.environ.get(_EPE_ALLOW_ENV, "") or ""
+    except Exception:
+        raw = ""
+    for part in raw.replace(";", ",").split(","):
+        hp = _epe_norm_hostport(part)
+        if hp:
+            out.add(hp)
+
+    path = _epe_config_path()
+    if path:
+        _epe_seed_config(path)
+        try:
+            with io.open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                entries = data.get("ollamaAllowedHosts")
+                # A string is a common hand-edit ("192.168.1.50:11434" instead
+                # of a list). Accept it rather than silently ignoring the only
+                # line the user wrote.
+                if isinstance(entries, str):
+                    entries = [entries]
+                if isinstance(entries, list):
+                    for e in entries:
+                        hp = _epe_norm_hostport(e)
+                        if hp:
+                            out.add(hp)
+                        elif e not in (None, ""):
+                            logger.warning(
+                                "EPE: ignoring unusable ollamaAllowedHosts entry %r "
+                                "in %s — expected \"host:port\"", e, path)
+            else:
+                logger.warning("EPE: %s is not a JSON object — ignoring it", path)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:                                # noqa: BLE001
+            logger.warning("EPE: could not read %s (%s) — allowing only this "
+                           "machine", path, exc)
+    return frozenset(out)
+
+
+def _epe_allowed_ollama_hosts():
+    global _EPE_ALLOW_CACHE
+    if _EPE_ALLOW_CACHE is not None:
+        return _EPE_ALLOW_CACHE
+    with _EPE_ALLOW_LOCK:
+        if _EPE_ALLOW_CACHE is None:
+            _EPE_ALLOW_CACHE = _epe_read_allowed_hosts()
+    return _EPE_ALLOW_CACHE
+
+
+def _epe_allow_hint():
+    """What to tell a user whose host was refused. Names the file AND the env
+    var, because which one they will reach for depends on how they launch."""
+    path = _epe_config_path() or "<ComfyUI>/user/epe/config.json"
+    return ("EPE only reaches Ollama on this computer by default. To allow "
+            "another machine, add it as \"host:port\" to ollamaAllowedHosts in "
+            "%s (or set %s), then restart ComfyUI." % (path, _EPE_ALLOW_ENV))
+
+
 def _epe_check_ollama_url(url: str) -> str:
-    """Ollama must live on localhost or the user's private network.
-    Returns '' if OK, else an error message."""
+    """Ollama must live on localhost, or on a host the machine's owner has
+    explicitly allowed. Returns '' if OK, else an error message."""
     try:
         from urllib.parse import urlparse
         u = urlparse(url)
@@ -208,7 +383,23 @@ def _epe_check_ollama_url(url: str) -> str:
         # a real Ollama host.
         if any(ip.is_link_local for ip in ips):
             return "ollamaUrl must not point to a link-local address"
-        return ""
+        # THE ALLOW-LIST. Everything above is a deny-list by range and lets any
+        # LAN host through; this is the part that names destinations.
+        #
+        # Loopback needs no entry — it is this machine, which the caller can
+        # already reach directly. Anything else must have been listed by
+        # someone with access to the machine.
+        #
+        # NOTE THE ORDER: the range checks above still ran. The allow-list only
+        # ever NARROWS — listing a public host does not buy a public fetch.
+        if all(ip.is_loopback for ip in ips):
+            return ""
+        hostport = _epe_norm_hostport(
+            "[%s]:%s" % (u.hostname, u.port) if (u.hostname or "").count(":") > 1
+            else "%s:%s" % (u.hostname, u.port or _EPE_DEFAULT_OLLAMA_PORT))
+        if hostport and hostport in _epe_allowed_ollama_hosts():
+            return ""
+        return _epe_allow_hint()
     except Exception:
         return "Invalid ollamaUrl"
 
