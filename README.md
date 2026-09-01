@@ -206,6 +206,10 @@ Bugs and feature requests → [open an issue](https://github.com/pixelpainter/co
 
 ## Changelog
 
+### 1.0.21
+
+- EPE now reaches Ollama on this computer by default. To use Ollama on another machine, add it as `host:port` to `ollamaAllowedHosts` in `<ComfyUI user dir>/epe/config.json` (or set `EPE_OLLAMA_ALLOWED_HOSTS`) and restart ComfyUI. EPE creates that file for you the first time it looks for it.
+
 ### 1.0.20
 
 - **Ten prompt tabs**, up from four. Each keeps its own prompt, instruct edit direction thread and undo history. Workflows saved by an older build open with all their tabs visible.

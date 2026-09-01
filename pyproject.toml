@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-ai-prompt-editor"
 description = "A full prompt-writing studio inside a single ComfyUI node — AI-powered editing, style targeting, prompt browsing, and wireless prompt injection, all driven by your local Ollama models."
-version = "1.0.20"
+version = "1.0.21"
 license = { file = "LICENSE" }
 # No hard dependencies. PyAV is needed only for the two video-to-prompt
 # routes, which detect its absence and answer with a plain "PyAV is not
